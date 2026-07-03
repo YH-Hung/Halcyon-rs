@@ -78,7 +78,7 @@ TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --no-default-feature
 - [x] Error model: `ErrorCode`, `Error`, SQLSTATE→code classification, `retriable` flag
 - [x] Boundary `Value` type with ergonomic `From` conversions
 - [x] `CliDriver` seam trait (mockable; unit tests need no live database)
-- [x] `Db2CliDriver`: connect/prepare/bind/execute/fetch, chunked array-binding batch, transactions — port of the C++ driver seam (SQLSTATE classification validated against live Db2)
+- [x] `Db2CliDriver`: connect/prepare/bind/execute/fetch, chunked array-binding batch, transactions — port of the C++ driver seam, exercised end-to-end against live Db2
 - [x] Batch shape validation (rectangular, type-homogeneous) enforced inside the driver
 - [x] Core: `Connection`, `Statement`, `ResultSet`, named (`:name`) & positional (`?`) parameters, row → tuple mapping (streaming cursor + `query_map`)
 - [x] `#[derive(FromRow)]` proc macro (`halcyon-derive`) — by-position struct mapping + `Connection::query_as`
@@ -88,7 +88,7 @@ TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --no-default-feature
 - [ ] `tokio` async facade (feature-gated, `spawn_blocking`)
 - [ ] Observability: `metrics`/`tracing`-facade adapters (feature-gated)
 - [x] CI (GitHub Actions): fmt/clippy/MSRV + pure-Rust matrix + `db2` Linux x86_64 & macOS-Intel + `live-db2` — runs once a GitHub remote is configured
-- [~] Integration tests against Dockerized Db2 — env-gated round-trip ([tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs) + [compose](docker/docker-compose.yml)). The error-classification path is validated against **live Db2** (the seam relays byte-identical diagnostics to IBM's `db2cli`); the happy-path round-trip runs in CI's `live-db2` job (macOS Docker Desktop's port proxy blocks the DRDA handshake locally)
+- [x] Integration tests against Dockerized Db2 — env-gated round-trip ([tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs) + [compose](docker/docker-compose.yml)) **validated end-to-end against live Db2** (connect → DDL → positional/named/batch insert → typed streaming read incl. NULL → `None`). It caught a real seam ABI bug (32-bit `SQLLEN`); transactions land with the Phase-3 facade. Also wired into CI's `live-db2` job on real x86_64
 
 ## License
 

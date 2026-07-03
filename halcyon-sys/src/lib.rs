@@ -21,8 +21,16 @@ pub type SQLUSMALLINT = u16;
 pub type SQLINTEGER = i32;
 pub type SQLUINTEGER = u32;
 pub type SQLRETURN = SQLSMALLINT;
-pub type SQLLEN = i64;
-pub type SQLULEN = u64;
+// IBM Db2 CLI defines SQLLEN/SQLULEN as the 64-bit `sqlint64`/`sqluint64` ONLY
+// under `ODBC64`, which sqlcli1.h enables solely for 64-bit Windows (CLI_WIN64);
+// otherwise `#define SQLLEN SQLINTEGER` — i.e. 32-bit. Every supported clidriver
+// target (Linux/macOS x86_64) is non-Windows, so these are 32-bit. A 64-bit
+// alias silently mismatches libdb2's indicator writes: a NULL's -1 sentinel
+// lands in the low 4 bytes and reads back as 0x0000_0000_FFFF_FFFF (not -1), and
+// array-binding indicator strides are wrong. (Windows is out of scope; if it is
+// ever added with CLI_WIN64, gate these on `cfg(windows)` back to 64-bit.)
+pub type SQLLEN = SQLINTEGER;
+pub type SQLULEN = SQLUINTEGER;
 pub type SQLPOINTER = *mut c_void;
 pub type SQLHANDLE = *mut c_void;
 pub type SQLHENV = SQLHANDLE;

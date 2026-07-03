@@ -569,7 +569,7 @@ impl CliDriver for Db2CliDriver {
         }
         let mut rows: cli::SQLLEN = 0;
         unsafe { cli::SQLRowCount(h, &mut rows) };
-        Ok(rows.max(0))
+        Ok(i64::from(rows.max(0)))
     }
 
     fn execute_batch(&self, stmt: StatementHandle, rows: &[Vec<Value>]) -> Result<i64> {
@@ -789,7 +789,7 @@ impl CliDriver for Db2CliDriver {
             }
             let mut affected: cli::SQLLEN = 0;
             unsafe { cli::SQLRowCount(h, &mut affected) };
-            total += affected.max(0);
+            total += i64::from(affected.max(0));
             start = end;
         }
         // On success the reset must stick, or a later reuse of this cached

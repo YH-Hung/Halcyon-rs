@@ -22,5 +22,5 @@ cargo clippy --all-targets                    # keep warning-free
 ## Design decisions (settled)
 
 - Sync core; async ships later as a feature-gated `tokio` facade over `spawn_blocking`.
-- Hand-written FFI in `halcyon-sys` (no bindgen, no odbc-api): only the ~19 CLI entry points the seam uses, with type widths verified against the vendored clidriver headers (`SQLLEN` = i64, handles = pointers).
+- Hand-written FFI in `halcyon-sys` (no bindgen, no odbc-api): only the ~19 CLI entry points the seam uses, with type widths taken from the vendored clidriver headers. `SQLLEN`/`SQLULEN` are **32-bit** (`SQLINTEGER`/`SQLUINTEGER`) on the supported non-Windows targets — the 64-bit `sqlint64` form is only enabled under `ODBC64`, which `sqlcli1.h` sets solely for 64-bit Windows. Handles are pointers. (A live round-trip caught the original `i64` mistake: it broke the NULL `-1` indicator sentinel.)
 - Roadmap and layer mapping live in README.md.
