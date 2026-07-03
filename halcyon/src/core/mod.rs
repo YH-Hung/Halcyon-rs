@@ -12,6 +12,9 @@ mod connection;
 mod params;
 mod result_set;
 
+#[cfg(all(test, feature = "derive"))]
+mod derive_tests;
+
 pub use column::FromColumn;
 pub use connection::{Connection, Statement};
 pub use params::{IntoParams, Named, Params};

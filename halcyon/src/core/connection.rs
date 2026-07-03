@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crate::core::mapping;
 use crate::core::params::{bind_named, IntoParams, Params};
-use crate::core::result_set::ResultSet;
+use crate::core::result_set::{FromRow, ResultSet};
 use crate::driver::batch::validate_batch_rows;
 use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
 use crate::error::Result;
@@ -77,6 +77,13 @@ impl Connection {
         self.driver.execute(stmt.handle)?;
         let columns = self.driver.column_count(stmt.handle)?;
         Ok(ResultSet::from_executed(stmt, columns))
+    }
+
+    /// Runs `sql` and maps every row into `T` via [`FromRow`], collecting a
+    /// `Vec`. The convenience form of `query(..)?.collect_rows()`; with
+    /// `#[derive(FromRow)]` this is the struct-mapping analog of the C++ `queryAs`.
+    pub fn query_as<T: FromRow>(&self, sql: &str, params: impl IntoParams) -> Result<Vec<T>> {
+        self.query(sql, params)?.collect_rows()
     }
 
     /// Validates a column-wise batch (rectangular + type-homogeneous) then runs

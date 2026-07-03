@@ -19,7 +19,7 @@ facade ─► pool ─► core ─► driver (CliDriver trait) ─► halcyon-sy
 | boundary `Value` variant | `Value` enum (`Null`/`Bool`/`Int`/`Double`/`Text`/`Bytes`) |
 | `Result<T>` + throwing overloads | idiomatic `Result<T, Error>` only |
 | `Error` (code, SQLSTATE, SQLCODE, message, retriable) | `Error` — identical fields and classification |
-| `HALCYON_REFLECT` struct mapping | `#[derive(FromRow)]` proc macro *(planned)* |
+| `HALCYON_REFLECT` struct mapping | `#[derive(FromRow)]` proc macro (`halcyon-derive`) |
 | `std::future` async over executor threads | feature-gated `tokio` facade over `spawn_blocking` *(planned)* |
 
 ## Requirements
@@ -56,6 +56,7 @@ cargo test --test db2_roundtrip -- --nocapture
 | Feature | Default | Description |
 |---|---|---|
 | `db2` | on | Links clidriver and enables the real `Db2CliDriver`. Disable to build/test the pure-Rust layers without Db2 installed. |
+| `derive` | on | Enables `#[derive(FromRow)]` (the `halcyon-derive` proc macro). Pure-Rust; disable to drop the proc-macro dependency. |
 
 ## Roadmap
 
@@ -66,7 +67,7 @@ cargo test --test db2_roundtrip -- --nocapture
 - [x] `Db2CliDriver`: connect/prepare/bind/execute/fetch, chunked array-binding batch, transactions — port of the C++ driver seam (not yet exercised against a live Db2)
 - [x] Batch shape validation (rectangular, type-homogeneous) enforced inside the driver
 - [x] Core: `Connection`, `Statement`, `ResultSet`, named (`:name`) & positional (`?`) parameters, row → tuple mapping (streaming cursor + `query_map`)
-- [ ] `#[derive(FromRow)]` proc macro (`halcyon-derive`)
+- [x] `#[derive(FromRow)]` proc macro (`halcyon-derive`) — by-position struct mapping + `Connection::query_as`
 - [ ] Pool: min/max bounds, acquire timeout, validation, idle/lifetime reaping, transparent reconnect, safe auto-retry
 - [ ] Facade: `Database` entry point, RAII + closure transactions, `execute_batch`
 - [ ] Statement cache (per-connection LRU)

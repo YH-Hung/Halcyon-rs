@@ -41,6 +41,10 @@
 // explicit allow) and in the halcyon-sys crate.
 #![deny(unsafe_code)]
 
+// Lets `#[derive(FromRow)]`'s generated `::halcyon::…` paths resolve inside this
+// crate's own tests, exactly as they do downstream.
+extern crate self as halcyon;
+
 mod core;
 pub mod driver;
 mod error;
@@ -56,3 +60,9 @@ pub use core::{
 };
 pub use error::{Error, ErrorCode, Result};
 pub use value::Value;
+
+/// Derives [`FromRow`] for a struct, mapping a result-set row into its fields by
+/// position (feature `derive`, on by default). Field types must implement
+/// [`FromColumn`].
+#[cfg(feature = "derive")]
+pub use halcyon_derive::FromRow;

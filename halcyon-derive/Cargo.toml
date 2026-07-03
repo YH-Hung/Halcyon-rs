@@ -1,0 +1,16 @@
+[package]
+name = "halcyon-derive"
+description = "#[derive(FromRow)] proc-macro for the Halcyon IBM Db2 client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = "2"
+quote = "1"
+proc-macro2 = "1"

@@ -8,10 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["db2"]
+default = ["db2", "derive"]
 # Links the IBM Db2 CLI driver (clidriver) and enables the real Db2CliDriver.
 # Disable to build/test the pure-Rust layers without clidriver installed.
 db2 = ["dep:halcyon-sys"]
+# Enables `#[derive(FromRow)]`. Pure-Rust (no clidriver); on by default.
+derive = ["dep:halcyon-derive"]
 
 [dependencies]
 halcyon-sys = { path = "../halcyon-sys", optional = true }
+halcyon-derive = { path = "../halcyon-derive", optional = true }

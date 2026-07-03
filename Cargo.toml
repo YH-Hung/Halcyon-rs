@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["halcyon", "halcyon-sys"]
+members = ["halcyon", "halcyon-sys", "halcyon-derive"]
 
 [workspace.package]
 version = "0.1.0"
