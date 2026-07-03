@@ -58,7 +58,7 @@ cargo test --test db2_roundtrip -- --nocapture
 `#[derive(FromRow)]`'s compile-error messages are covered by [trybuild](halcyon/tests/ui/) snapshots. Because `.stderr` is rustc-version-specific, they run only under `HALCYON_UI_TESTS=1` (the pinned `derive-ui` CI job) and are a no-op pass otherwise. Regenerate after an intended change:
 
 ```bash
-TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --features derive --test derive_ui
+TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --no-default-features --features derive --test derive_ui
 ```
 
 ### Continuous integration

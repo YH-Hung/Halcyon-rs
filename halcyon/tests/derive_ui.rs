@@ -9,7 +9,7 @@
 //!
 //! Regenerate after an intended message or toolchain change with:
 //!   TRYBUILD=overwrite HALCYON_UI_TESTS=1 \
-//!     cargo test -p halcyon --features derive --test derive_ui
+//!     cargo test -p halcyon --no-default-features --features derive --test derive_ui
 #![cfg(feature = "derive")]
 
 #[test]

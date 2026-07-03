@@ -63,7 +63,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
       - name: UI tests
-        run: cargo test -p halcyon --features derive --test derive_ui
+        # --no-default-features keeps `db2`/halcyon-sys (and the clidriver they
+        # need) out of this driverless job; the derive is pure-Rust.
+        run: cargo test -p halcyon --no-default-features --features derive --test derive_ui
 
   # ---------------------------------------------------------------------------
   # MSRV: the pure-Rust layers must build and test on the pinned minimum.
