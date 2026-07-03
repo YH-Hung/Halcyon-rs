@@ -18,3 +18,8 @@ derive = ["dep:halcyon-derive"]
 [dependencies]
 halcyon-sys = { path = "../halcyon-sys", optional = true }
 halcyon-derive = { path = "../halcyon-derive", optional = true }
+
+[dev-dependencies]
+# UI/compile-fail tests for #[derive(FromRow)] (tests/derive_ui.rs); only run
+# when the `derive` feature is enabled.
+trybuild = "1"

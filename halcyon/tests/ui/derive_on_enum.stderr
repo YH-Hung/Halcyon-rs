@@ -1,0 +1,5 @@
+error: FromRow cannot be derived for enums; it maps one result-set row into a struct's fields by position
+ --> tests/ui/derive_on_enum.rs:4:6
+  |
+4 | enum Bad {
+  |      ^^^

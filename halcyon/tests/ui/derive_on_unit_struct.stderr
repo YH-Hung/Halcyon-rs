@@ -1,0 +1,5 @@
+error: FromRow cannot be derived for a unit struct (there are no fields to map columns into)
+ --> tests/ui/derive_on_unit_struct.rs:4:8
+  |
+4 | struct Bad;
+  |        ^^^

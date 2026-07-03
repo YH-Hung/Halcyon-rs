@@ -1,0 +1,5 @@
+error: FromRow cannot be derived for unions
+ --> tests/ui/derive_on_union.rs:4:7
+  |
+4 | union Bad {
+  |       ^^^
