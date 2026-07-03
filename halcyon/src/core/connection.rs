@@ -10,7 +10,9 @@
 //! The per-connection statement cache (C++ `StatementCache`) is Phase 5; here
 //! every `query`/`execute` prepares a fresh statement.
 
+use std::cell::Cell;
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::core::mapping;
@@ -23,20 +25,32 @@ use crate::value::Value;
 
 /// A single logical Db2 connection over the CLI seam.
 ///
-/// Owns the physical connection handle and disconnects on drop. Move-only and
-/// not safe for concurrent use by multiple threads (the pool leases one to a
-/// single thread at a time). The driver is shared (`Arc<dyn CliDriver>`) so many
-/// connections can run concurrently through one driver.
+/// Owns the physical connection handle and disconnects on drop. Move-only.
+///
+/// `Send` but deliberately **not `Sync`**: the seam's contract is that one
+/// connection (and any statement on it) is driven by a single thread at a time
+/// (see [`crate::driver::CliDriver`]). Being `Send` lets the pool move a
+/// connection to a worker thread; being `!Sync` stops a `&Connection` from being
+/// shared across threads, so the type system — not just this doc — upholds the
+/// single-owner invariant. The driver itself is shared (`Arc<dyn CliDriver>`),
+/// so different connections still run concurrently through one driver.
 pub struct Connection {
     driver: Arc<dyn CliDriver>,
     handle: ConnectionHandle,
+    // `Cell<()>` is `Send + !Sync`, which propagates to `Connection` without a
+    // runtime cost or any borrowed data. It carries no value.
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 impl Connection {
     /// Opens a connection through `driver`.
     pub fn open(driver: Arc<dyn CliDriver>, params: &ConnectionParams) -> Result<Self> {
         let handle = driver.connect(params)?;
-        Ok(Connection { driver, handle })
+        Ok(Connection {
+            driver,
+            handle,
+            _not_sync: PhantomData,
+        })
     }
 
     pub fn handle(&self) -> ConnectionHandle {
@@ -304,6 +318,44 @@ mod tests {
     }
 
     #[test]
+    fn mid_stream_column_read_error_poisons_the_cursor() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(users_grid());
+        // The first get_column (column 0 of the first row) fails as a driver
+        // error, e.g. a connection drop during SQLGetData.
+        mock.fail_get_column_on_call(1, Error::new(ErrorCode::Connection, "dropped mid-read"));
+        let conn = connect(&mock);
+        let mut rs = conn.query("SELECT id, name FROM u", ()).unwrap();
+
+        // The read propagates the driver error to the caller...
+        let code = {
+            let row = rs.next().unwrap().unwrap();
+            row.column::<i64>(0).unwrap_err().code
+        };
+        assert_eq!(code, ErrorCode::Connection);
+        // ...and, unlike a plain mapping error, it is retained on the cursor so
+        // the pool can discard the connection (mirrors C++ note_column_error).
+        assert_eq!(rs.error().map(|e| e.code), Some(ErrorCode::Connection));
+    }
+
+    #[test]
+    fn client_side_mapping_error_during_read_does_not_poison_the_cursor() {
+        let mock = Arc::new(MockCliDriver::new());
+        // Column holds an Int; reading it as String is a client-side type error.
+        mock.push_result_set(ScriptedRows::new(["name"], vec![vec![Value::Int(7)]]));
+        let conn = connect(&mock);
+        let mut rs = conn.query("SELECT name FROM u", ()).unwrap();
+
+        let is_err = {
+            let row = rs.next().unwrap().unwrap();
+            row.column::<String>(0).is_err()
+        };
+        assert!(is_err);
+        // A client mapping error does not mean the connection is bad.
+        assert!(rs.error().is_none());
+    }
+
+    #[test]
     fn execute_returns_rows_affected_and_finalizes_statement() {
         let mock = Arc::new(MockCliDriver::new());
         mock.push_exec_row_count(3);
@@ -428,5 +480,27 @@ mod tests {
         // The statement was finalized, then the connection disconnected.
         assert_eq!(mock.finalize_calls(), 1);
         assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn connection_is_send_for_pool_handoff() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Connection>();
+    }
+
+    // Compile-time guard that `Connection` is NOT `Sync` (the single-owner seam
+    // contract, enforced by the `PhantomData<Cell<()>>` marker): `resolve`'s trait
+    // parameter is inferable only while the type is `!Sync`. If `Connection`
+    // regained `Sync`, both impls would apply, the `_` would be ambiguous, and the
+    // test below would fail to compile.
+    trait AmbiguousIfSync<A> {
+        fn resolve() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+    #[test]
+    fn connection_is_not_sync() {
+        let _resolve = <Connection as AmbiguousIfSync<_>>::resolve;
     }
 }

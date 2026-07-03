@@ -3,15 +3,18 @@
 //! [`ResultSet`] is a forward-only cursor over an executed statement, ported
 //! from the C++ `ResultSet`. It is driven one row at a time by [`ResultSet::next`]
 //! (a lending cursor — each [`Row`] borrows the set, so only one row is live at a
-//! time and no per-row allocation is forced). A mid-stream fetch failure is
-//! surfaced, never collapsed into end-of-cursor: [`ResultSet::next`] returns the
-//! error and [`ResultSet::error`] retains it — the signal the pool layer uses to
-//! discard a connection that dropped mid-scan.
+//! time and no per-row allocation is forced). A driver-side failure mid-scan —
+//! whether a `fetch` or a column read — is surfaced, never collapsed into
+//! end-of-cursor: the failing call returns the error and [`ResultSet::error`]
+//! retains it, the signal the pool layer uses to discard a dropped connection.
+//! A client-side mapping error (wrong target type, NULL into a non-`Option`) is
+//! *not* recorded — it doesn't mean the connection is bad.
 //!
 //! For idiomatic iteration, [`ResultSet::query_map`] adapts the cursor into an
 //! `Iterator` of owned `Result<T>` (sidestepping the lending borrow), and
 //! [`ResultSet::collect_rows`] materializes all rows via [`FromRow`].
 
+use std::cell::RefCell;
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -28,6 +31,9 @@ pub struct Row<'a> {
     driver: &'a dyn CliDriver,
     stmt: StatementHandle,
     columns: usize,
+    // The owning cursor's error slot, so a driver-side read failure is recorded
+    // there (mirrors the C++ `Row::record_read_error` -> `note_column_error`).
+    errors: &'a RefCell<Option<Error>>,
 }
 
 impl Row<'_> {
@@ -37,14 +43,31 @@ impl Row<'_> {
 
     /// Reads the 0-based `index` column as `T`. `Mapping` error on a bad index,
     /// a type mismatch, or NULL into a non-`Option` target.
+    ///
+    /// A driver-side read failure (e.g. a connection drop during `SQLGetData`) is
+    /// recorded on the owning [`ResultSet`] — see [`ResultSet::error`] — as well
+    /// as returned; a client-side mapping error is only returned.
     pub fn column<T: FromColumn>(&self, index: usize) -> Result<T> {
         if index >= self.columns {
+            // Client-side misuse, not a driver failure: return but don't record.
             return Err(mapping(format!(
                 "column index {index} out of range (row has {} columns)",
                 self.columns
             )));
         }
-        let value = self.driver.get_column(self.stmt, index)?;
+        let value = match self.driver.get_column(self.stmt, index) {
+            Ok(v) => v,
+            Err(e) => {
+                // Driver-side read failure: poison the cursor so the pool can
+                // discard the connection. A `from_column` mapping error below is
+                // client-side and deliberately left unrecorded (as in C++).
+                let mut slot = self.errors.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(e.clone());
+                }
+                return Err(e);
+            }
+        };
         T::from_column(value)
     }
 
@@ -105,7 +128,9 @@ impl_from_row_tuple!(12; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10,
 pub struct ResultSet<'c> {
     stmt: Statement<'c>,
     columns: usize,
-    error: Option<Error>,
+    // `RefCell` so a `Row` (which holds only a shared `&self`) can record a
+    // driver-side read failure here without the cursor being borrowed mutably.
+    error: RefCell<Option<Error>>,
     done: bool,
 }
 
@@ -116,7 +141,7 @@ impl<'c> ResultSet<'c> {
         ResultSet {
             stmt,
             columns,
-            error: None,
+            error: RefCell::new(None),
             done: false,
         }
     }
@@ -125,11 +150,20 @@ impl<'c> ResultSet<'c> {
         self.columns
     }
 
-    /// The error that ended iteration early, if any. Empty after a clean end;
-    /// set after a mid-stream fetch failure. Distinguishes the two so a Db2 error
-    /// is never silently mistaken for end-of-results.
-    pub fn error(&self) -> Option<&Error> {
-        self.error.as_ref()
+    /// The driver-side failure that spoiled the scan, if any: empty after a clean
+    /// end, set after a mid-stream `fetch` or column-read error. Distinguishes a
+    /// clean end-of-cursor from a Db2 error, and is the signal the pool uses to
+    /// discard the connection. Client-side mapping errors are not recorded here.
+    pub fn error(&self) -> Option<Error> {
+        self.error.borrow().clone()
+    }
+
+    /// Records a driver-side failure, keeping the first one seen.
+    fn poison(&self, e: &Error) {
+        let mut slot = self.error.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(e.clone());
+        }
     }
 
     /// Advances to the next row. `Ok(Some(row))` while rows remain, `Ok(None)` at
@@ -150,6 +184,7 @@ impl<'c> ResultSet<'c> {
                 driver: self.stmt.driver_ref(),
                 stmt: handle,
                 columns: self.columns,
+                errors: &self.error,
             })),
             Ok(false) => {
                 self.done = true;
@@ -157,7 +192,7 @@ impl<'c> ResultSet<'c> {
             }
             Err(e) => {
                 self.done = true;
-                self.error = Some(e.clone());
+                self.poison(&e);
                 Err(e)
             }
         }
