@@ -5,9 +5,9 @@
 //! implementation is [`Db2CliDriver`] (feature `db2`); tests substitute their
 //! own implementations and need no live database.
 
-// Gated because its only non-test caller today is Db2CliDriver; lift the cfg
-// when the core layer starts validating batches above the seam (as in C++).
-#[cfg(any(feature = "db2", test))]
+// The core layer validates batches above the seam (as the C++
+// `Connection::executeBatch` does), and `Db2CliDriver` re-checks before any
+// unsafe buffer work — so this is always compiled.
 pub(crate) mod batch;
 mod sqlstate;
 pub use sqlstate::{classify_sqlstate, Classification};

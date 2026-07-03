@@ -2,7 +2,7 @@
 
 A modern Rust client library for **IBM Db2**, built on the IBM Db2 CLI (`libdb2`). The Rust counterpart of the C++ [Halcyon](https://github.com/YH-Hung/Halcyon) library — same layered architecture, same error model, same driver-seam philosophy, expressed idiomatically in Rust.
 
-> **Status: early development.** The driver seam is complete; the core/pool/facade layers are being ported. See the roadmap below.
+> **Status: early development.** The driver seam and the core data path are complete; the pool and facade layers are being ported. See the roadmap below.
 
 ## Architecture
 
@@ -55,7 +55,7 @@ The clidriver `lib/` directory is embedded as an rpath in test/example binaries,
 - [x] `CliDriver` seam trait (mockable; unit tests need no live database)
 - [x] `Db2CliDriver`: connect/prepare/bind/execute/fetch, chunked array-binding batch, transactions — port of the C++ driver seam (not yet exercised against a live Db2)
 - [x] Batch shape validation (rectangular, type-homogeneous) enforced inside the driver
-- [ ] Core: `Connection`, `Statement`, `ResultSet`, named (`:name`) & positional (`?`) parameters, row → tuple mapping
+- [x] Core: `Connection`, `Statement`, `ResultSet`, named (`:name`) & positional (`?`) parameters, row → tuple mapping (streaming cursor + `query_map`)
 - [ ] `#[derive(FromRow)]` proc macro (`halcyon-derive`)
 - [ ] Pool: min/max bounds, acquire timeout, validation, idle/lifetime reaping, transparent reconnect, safe auto-retry
 - [ ] Facade: `Database` entry point, RAII + closure transactions, `execute_batch`
