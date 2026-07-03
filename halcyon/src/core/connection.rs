@@ -57,6 +57,12 @@ impl Connection {
         self.handle
     }
 
+    /// The shared driver as a trait object — for transaction control
+    /// ([`Connection::begin`]) and cursor row reads.
+    pub(crate) fn driver_ref(&self) -> &dyn CliDriver {
+        self.driver.as_ref()
+    }
+
     /// Prepares `sql`, returning a reusable [`Statement`].
     pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
         let handle = self.driver.prepare(self.handle, sql)?;

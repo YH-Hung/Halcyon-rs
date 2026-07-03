@@ -5,14 +5,15 @@
 //! [Halcyon](https://github.com/YH-Hung/Halcyon) library.
 //!
 //! **Status: early development.** The target architecture mirrors the C++
-//! layering. The driver seam and the core data path ([`Connection`],
-//! [`Statement`], [`ResultSet`]/[`Row`], `?`/`:name` params, row → tuple mapping)
-//! are implemented; the pool and facade layers are being ported. See the README
-//! roadmap:
+//! layering. The driver seam, the core data path ([`Connection`], [`Statement`],
+//! [`ResultSet`]/[`Row`], `?`/`:name` params, row → tuple mapping), and the
+//! single-connection facade ([`Database`], closure/RAII [`Transaction`]) are
+//! implemented; the connection pool that re-targets the facade is being ported.
+//! See the README roadmap:
 //!
 //! ```text
 //! facade ─► pool ─► core ─► driver (CliDriver seam) ─► halcyon-sys ─► libdb2
-//! (planned) (planned) (done)     (implemented)
+//! (single-conn) (planned) (done)     (implemented)
 //! ```
 //!
 //! Only `driver::db2` (feature `db2`) touches the CLI ABI; everything above the
@@ -48,6 +49,7 @@ extern crate self as halcyon;
 mod core;
 pub mod driver;
 mod error;
+mod facade;
 mod value;
 
 // Shared, scriptable mock driver for the layers above the seam. Test-only, so
@@ -56,9 +58,11 @@ mod value;
 mod testing;
 
 pub use core::{
-    Connection, FromColumn, FromRow, IntoParams, Named, Params, QueryMap, ResultSet, Row, Statement,
+    Connection, FromColumn, FromRow, IntoParams, Named, Params, QueryMap, ResultSet, Row,
+    Statement, Transaction,
 };
 pub use error::{Error, ErrorCode, Result};
+pub use facade::Database;
 pub use value::Value;
 
 /// Derives [`FromRow`] for a struct, mapping a result-set row into its fields by

@@ -14,17 +14,18 @@
 //! The whole file is `db2`-feature-gated, so `cargo test --no-default-features`
 //! compiles it to nothing and the pure-Rust invariant is preserved.
 //!
-//! Covers the Phase 1 public surface plus the seam's transaction control:
-//! connect, DDL, positional/named/batch inserts, typed streaming reads including
-//! NULL, and commit/rollback via the driver primitives. The RAII/closure
-//! transaction facade, struct-mapping `queryAs`, and pool round-trips from the
-//! C++ `test_db2_roundtrip.cpp` arrive with Phases 3–4.
+//! Covers the Phase 1 core surface plus the seam's transaction control in
+//! [`live_round_trip`] (connect, DDL, positional/named/batch inserts, typed
+//! streaming reads including NULL, commit/rollback via the driver primitives),
+//! and the Phase 3 [`Database`] facade in [`live_facade_round_trip`] (ergonomic
+//! `connect`, closure/RAII [`halcyon::Transaction`] commit and rollback). The
+//! pool round-trips from the C++ `test_db2_roundtrip.cpp` arrive with Phase 4.
 #![cfg(feature = "db2")]
 
 use std::sync::Arc;
 
 use halcyon::driver::{CliDriver, ConnectionParams, Db2CliDriver};
-use halcyon::{named, Connection, Value};
+use halcyon::{named, Connection, Database, Error, ErrorCode, Value};
 
 fn test_dsn() -> Option<String> {
     std::env::var("HALCYON_TEST_DSN").ok()
@@ -145,5 +146,67 @@ fn live_round_trip() {
     assert_eq!(committed, vec![(6, "fin".to_string())]);
 
     conn.execute("DROP TABLE halcyon_people", ())
+        .expect("drop table");
+}
+
+/// Facade round-trip: the ergonomic [`Database`] and the closure/RAII
+/// [`halcyon::Transaction`] (Phase 3) against a real Db2 — the facade analog of
+/// the seam-primitive transaction coverage in [`live_round_trip`]. Gated on
+/// `HALCYON_TEST_DSN` the same way (a no-op pass when unset).
+#[test]
+fn live_facade_round_trip() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("HALCYON_TEST_DSN not set; skipping live Db2 facade round-trip");
+        return;
+    };
+    let db = Database::connect(&dsn).expect("open database");
+
+    let _ = db.execute("DROP TABLE halcyon_facade", ());
+    db.execute(
+        "CREATE TABLE halcyon_facade(id INT NOT NULL, name VARCHAR(64))",
+        (),
+    )
+    .expect("create table");
+
+    // Closure transaction: commits on Ok.
+    db.transaction(|tx| {
+        tx.execute("INSERT INTO halcyon_facade VALUES (?, ?)", (1, "ada"))?;
+        tx.execute("INSERT INTO halcyon_facade VALUES (?, ?)", (2, "bob"))?;
+        Ok(())
+    })
+    .expect("committed transaction");
+    let committed: Vec<(i32, String)> = db
+        .query_as("SELECT id, name FROM halcyon_facade ORDER BY id", ())
+        .expect("post-commit query");
+    assert_eq!(
+        committed,
+        vec![(1, "ada".to_string()), (2, "bob".to_string())]
+    );
+
+    // Closure transaction: rolls back on Err — the insert must not persist.
+    let rolled: halcyon::Result<()> = db.transaction(|tx| {
+        tx.execute("INSERT INTO halcyon_facade VALUES (?, ?)", (3, "cy"))?;
+        Err(Error::new(ErrorCode::Constraint, "abort"))
+    });
+    assert!(rolled.is_err());
+    let after_rollback: Vec<(i32,)> = db
+        .query_as("SELECT id FROM halcyon_facade WHERE id = 3", ())
+        .expect("post-rollback query");
+    assert!(
+        after_rollback.is_empty(),
+        "rolled-back insert must not persist"
+    );
+
+    // RAII transaction: explicit commit persists the insert.
+    let mut tx = db.begin().expect("begin");
+    tx.execute("INSERT INTO halcyon_facade VALUES (?, ?)", (4, "di"))
+        .expect("insert di");
+    tx.commit().expect("commit");
+    let after_commit: Vec<(i32, String)> = db
+        .query_as("SELECT id, name FROM halcyon_facade WHERE id = 4", ())
+        .expect("post-commit query");
+    assert_eq!(after_commit, vec![(4, "di".to_string())]);
+
+    db.execute("DROP TABLE halcyon_facade", ())
         .expect("drop table");
 }

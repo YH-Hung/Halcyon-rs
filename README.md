@@ -2,7 +2,7 @@
 
 A modern Rust client library for **IBM Db2**, built on the IBM Db2 CLI (`libdb2`). The Rust counterpart of the C++ [Halcyon](https://github.com/YH-Hung/Halcyon) library — same layered architecture, same error model, same driver-seam philosophy, expressed idiomatically in Rust.
 
-> **Status: early development.** The driver seam and the core data path are complete; the pool and facade layers are being ported. See the roadmap below.
+> **Status: early development.** The driver seam, the core data path, and the single-connection facade (`Database` + transactions) are complete; the connection pool that re-targets the facade is being ported. See the roadmap below.
 
 ## Architecture
 
@@ -82,13 +82,13 @@ TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --no-default-feature
 - [x] Batch shape validation (rectangular, type-homogeneous) enforced inside the driver
 - [x] Core: `Connection`, `Statement`, `ResultSet`, named (`:name`) & positional (`?`) parameters, row → tuple mapping (streaming cursor + `query_map`)
 - [x] `#[derive(FromRow)]` proc macro (`halcyon-derive`) — by-position struct mapping + `Connection::query_as`
+- [x] Facade (single-connection): `Database` entry point, RAII + closure `transaction()` (commit on `Ok`, rollback on `Err`/panic via a `Drop` guard), `execute_batch`, `query`/`query_as`/`execute` — validated on mock **and** live Db2; re-targeted onto the pool in Phase 4
 - [ ] Pool: min/max bounds, acquire timeout, validation, idle/lifetime reaping, transparent reconnect, safe auto-retry
-- [ ] Facade: `Database` entry point, RAII + closure transactions, `execute_batch`
 - [ ] Statement cache (per-connection LRU)
 - [ ] `tokio` async facade (feature-gated, `spawn_blocking`)
 - [ ] Observability: `metrics`/`tracing`-facade adapters (feature-gated)
 - [x] CI (GitHub Actions): fmt/clippy/MSRV + pure-Rust matrix + `db2` Linux x86_64 & macOS-Intel + `live-db2` — runs once a GitHub remote is configured
-- [x] Integration tests against Dockerized Db2 — env-gated round-trip ([tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs) + [compose](docker/docker-compose.yml)) **validated end-to-end against live Db2**: connect → DDL → positional/named/batch insert → typed streaming read (incl. NULL → `None`) → commit/rollback via the seam primitives. It caught a real seam ABI bug (32-bit `SQLLEN`). The ergonomic transaction facade is Phase 3; also wired into CI's `live-db2` job on real x86_64
+- [x] Integration tests against Dockerized Db2 — env-gated round-trip ([tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs) + [compose](docker/docker-compose.yml)) **validated end-to-end against live Db2**: connect → DDL → positional/named/batch insert → typed streaming read (incl. NULL → `None`) → commit/rollback via the seam primitives. It caught a real seam ABI bug (32-bit `SQLLEN`). Phase 3 adds a facade round-trip alongside it (ergonomic `Database::connect`, closure/RAII `Transaction` commit + rollback); both are wired into CI's `live-db2` job on real x86_64
 
 ## License
 

@@ -11,6 +11,7 @@ mod column;
 mod connection;
 mod params;
 mod result_set;
+mod transaction;
 
 #[cfg(all(test, feature = "derive"))]
 mod derive_tests;
@@ -19,6 +20,7 @@ pub use column::FromColumn;
 pub use connection::{Connection, Statement};
 pub use params::{IntoParams, Named, Params};
 pub use result_set::{FromRow, QueryMap, ResultSet, Row};
+pub use transaction::Transaction;
 
 use crate::error::{Error, ErrorCode};
 
