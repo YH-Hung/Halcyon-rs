@@ -24,5 +24,10 @@ pub mod driver;
 mod error;
 mod value;
 
+// Shared, scriptable mock driver for the layers above the seam. Test-only, so
+// it never ships in a normal build; every upper-layer unit test builds on it.
+#[cfg(test)]
+mod testing;
+
 pub use error::{Error, ErrorCode, Result};
 pub use value::Value;
