@@ -51,6 +51,20 @@ export HALCYON_TEST_DSN='DATABASE=SAMPLE;HOSTNAME=localhost;PORT=50000;PROTOCOL=
 cargo test --test db2_roundtrip -- --nocapture
 ```
 
+> On macOS + Docker Desktop the host cannot complete the Db2 DRDA handshake through the port proxy (IBM's own `db2cli` fails identically), so run the round-trip on Linux — or in a Linux container on the Db2 network — where it connects natively. CI's `live-db2` job does exactly this.
+
+### Derive UI tests
+
+`#[derive(FromRow)]`'s compile-error messages are covered by [trybuild](halcyon/tests/ui/) snapshots. Because `.stderr` is rustc-version-specific, they run only under `HALCYON_UI_TESTS=1` (the pinned `derive-ui` CI job) and are a no-op pass otherwise. Regenerate after an intended change:
+
+```bash
+TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --features derive --test derive_ui
+```
+
+### Continuous integration
+
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every push/PR: `fmt`, `clippy`, the pure-Rust test matrix (`--no-default-features` ± `derive`), an MSRV (1.75) check, and the full `db2` build/test on **Linux x86_64 + macOS Intel** (clidriver is x86_64-only), with the driver fetched by a composite action. A `live-db2` job stands up the Dockerized Db2 and runs the round-trip on pushes to `main`. *(The workflow runs once a GitHub remote is configured.)*
+
 ## Feature flags
 
 | Feature | Default | Description |
@@ -64,7 +78,7 @@ cargo test --test db2_roundtrip -- --nocapture
 - [x] Error model: `ErrorCode`, `Error`, SQLSTATE→code classification, `retriable` flag
 - [x] Boundary `Value` type with ergonomic `From` conversions
 - [x] `CliDriver` seam trait (mockable; unit tests need no live database)
-- [x] `Db2CliDriver`: connect/prepare/bind/execute/fetch, chunked array-binding batch, transactions — port of the C++ driver seam (not yet exercised against a live Db2)
+- [x] `Db2CliDriver`: connect/prepare/bind/execute/fetch, chunked array-binding batch, transactions — port of the C++ driver seam (SQLSTATE classification validated against live Db2)
 - [x] Batch shape validation (rectangular, type-homogeneous) enforced inside the driver
 - [x] Core: `Connection`, `Statement`, `ResultSet`, named (`:name`) & positional (`?`) parameters, row → tuple mapping (streaming cursor + `query_map`)
 - [x] `#[derive(FromRow)]` proc macro (`halcyon-derive`) — by-position struct mapping + `Connection::query_as`
@@ -73,7 +87,8 @@ cargo test --test db2_roundtrip -- --nocapture
 - [ ] Statement cache (per-connection LRU)
 - [ ] `tokio` async facade (feature-gated, `spawn_blocking`)
 - [ ] Observability: `metrics`/`tracing`-facade adapters (feature-gated)
-- [~] Integration tests against Dockerized Db2 — env-gated round-trip scaffold landed ([tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs) + [docker-compose.yml](docker/docker-compose.yml), skipped without `HALCYON_TEST_DSN`); live run pending a database
+- [x] CI (GitHub Actions): fmt/clippy/MSRV + pure-Rust matrix + `db2` Linux x86_64 & macOS-Intel + `live-db2` — runs once a GitHub remote is configured
+- [~] Integration tests against Dockerized Db2 — env-gated round-trip ([tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs) + [compose](docker/docker-compose.yml)). The error-classification path is validated against **live Db2** (the seam relays byte-identical diagnostics to IBM's `db2cli`); the happy-path round-trip runs in CI's `live-db2` job (macOS Docker Desktop's port proxy blocks the DRDA handshake locally)
 
 ## License
 

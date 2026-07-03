@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref (e.g. force-pushes to a PR).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Formatting, lint, and the pure-Rust test matrix. Everything above the seam
+  # is mockable, so this needs no clidriver — the always-green backbone and the
+  # guardian of the `cargo test --no-default-features` invariant.
+  # ---------------------------------------------------------------------------
+  lint-and-pure:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (pure-Rust, no clidriver)
+        run: |
+          cargo clippy -p halcyon-derive --all-targets -- -D warnings
+          cargo clippy -p halcyon --no-default-features --all-targets -- -D warnings
+          cargo clippy -p halcyon --no-default-features --features derive --all-targets -- -D warnings
+
+      - name: Test (pure-Rust, no clidriver)
+        run: |
+          cargo test -p halcyon --no-default-features
+          cargo test -p halcyon --no-default-features --features derive
+          cargo test -p halcyon-derive
+
+  # ---------------------------------------------------------------------------
+  # Compile-fail (trybuild) tests for #[derive(FromRow)]. Pinned toolchain: the
+  # .stderr snapshots are rustc-version-specific, so this is the one job that
+  # runs them (HALCYON_UI_TESTS=1). Bump the version here in lockstep with a
+  # `TRYBUILD=overwrite` regeneration of the snapshots.
+  # ---------------------------------------------------------------------------
+  derive-ui:
+    runs-on: ubuntu-24.04
+    env:
+      HALCYON_UI_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: UI tests
+        run: cargo test -p halcyon --features derive --test derive_ui
+
+  # ---------------------------------------------------------------------------
+  # MSRV: the pure-Rust layers must build and test on the pinned minimum.
+  # ---------------------------------------------------------------------------
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build + test on MSRV (pure-Rust)
+        run: |
+          cargo build -p halcyon --no-default-features --features derive
+          cargo test -p halcyon --no-default-features --features derive
+
+  # ---------------------------------------------------------------------------
+  # Full build + tests with the real Db2CliDriver linked against the clidriver.
+  # No live DB here: the integration test skips without HALCYON_TEST_DSN.
+  # ---------------------------------------------------------------------------
+  db2-linux:
+    runs-on: ubuntu-24.04
+    env:
+      DB2_CLIDRIVER_ROOT: third_party/clidriver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up Db2 CLI driver
+        uses: ./.github/actions/setup-db2-clidriver
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build
+        run: cargo build
+      - name: Test (unit + integration-skipped)
+        run: cargo test
+
+  # ---------------------------------------------------------------------------
+  # The macOS cloud can't reliably reach IBM's driver host, so fetch the macOS
+  # (x86_64) driver on Ubuntu and hand it to the Intel macOS job as an artifact
+  # (mirrors the C++ repo).
+  # ---------------------------------------------------------------------------
+  prepare-macos-clidriver:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch macOS Db2 CLI driver
+        uses: ./.github/actions/setup-db2-clidriver
+        with:
+          platform: macos
+      - name: Package
+        run: tar -czf macos-clidriver.tar.gz -C third_party clidriver
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-clidriver
+          path: macos-clidriver.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # macOS build + tests. Intel runner so the x86_64 IBM driver links and loads.
+  # ---------------------------------------------------------------------------
+  db2-macos:
+    runs-on: macos-13
+    needs: prepare-macos-clidriver
+    env:
+      DB2_CLIDRIVER_ROOT: third_party/clidriver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-clidriver
+          path: /tmp/macos-clidriver
+      - name: Unpack Db2 CLI driver
+        run: |
+          mkdir -p third_party
+          tar -xzf /tmp/macos-clidriver/macos-clidriver.tar.gz -C third_party
+          test -f third_party/clidriver/include/sqlcli1.h
+          chmod -R u+w third_party/clidriver
+          xattr -r -d com.apple.quarantine third_party/clidriver || true
+      - name: Build
+        run: cargo build
+      - name: Test
+        run: cargo test
+
+  # ---------------------------------------------------------------------------
+  # Live Db2 round-trip: stand up the Dockerized Db2 and run the integration
+  # test against it. Skipped on PRs (the ~5-min image pull + boot would slow
+  # every PR); runs on pushes to main and manual dispatch. On Linux runners the
+  # published port is reachable at localhost with native container networking.
+  # ---------------------------------------------------------------------------
+  live-db2:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    env:
+      DB2_CLIDRIVER_ROOT: third_party/clidriver
+      HALCYON_TEST_DSN: DATABASE=SAMPLE;HOSTNAME=localhost;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PWD=halcyon;
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up Db2 CLI driver
+        uses: ./.github/actions/setup-db2-clidriver
+      - name: Start Db2 and wait for healthy
+        run: docker compose -f docker/docker-compose.yml up -d --wait --wait-timeout 600
+      - name: Live round-trip
+        run: cargo test --test db2_roundtrip -- --nocapture
+      - name: Tear down Db2
+        if: always()
+        run: docker compose -f docker/docker-compose.yml down -v

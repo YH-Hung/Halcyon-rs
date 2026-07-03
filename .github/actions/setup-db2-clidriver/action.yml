@@ -1,0 +1,104 @@
+name: Set up Db2 CLI driver
+description: >
+  Fetch, verify, and cache the IBM Db2 CLI driver (clidriver) into
+  third_party/clidriver. The driver is IBM's redistributable (not part of this
+  repo, hence gitignored), so CI downloads it instead of vendoring it. Point the
+  build at it with DB2_CLIDRIVER_ROOT=third_party/clidriver. Ported from the C++
+  Halcyon repo so both ports resolve the same driver.
+
+inputs:
+  platform:
+    description: Driver platform to fetch (`auto`, `linux`, or `macos`).
+    default: auto
+  url:
+    description: Tarball URL (IBM publishes only a rolling "latest" for linux x64).
+    default: https://public.dhe.ibm.com/ibmdl/export/pub/software/data/db2/drivers/odbc_cli/linuxx64_odbc_cli.tar.gz
+  sha256:
+    description: >
+      Expected SHA256 of the tarball. Because the URL above is a moving target,
+      this pin makes the build reproducible and tamper-evident: when IBM rotates
+      the file the checksum check fails loudly — review the new driver, then
+      update this value (a fresh checksum also rotates the cache key).
+    default: 2c10efc71a638cd6b07a5b977b6dbe8aa0408e1dca825bea0d2b63318c9bba2f
+  macos_url:
+    description: macOS (x86_64) clidriver tarball URL.
+    default: https://public.dhe.ibm.com/ibmdl/export/pub/software/data/db2/drivers/odbc_cli/macos64_odbc_cli.tar.gz
+  macos_sha256:
+    description: >
+      Expected SHA256 of the macOS tarball. Like the linux pin, this is a moving
+      target; when it fails, review the new driver and update this value.
+    default: 8422b3ec74564ab737fc7a3caf173ab378d4654d1f2093bfca7db0a93ce154d8
+
+runs:
+  using: composite
+  steps:
+    - name: Select driver source
+      id: src
+      shell: bash
+      run: |
+        case "${{ inputs.platform }}" in
+          auto)
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              platform=macos
+            else
+              platform=linux
+            fi
+            ;;
+          linux|macos)
+            platform="${{ inputs.platform }}"
+            ;;
+          *)
+            echo "Unsupported clidriver platform: ${{ inputs.platform }}" >&2
+            exit 1
+            ;;
+        esac
+
+        if [ "$platform" = "macos" ]; then
+          echo "platform=macos" >> "$GITHUB_OUTPUT"
+          echo "cache_platform=macOS" >> "$GITHUB_OUTPUT"
+          echo "url=${{ inputs.macos_url }}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${{ inputs.macos_sha256 }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "platform=linux" >> "$GITHUB_OUTPUT"
+          echo "cache_platform=Linux" >> "$GITHUB_OUTPUT"
+          echo "url=${{ inputs.url }}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${{ inputs.sha256 }}" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Restore cached driver
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: third_party/clidriver
+        key: clidriver-${{ steps.src.outputs.cache_platform }}-${{ steps.src.outputs.sha256 }}
+
+    - name: Download, verify, extract
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p third_party
+        for attempt in 1 2 3 4 5; do
+          echo "Downloading Db2 CLI driver (attempt ${attempt}/5)"
+          rm -f /tmp/clidriver.tar.gz
+          if curl --connect-timeout 20 --max-time 120 -fSL "${{ steps.src.outputs.url }}" -o /tmp/clidriver.tar.gz; then
+            break
+          fi
+          if [ "$attempt" -eq 5 ]; then
+            echo "Failed to download Db2 CLI driver after ${attempt} attempts" >&2
+            exit 1
+          fi
+          sleep $((attempt * 5))
+        done
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          echo "${{ steps.src.outputs.sha256 }}  /tmp/clidriver.tar.gz" | shasum -a 256 -c -
+        else
+          echo "${{ steps.src.outputs.sha256 }}  /tmp/clidriver.tar.gz" | sha256sum -c -
+        fi
+        tar -xzf /tmp/clidriver.tar.gz -C third_party
+        test -f third_party/clidriver/include/sqlcli1.h
+        # macOS: clear Gatekeeper quarantine so the driver dlopens (see AGENTS.md).
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          chmod -R u+w third_party/clidriver
+          xattr -r -d com.apple.quarantine third_party/clidriver || true
+        fi
