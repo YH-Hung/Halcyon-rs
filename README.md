@@ -41,6 +41,16 @@ cargo test  -p halcyon --no-default-features
 
 The clidriver `lib/` directory is embedded as an rpath in test/example binaries, so they run without `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`. Downstream consumers should do the same in their own build script (read `DEP_DB2_LIB_DIR`) or set the library path at runtime.
 
+### Live integration test
+
+An end-to-end round-trip against a real Db2 lives in [halcyon/tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs). It is gated on `HALCYON_TEST_DSN` and skipped (a no-op pass) when unset, so the default `cargo test` needs no database. To run it against a local Db2:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d   # wait until healthy (first boot: a few minutes)
+export HALCYON_TEST_DSN='DATABASE=SAMPLE;HOSTNAME=localhost;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PWD=halcyon;'
+cargo test --test db2_roundtrip -- --nocapture
+```
+
 ## Feature flags
 
 | Feature | Default | Description |
@@ -62,7 +72,7 @@ The clidriver `lib/` directory is embedded as an rpath in test/example binaries,
 - [ ] Statement cache (per-connection LRU)
 - [ ] `tokio` async facade (feature-gated, `spawn_blocking`)
 - [ ] Observability: `metrics`/`tracing`-facade adapters (feature-gated)
-- [ ] Integration tests against Dockerized Db2 (reuse the C++ repo's compose setup)
+- [~] Integration tests against Dockerized Db2 — env-gated round-trip scaffold landed ([tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs) + [docker-compose.yml](docker/docker-compose.yml), skipped without `HALCYON_TEST_DSN`); live run pending a database
 
 ## License
 
