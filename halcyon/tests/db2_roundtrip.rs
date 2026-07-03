@@ -14,30 +14,35 @@
 //! The whole file is `db2`-feature-gated, so `cargo test --no-default-features`
 //! compiles it to nothing and the pure-Rust invariant is preserved.
 //!
-//! Struct mapping (`queryAs<Person>`), transactions, and the pool round-trips
-//! from the C++ `test_db2_roundtrip.cpp` arrive with Phases 2–4; this covers the
-//! Phase 1 public surface: connect, DDL, positional + named + batch inserts, and
-//! typed streaming reads including NULL.
+//! Covers the Phase 1 public surface plus the seam's transaction control:
+//! connect, DDL, positional/named/batch inserts, typed streaming reads including
+//! NULL, and commit/rollback via the driver primitives. The RAII/closure
+//! transaction facade, struct-mapping `queryAs`, and pool round-trips from the
+//! C++ `test_db2_roundtrip.cpp` arrive with Phases 3–4.
 #![cfg(feature = "db2")]
 
 use std::sync::Arc;
 
-use halcyon::driver::{ConnectionParams, Db2CliDriver};
+use halcyon::driver::{CliDriver, ConnectionParams, Db2CliDriver};
 use halcyon::{named, Connection, Value};
 
 fn test_dsn() -> Option<String> {
     std::env::var("HALCYON_TEST_DSN").ok()
 }
 
-fn open(dsn: &str) -> Connection {
+/// Returns the driver alongside the connection so the test can drive the seam's
+/// transaction primitives (`set_auto_commit`/`commit`/`rollback`) directly — the
+/// ergonomic facade over them is Phase 3.
+fn open(dsn: &str) -> (Arc<Db2CliDriver>, Connection) {
     let driver = Arc::new(Db2CliDriver::new());
-    Connection::open(
-        driver,
+    let conn = Connection::open(
+        driver.clone(),
         &ConnectionParams {
             connection_string: dsn.to_string(),
         },
     )
-    .expect("open live connection")
+    .expect("open live connection");
+    (driver, conn)
 }
 
 #[test]
@@ -46,7 +51,7 @@ fn live_round_trip() {
         eprintln!("HALCYON_TEST_DSN not set; skipping live Db2 round-trip");
         return;
     };
-    let conn = open(&dsn);
+    let (driver, conn) = open(&dsn);
 
     // Fresh table (ignore the drop error if it does not exist yet).
     let _ = conn.execute("DROP TABLE halcyon_people", ());
@@ -105,6 +110,39 @@ fn live_round_trip() {
         .collect::<halcyon::Result<Vec<_>>>()
         .expect("map names");
     assert_eq!(names, vec!["cy".to_string(), "di".to_string()]);
+
+    // --- Transaction commit/rollback, via the seam primitives on this
+    // connection's handle (the RAII/closure facade is Phase 3). ---
+    let h = conn.handle();
+    driver.set_auto_commit(h, false).expect("autocommit off");
+
+    // Rollback discards an insert.
+    conn.execute(
+        "INSERT INTO halcyon_people VALUES (?, ?, ?)",
+        (5, "eve", 40),
+    )
+    .expect("insert eve");
+    driver.rollback(h).expect("rollback");
+    let rolled_back: Vec<(i32,)> = conn
+        .query_as("SELECT id FROM halcyon_people WHERE id = 5", ())
+        .expect("post-rollback query");
+    assert!(
+        rolled_back.is_empty(),
+        "rolled-back insert must not persist"
+    );
+
+    // Commit persists an insert.
+    conn.execute(
+        "INSERT INTO halcyon_people VALUES (?, ?, ?)",
+        (6, "fin", 50),
+    )
+    .expect("insert fin");
+    driver.commit(h).expect("commit");
+    driver.set_auto_commit(h, true).expect("autocommit on");
+    let committed: Vec<(i32, String)> = conn
+        .query_as("SELECT id, name FROM halcyon_people WHERE id = 6", ())
+        .expect("post-commit query");
+    assert_eq!(committed, vec![(6, "fin".to_string())]);
 
     conn.execute("DROP TABLE halcyon_people", ())
         .expect("drop table");

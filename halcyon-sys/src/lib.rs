@@ -2,9 +2,10 @@
 //!
 //! Hand-written, deliberately minimal: only the entry points, types, and
 //! constants that Halcyon's driver seam uses. Type widths and constant values
-//! are taken from the clidriver headers (`sqlcli.h` / `sqlext.h`) as compiled
-//! on 64-bit Linux/macOS: `SQLLEN`/`SQLULEN` are 64-bit and handles are
-//! pointers.
+//! are taken from the clidriver headers (`sqlcli.h` / `sqlext.h`). On the
+//! supported Linux/macOS x86_64 targets `SQLLEN`/`SQLULEN` are **32-bit**
+//! (`SQLINTEGER`/`SQLUINTEGER`) — the 64-bit form is `ODBC64`-only, which the
+//! headers enable solely for 64-bit Windows — and handles are pointers.
 //!
 //! Everything here is `unsafe` to call; the only consumer is the `driver::db2`
 //! module in the `halcyon` crate.

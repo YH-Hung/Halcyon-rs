@@ -88,7 +88,7 @@ TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --no-default-feature
 - [ ] `tokio` async facade (feature-gated, `spawn_blocking`)
 - [ ] Observability: `metrics`/`tracing`-facade adapters (feature-gated)
 - [x] CI (GitHub Actions): fmt/clippy/MSRV + pure-Rust matrix + `db2` Linux x86_64 & macOS-Intel + `live-db2` — runs once a GitHub remote is configured
-- [x] Integration tests against Dockerized Db2 — env-gated round-trip ([tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs) + [compose](docker/docker-compose.yml)) **validated end-to-end against live Db2** (connect → DDL → positional/named/batch insert → typed streaming read incl. NULL → `None`). It caught a real seam ABI bug (32-bit `SQLLEN`); transactions land with the Phase-3 facade. Also wired into CI's `live-db2` job on real x86_64
+- [x] Integration tests against Dockerized Db2 — env-gated round-trip ([tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs) + [compose](docker/docker-compose.yml)) **validated end-to-end against live Db2**: connect → DDL → positional/named/batch insert → typed streaming read (incl. NULL → `None`) → commit/rollback via the seam primitives. It caught a real seam ABI bug (32-bit `SQLLEN`). The ergonomic transaction facade is Phase 3; also wired into CI's `live-db2` job on real x86_64
 
 ## License
 

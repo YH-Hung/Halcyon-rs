@@ -118,9 +118,14 @@ As soon as Phase 1 lands, prove the seam against a real database:
 - `tests/integration/` gated on an env DSN (e.g. `HALCYON_TEST_DSN`), **skipped
   when unset** — mirrors the C++ `HALCYON_TEST_DSN` convention.
 - One end-to-end round-trip: connect → create temp table → param insert → query
-  → typed read → transaction commit/rollback → batch insert.
+  → typed read → transaction commit/rollback → batch insert. Transactions here
+  mean the **seam primitives** (`set_auto_commit`/`commit`/`rollback` on the
+  driver) — enough to prove the seam; the ergonomic RAII/closure transaction
+  facade is validated when it lands in Phase 3.
 
 **Exit:** the seam is proven, not assumed. Retire the biggest project risk here.
+Done — the round-trip (incl. commit/rollback) passes against live Db2 and caught
+the 32-bit `SQLLEN` ABI bug on the way.
 
 ### Phase 2 — Derive macro
 
