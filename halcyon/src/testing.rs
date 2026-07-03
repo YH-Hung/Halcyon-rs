@@ -373,7 +373,11 @@ impl CliDriver for MockCliDriver {
     fn column_name(&self, stmt: StatementHandle, index: usize) -> Result<String> {
         let s = self.lock();
         let st = s.statements.get(&stmt.0).ok_or_else(unknown_stmt)?;
-        st.cursor.columns.get(index).cloned().ok_or_else(range_error)
+        st.cursor
+            .columns
+            .get(index)
+            .cloned()
+            .ok_or_else(range_error)
     }
 
     fn fetch(&self, stmt: StatementHandle) -> Result<bool> {
@@ -472,7 +476,10 @@ mod tests {
     fn scripted_connect_error_is_returned_once_then_recovers() {
         let m = MockCliDriver::new();
         m.push_connect_error(Error::new(ErrorCode::Connection, "boom"));
-        assert_eq!(m.connect(&conn_params()).unwrap_err().code, ErrorCode::Connection);
+        assert_eq!(
+            m.connect(&conn_params()).unwrap_err().code,
+            ErrorCode::Connection
+        );
         // Next connect succeeds — the scripted error is consumed.
         assert!(m.connect(&conn_params()).unwrap().is_valid());
     }
@@ -567,7 +574,11 @@ mod tests {
         let m = MockCliDriver::new();
         let c = m.connect(&conn_params()).unwrap();
         let s = m.prepare(c, "INSERT INTO t VALUES (?)").unwrap();
-        let rows = vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]];
+        let rows = vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+        ];
         // Unscripted: returns the row count.
         assert_eq!(m.execute_batch(s, &rows).unwrap(), 3);
         assert_eq!(m.execute_batch_calls(), 1);
@@ -627,7 +638,10 @@ mod tests {
         let m = MockCliDriver::new();
         let c = m.connect(&conn_params()).unwrap();
         m.push_prepare_error(Error::new(ErrorCode::Syntax, "42601"));
-        assert_eq!(m.prepare(c, "SELEKT 1").unwrap_err().code, ErrorCode::Syntax);
+        assert_eq!(
+            m.prepare(c, "SELEKT 1").unwrap_err().code,
+            ErrorCode::Syntax
+        );
         // Recovers on the next prepare.
         let s = m.prepare(c, "SELECT 1").unwrap();
         m.push_execute_error(Error::new(ErrorCode::Timeout, "57014"));
@@ -642,7 +656,10 @@ mod tests {
         let s = m.prepare(c, "INSERT INTO t VALUES (?)").unwrap();
         m.push_batch_error(Error::new(ErrorCode::Constraint, "23505"));
         let rows = vec![vec![Value::Int(1)]];
-        assert_eq!(m.execute_batch(s, &rows).unwrap_err().code, ErrorCode::Constraint);
+        assert_eq!(
+            m.execute_batch(s, &rows).unwrap_err().code,
+            ErrorCode::Constraint
+        );
         // The rows are still recorded even on a failed batch.
         assert_eq!(m.execute_batch_calls(), 1);
         assert_eq!(m.last_batch_rows(), rows);
@@ -659,7 +676,10 @@ mod tests {
         ));
         m.execute(s).unwrap();
         assert!(m.fetch(s).unwrap());
-        m.fail_get_column_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-SQLGetData"));
+        m.fail_get_column_on_call(
+            2,
+            Error::new(ErrorCode::Connection, "dropped mid-SQLGetData"),
+        );
         assert_eq!(m.get_column(s, 0).unwrap(), Value::Int(1)); // call 1 ok
         assert_eq!(m.get_column(s, 1).unwrap_err().code, ErrorCode::Connection); // call 2 fails
         assert_eq!(m.get_column_calls(), 2);

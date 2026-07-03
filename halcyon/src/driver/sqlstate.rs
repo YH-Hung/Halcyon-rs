@@ -11,25 +11,46 @@ pub struct Classification {
 /// and the `retriable` flag that drives transparent auto-retry.
 pub fn classify_sqlstate(sqlstate: &str, native_error: i32) -> Classification {
     if sqlstate.starts_with("08") {
-        return Classification { code: ErrorCode::Connection, retriable: true };
+        return Classification {
+            code: ErrorCode::Connection,
+            retriable: true,
+        };
     }
     if native_error == -30081 {
-        return Classification { code: ErrorCode::Transient, retriable: true };
+        return Classification {
+            code: ErrorCode::Transient,
+            retriable: true,
+        };
     }
     if sqlstate == "40001" {
-        return Classification { code: ErrorCode::Deadlock, retriable: true };
+        return Classification {
+            code: ErrorCode::Deadlock,
+            retriable: true,
+        };
     }
     if sqlstate.starts_with("57") {
         // 57033 lock timeout / resource-not-available class: retriable timeout.
-        return Classification { code: ErrorCode::Timeout, retriable: true };
+        return Classification {
+            code: ErrorCode::Timeout,
+            retriable: true,
+        };
     }
     if sqlstate.starts_with("23") {
-        return Classification { code: ErrorCode::Constraint, retriable: false };
+        return Classification {
+            code: ErrorCode::Constraint,
+            retriable: false,
+        };
     }
     if sqlstate.starts_with("42") {
-        return Classification { code: ErrorCode::Syntax, retriable: false };
+        return Classification {
+            code: ErrorCode::Syntax,
+            retriable: false,
+        };
     }
-    Classification { code: ErrorCode::Unknown, retriable: false }
+    Classification {
+        code: ErrorCode::Unknown,
+        retriable: false,
+    }
 }
 
 #[cfg(test)]
@@ -39,7 +60,10 @@ mod tests {
     fn check(sqlstate: &str, native: i32, code: ErrorCode, retriable: bool) {
         let c = classify_sqlstate(sqlstate, native);
         assert_eq!(c.code, code, "sqlstate={sqlstate} native={native}");
-        assert_eq!(c.retriable, retriable, "sqlstate={sqlstate} native={native}");
+        assert_eq!(
+            c.retriable, retriable,
+            "sqlstate={sqlstate} native={native}"
+        );
     }
 
     #[test]

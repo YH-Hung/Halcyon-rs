@@ -183,7 +183,10 @@ impl Db2CliDriver {
         unsafe {
             cli::SQLAllocHandle(cli::SQL_HANDLE_ENV, cli::SQL_NULL_HANDLE, &mut env);
         }
-        Db2CliDriver { env: RawHandle(env), inner: Mutex::new(Inner::default()) }
+        Db2CliDriver {
+            env: RawHandle(env),
+            inner: Mutex::new(Inner::default()),
+        }
     }
 
     /// The bookkeeping is consistent between operations and the lock is never
@@ -202,10 +205,17 @@ impl Db2CliDriver {
     }
 
     fn end_tran(&self, conn: ConnectionHandle, how: cli::SQLSMALLINT, context: &str) -> Result<()> {
-        let Some(dbc) = self.conn_handle(conn) else { return Err(unknown_conn()) };
+        let Some(dbc) = self.conn_handle(conn) else {
+            return Err(unknown_conn());
+        };
         let rc = unsafe { cli::SQLEndTran(cli::SQL_HANDLE_DBC, dbc.0, how) };
         if !cli_ok(rc) {
-            return Err(make_error(cli::SQL_HANDLE_DBC, dbc.0, ErrorCode::Unknown, context));
+            return Err(make_error(
+                cli::SQL_HANDLE_DBC,
+                dbc.0,
+                ErrorCode::Unknown,
+                context,
+            ));
         }
         Ok(())
     }
@@ -266,12 +276,18 @@ fn get_string(h: cli::SQLHANDLE, col: cli::SQLUSMALLINT) -> Result<Value> {
             break;
         }
         if !cli_ok(rc) {
-            return Err(make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLGetData char failed"));
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                "SQLGetData char failed",
+            ));
         }
         if ind == cli::SQL_NULL_DATA {
             return Ok(Value::Null);
         }
-        let copied = if ind == cli::SQLLEN::from(cli::SQL_NTS) || ind >= chunk.len() as cli::SQLLEN {
+        let copied = if ind == cli::SQLLEN::from(cli::SQL_NTS) || ind >= chunk.len() as cli::SQLLEN
+        {
             // Truncated chunk: the CLI NUL-terminates within the buffer.
             chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len())
         } else {
@@ -309,7 +325,12 @@ fn get_binary(h: cli::SQLHANDLE, col: cli::SQLUSMALLINT) -> Result<Value> {
             break;
         }
         if !cli_ok(rc) {
-            return Err(make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLGetData binary failed"));
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                "SQLGetData binary failed",
+            ));
         }
         if ind == cli::SQL_NULL_DATA {
             return Ok(Value::Null);
@@ -335,7 +356,12 @@ impl CliDriver for Db2CliDriver {
             let _lk = self.lock();
             let rc = unsafe { cli::SQLAllocHandle(cli::SQL_HANDLE_DBC, self.env.0, &mut dbc) };
             if !cli_ok(rc) {
-                return Err(make_error(cli::SQL_HANDLE_ENV, self.env.0, ErrorCode::Connection, "alloc dbc"));
+                return Err(make_error(
+                    cli::SQL_HANDLE_ENV,
+                    self.env.0,
+                    ErrorCode::Connection,
+                    "alloc dbc",
+                ));
             }
         }
         // The dbc is private to this thread until it is published into conns
@@ -356,7 +382,12 @@ impl CliDriver for Db2CliDriver {
             )
         };
         if !cli_ok(rc) {
-            let e = make_error(cli::SQL_HANDLE_DBC, dbc, ErrorCode::Connection, "SQLDriverConnect failed");
+            let e = make_error(
+                cli::SQL_HANDLE_DBC,
+                dbc,
+                ErrorCode::Connection,
+                "SQLDriverConnect failed",
+            );
             unsafe { cli::SQLFreeHandle(cli::SQL_HANDLE_DBC, dbc) };
             return Err(e);
         }
@@ -370,7 +401,9 @@ impl CliDriver for Db2CliDriver {
     fn disconnect(&self, conn: ConnectionHandle) -> Result<()> {
         let (dbc, children) = {
             let mut inner = self.lock();
-            let Some(dbc) = inner.conns.remove(&conn.0) else { return Ok(()) };
+            let Some(dbc) = inner.conns.remove(&conn.0) else {
+                return Ok(());
+            };
             // Unregister this connection's statements so a later finalize is a
             // clean no-op instead of freeing a stale child handle.
             let mut children = Vec::new();
@@ -397,7 +430,9 @@ impl CliDriver for Db2CliDriver {
     }
 
     fn is_alive(&self, conn: ConnectionHandle) -> Result<bool> {
-        let Some(dbc) = self.conn_handle(conn) else { return Ok(false) };
+        let Some(dbc) = self.conn_handle(conn) else {
+            return Ok(false);
+        };
         let mut s: cli::SQLHANDLE = ptr::null_mut();
         let rc = unsafe { cli::SQLAllocHandle(cli::SQL_HANDLE_STMT, dbc.0, &mut s) };
         if !cli_ok(rc) {
@@ -413,17 +448,29 @@ impl CliDriver for Db2CliDriver {
     }
 
     fn prepare(&self, conn: ConnectionHandle, sql: &str) -> Result<StatementHandle> {
-        let Some(dbc) = self.conn_handle(conn) else { return Err(unknown_conn()) };
+        let Some(dbc) = self.conn_handle(conn) else {
+            return Err(unknown_conn());
+        };
         let mut s: cli::SQLHANDLE = ptr::null_mut();
         let rc = unsafe { cli::SQLAllocHandle(cli::SQL_HANDLE_STMT, dbc.0, &mut s) };
         if !cli_ok(rc) {
-            return Err(make_error(cli::SQL_HANDLE_DBC, dbc.0, ErrorCode::Unknown, "alloc stmt"));
+            return Err(make_error(
+                cli::SQL_HANDLE_DBC,
+                dbc.0,
+                ErrorCode::Unknown,
+                "alloc stmt",
+            ));
         }
         // Explicit byte length — never SQL_NTS (no NUL terminator in Rust buffers).
         let mut text = sql.as_bytes().to_vec();
         let rc = unsafe { cli::SQLPrepare(s, text.as_mut_ptr(), text.len() as cli::SQLINTEGER) };
         if !cli_ok(rc) {
-            let e = make_error(cli::SQL_HANDLE_STMT, s, ErrorCode::Syntax, "SQLPrepare failed");
+            let e = make_error(
+                cli::SQL_HANDLE_STMT,
+                s,
+                ErrorCode::Syntax,
+                "SQLPrepare failed",
+            );
             unsafe { cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, s) };
             return Err(e);
         }
@@ -441,14 +488,19 @@ impl CliDriver for Db2CliDriver {
             h,
             StmtEntry {
                 conn: conn.0,
-                state: Arc::new(Mutex::new(StmtState { handle: RawHandle(s), bound: Vec::new() })),
+                state: Arc::new(Mutex::new(StmtState {
+                    handle: RawHandle(s),
+                    bound: Vec::new(),
+                })),
             },
         );
         Ok(StatementHandle(h))
     }
 
     fn bind_params(&self, stmt: StatementHandle, params: &[Value]) -> Result<()> {
-        let Some(st) = self.stmt_state(stmt) else { return Err(unknown_stmt()) };
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
         let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
         // Build every BoundParam first so the Vec reaches its final size, then
         // bind — the addresses handed to the CLI must not move afterwards.
@@ -469,8 +521,11 @@ impl CliDriver for Db2CliDriver {
                 buf_len = bp.buf.len() as cli::SQLLEN;
                 bp.buf.as_mut_ptr().cast()
             };
-            let column_size: cli::SQLULEN =
-                if bp.len_ind == cli::SQL_NULL_DATA { 0 } else { buf_len as cli::SQLULEN };
+            let column_size: cli::SQLULEN = if bp.len_ind == cli::SQL_NULL_DATA {
+                0
+            } else {
+                buf_len as cli::SQLULEN
+            };
             let rc = unsafe {
                 cli::SQLBindParameter(
                     h,
@@ -486,19 +541,31 @@ impl CliDriver for Db2CliDriver {
                 )
             };
             if !cli_ok(rc) {
-                return Err(make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLBindParameter failed"));
+                return Err(make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLBindParameter failed",
+                ));
             }
         }
         Ok(())
     }
 
     fn execute(&self, stmt: StatementHandle) -> Result<i64> {
-        let Some(st) = self.stmt_state(stmt) else { return Err(unknown_stmt()) };
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
         let st = st.lock().unwrap_or_else(|p| p.into_inner());
         let h = st.handle.0;
         let rc = unsafe { cli::SQLExecute(h) };
         if !cli_ok(rc) && rc != cli::SQL_NO_DATA {
-            return Err(make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLExecute failed"));
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                "SQLExecute failed",
+            ));
         }
         let mut rows: cli::SQLLEN = 0;
         unsafe { cli::SQLRowCount(h, &mut rows) };
@@ -509,7 +576,9 @@ impl CliDriver for Db2CliDriver {
         // Soundness gate: every unsafe buffer write below assumes a rectangular,
         // type-homogeneous batch. Validate before touching anything.
         crate::driver::batch::validate_batch_rows(rows)?;
-        let Some(st) = self.stmt_state(stmt) else { return Err(unknown_stmt()) };
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
         let st = st.lock().unwrap_or_else(|p| p.into_inner());
         let h = st.handle.0;
         let n_rows = rows.len();
@@ -588,7 +657,11 @@ impl CliDriver for Db2CliDriver {
                 let prospective_rows = end - start + 1;
                 let mut bytes = 0usize;
                 for c in 0..n_cols {
-                    let w = if is_var[c] { new_max[c].max(1) } else { fixed_w[c] as usize };
+                    let w = if is_var[c] {
+                        new_max[c].max(1)
+                    } else {
+                        fixed_w[c] as usize
+                    };
                     bytes += w * prospective_rows;
                 }
                 if end > start && bytes > BYTE_BUDGET {
@@ -608,7 +681,11 @@ impl CliDriver for Db2CliDriver {
             let mut ind: Vec<Vec<cli::SQLLEN>> = Vec::with_capacity(n_cols);
             let mut width = vec![0 as cli::SQLLEN; n_cols];
             for c in 0..n_cols {
-                width[c] = if is_var[c] { col_max[c].max(1) as cli::SQLLEN } else { fixed_w[c] };
+                width[c] = if is_var[c] {
+                    col_max[c].max(1) as cli::SQLLEN
+                } else {
+                    fixed_w[c]
+                };
                 let w = width[c] as usize;
                 let nbytes = w * chunk_rows;
                 let mut col = vec![0i64; nbytes.div_ceil(std::mem::size_of::<i64>())];
@@ -639,7 +716,12 @@ impl CliDriver for Db2CliDriver {
             }
 
             let mut rc_set = unsafe {
-                cli::SQLSetStmtAttr(h, cli::SQL_ATTR_PARAMSET_SIZE, attr_value(chunk_rows as cli::SQLULEN), 0)
+                cli::SQLSetStmtAttr(
+                    h,
+                    cli::SQL_ATTR_PARAMSET_SIZE,
+                    attr_value(chunk_rows as cli::SQLULEN),
+                    0,
+                )
             };
             if cli_ok(rc_set) {
                 rc_set = unsafe {
@@ -652,7 +734,12 @@ impl CliDriver for Db2CliDriver {
                 };
             }
             if !cli_ok(rc_set) {
-                let e = make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLSetStmtAttr (array binding) failed");
+                let e = make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLSetStmtAttr (array binding) failed",
+                );
                 reset_paramset(h);
                 return Err(e);
             }
@@ -673,7 +760,12 @@ impl CliDriver for Db2CliDriver {
                     )
                 };
                 if !cli_ok(rc) {
-                    let e = make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLBindParameter (array) failed");
+                    let e = make_error(
+                        cli::SQL_HANDLE_STMT,
+                        h,
+                        ErrorCode::Unknown,
+                        "SQLBindParameter (array) failed",
+                    );
                     reset_paramset(h);
                     return Err(e);
                 }
@@ -686,7 +778,12 @@ impl CliDriver for Db2CliDriver {
                 // — surface the Db2 diagnostic (SQLSTATE) as-is. Wrap the call
                 // in a transaction for whole-batch atomicity and re-drive on
                 // error.
-                let e = make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLExecute (array binding) failed");
+                let e = make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLExecute (array binding) failed",
+                );
                 reset_paramset(h);
                 return Err(e);
             }
@@ -709,19 +806,28 @@ impl CliDriver for Db2CliDriver {
     }
 
     fn column_count(&self, stmt: StatementHandle) -> Result<usize> {
-        let Some(st) = self.stmt_state(stmt) else { return Err(unknown_stmt()) };
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
         let st = st.lock().unwrap_or_else(|p| p.into_inner());
         let h = st.handle.0;
         let mut n: cli::SQLSMALLINT = 0;
         let rc = unsafe { cli::SQLNumResultCols(h, &mut n) };
         if !cli_ok(rc) {
-            return Err(make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLNumResultCols failed"));
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                "SQLNumResultCols failed",
+            ));
         }
         Ok(n.max(0) as usize)
     }
 
     fn column_name(&self, stmt: StatementHandle, index: usize) -> Result<String> {
-        let Some(st) = self.stmt_state(stmt) else { return Err(unknown_stmt()) };
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
         let st = st.lock().unwrap_or_else(|p| p.into_inner());
         let h = st.handle.0;
         let mut name = [0u8; 256];
@@ -744,27 +850,41 @@ impl CliDriver for Db2CliDriver {
             )
         };
         if !cli_ok(rc) {
-            return Err(make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLDescribeCol failed"));
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                "SQLDescribeCol failed",
+            ));
         }
         let len = (name_len.max(0) as usize).min(name.len());
         Ok(String::from_utf8_lossy(&name[..len]).into_owned())
     }
 
     fn fetch(&self, stmt: StatementHandle) -> Result<bool> {
-        let Some(st) = self.stmt_state(stmt) else { return Err(unknown_stmt()) };
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
         let st = st.lock().unwrap_or_else(|p| p.into_inner());
         let rc = unsafe { cli::SQLFetch(st.handle.0) };
         if rc == cli::SQL_NO_DATA {
             return Ok(false);
         }
         if !cli_ok(rc) {
-            return Err(make_error(cli::SQL_HANDLE_STMT, st.handle.0, ErrorCode::Unknown, "SQLFetch failed"));
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                st.handle.0,
+                ErrorCode::Unknown,
+                "SQLFetch failed",
+            ));
         }
         Ok(true)
     }
 
     fn get_column(&self, stmt: StatementHandle, index: usize) -> Result<Value> {
-        let Some(st) = self.stmt_state(stmt) else { return Err(unknown_stmt()) };
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
         let st = st.lock().unwrap_or_else(|p| p.into_inner());
         let h = st.handle.0;
         let col = (index + 1) as cli::SQLUSMALLINT;
@@ -788,7 +908,12 @@ impl CliDriver for Db2CliDriver {
             )
         };
         if !cli_ok(rc) {
-            return Err(make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLDescribeCol failed"));
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                "SQLDescribeCol failed",
+            ));
         }
 
         match sql_type {
@@ -806,7 +931,12 @@ impl CliDriver for Db2CliDriver {
                     )
                 };
                 if !cli_ok(rc) {
-                    return Err(make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLGetData int failed"));
+                    return Err(make_error(
+                        cli::SQL_HANDLE_STMT,
+                        h,
+                        ErrorCode::Unknown,
+                        "SQLGetData int failed",
+                    ));
                 }
                 if ind == cli::SQL_NULL_DATA {
                     return Ok(Value::Null);
@@ -827,7 +957,12 @@ impl CliDriver for Db2CliDriver {
                     )
                 };
                 if !cli_ok(rc) {
-                    return Err(make_error(cli::SQL_HANDLE_STMT, h, ErrorCode::Unknown, "SQLGetData double failed"));
+                    return Err(make_error(
+                        cli::SQL_HANDLE_STMT,
+                        h,
+                        ErrorCode::Unknown,
+                        "SQLGetData double failed",
+                    ));
                 }
                 if ind == cli::SQL_NULL_DATA {
                     return Ok(Value::Null);
@@ -860,23 +995,43 @@ impl CliDriver for Db2CliDriver {
 
     fn close_cursor(&self, stmt: StatementHandle) -> Result<()> {
         // Unknown/finalized handle: no-op.
-        let Some(st) = self.stmt_state(stmt) else { return Ok(()) };
+        let Some(st) = self.stmt_state(stmt) else {
+            return Ok(());
+        };
         let st = st.lock().unwrap_or_else(|p| p.into_inner());
         let rc = unsafe { cli::SQLFreeStmt(st.handle.0, cli::SQL_CLOSE) };
         // SQL_SUCCESS_WITH_INFO / "no cursor open" are benign; only a hard
         // error is reported.
         if !cli_ok(rc) {
-            return Err(make_error(cli::SQL_HANDLE_STMT, st.handle.0, ErrorCode::Unknown, "SQLFreeStmt(SQL_CLOSE) failed"));
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                st.handle.0,
+                ErrorCode::Unknown,
+                "SQLFreeStmt(SQL_CLOSE) failed",
+            ));
         }
         Ok(())
     }
 
     fn set_auto_commit(&self, conn: ConnectionHandle, enabled: bool) -> Result<()> {
-        let Some(dbc) = self.conn_handle(conn) else { return Err(unknown_conn()) };
-        let v = attr_value(if enabled { cli::SQL_AUTOCOMMIT_ON } else { cli::SQL_AUTOCOMMIT_OFF });
-        let rc = unsafe { cli::SQLSetConnectAttr(dbc.0, cli::SQL_ATTR_AUTOCOMMIT, v, cli::SQL_IS_INTEGER) };
+        let Some(dbc) = self.conn_handle(conn) else {
+            return Err(unknown_conn());
+        };
+        let v = attr_value(if enabled {
+            cli::SQL_AUTOCOMMIT_ON
+        } else {
+            cli::SQL_AUTOCOMMIT_OFF
+        });
+        let rc = unsafe {
+            cli::SQLSetConnectAttr(dbc.0, cli::SQL_ATTR_AUTOCOMMIT, v, cli::SQL_IS_INTEGER)
+        };
         if !cli_ok(rc) {
-            return Err(make_error(cli::SQL_HANDLE_DBC, dbc.0, ErrorCode::Unknown, "SQLSetConnectAttr(AUTOCOMMIT) failed"));
+            return Err(make_error(
+                cli::SQL_HANDLE_DBC,
+                dbc.0,
+                ErrorCode::Unknown,
+                "SQLSetConnectAttr(AUTOCOMMIT) failed",
+            ));
         }
         Ok(())
     }
@@ -913,12 +1068,21 @@ mod tests {
         d.finalize(stmt).unwrap(); // idempotent no-op
         d.close_cursor(stmt).unwrap(); // no-op
 
-        assert_eq!(d.prepare(conn, "SELECT 1").unwrap_err().code, ErrorCode::Connection);
-        assert_eq!(d.set_auto_commit(conn, false).unwrap_err().code, ErrorCode::Connection);
+        assert_eq!(
+            d.prepare(conn, "SELECT 1").unwrap_err().code,
+            ErrorCode::Connection
+        );
+        assert_eq!(
+            d.set_auto_commit(conn, false).unwrap_err().code,
+            ErrorCode::Connection
+        );
         assert_eq!(d.commit(conn).unwrap_err().code, ErrorCode::Connection);
         assert_eq!(d.rollback(conn).unwrap_err().code, ErrorCode::Connection);
 
-        assert_eq!(d.bind_params(stmt, &[]).unwrap_err().code, ErrorCode::Unknown);
+        assert_eq!(
+            d.bind_params(stmt, &[]).unwrap_err().code,
+            ErrorCode::Unknown
+        );
         assert_eq!(d.execute(stmt).unwrap_err().code, ErrorCode::Unknown);
         assert_eq!(d.fetch(stmt).unwrap_err().code, ErrorCode::Unknown);
         assert_eq!(d.column_count(stmt).unwrap_err().code, ErrorCode::Unknown);
@@ -930,9 +1094,18 @@ mod tests {
         let stmt = StatementHandle(42);
 
         let ragged = vec![vec![Value::Int(1), Value::Int(2)], vec![Value::Int(3)]];
-        assert_eq!(d.execute_batch(stmt, &ragged).unwrap_err().code, ErrorCode::Mapping);
+        assert_eq!(
+            d.execute_batch(stmt, &ragged).unwrap_err().code,
+            ErrorCode::Mapping
+        );
 
-        let mixed = vec![vec![Value::Int(1)], vec![Value::Text("overflows an 8-byte slot".into())]];
-        assert_eq!(d.execute_batch(stmt, &mixed).unwrap_err().code, ErrorCode::Mapping);
+        let mixed = vec![
+            vec![Value::Int(1)],
+            vec![Value::Text("overflows an 8-byte slot".into())],
+        ];
+        assert_eq!(
+            d.execute_batch(stmt, &mixed).unwrap_err().code,
+            ErrorCode::Mapping
+        );
     }
 }

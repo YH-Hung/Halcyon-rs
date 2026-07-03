@@ -24,7 +24,9 @@ fn type_index(v: &Value) -> Option<usize> {
 /// it before any unsafe buffer work: violating the shape precondition from
 /// safe code must yield a `Mapping` error, never an out-of-bounds write.
 pub(crate) fn validate_batch_rows(rows: &[Vec<Value>]) -> Result<()> {
-    let Some(first) = rows.first() else { return Ok(()) };
+    let Some(first) = rows.first() else {
+        return Ok(());
+    };
     let ncols = first.len();
     let mut col_type: Vec<Option<usize>> = vec![None; ncols];
     for (r, row) in rows.iter().enumerate() {
@@ -100,6 +102,9 @@ mod tests {
         ];
         let e = validate_batch_rows(&rows).unwrap_err();
         assert_eq!(e.code, ErrorCode::Mapping);
-        assert_eq!(e.message, "batch column 0 mixes value types (first at row 1)");
+        assert_eq!(
+            e.message,
+            "batch column 0 mixes value types (first at row 1)"
+        );
     }
 }
