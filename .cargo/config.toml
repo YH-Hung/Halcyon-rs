@@ -1,0 +1,5 @@
+[env]
+# Default clidriver location for a sibling checkout of the C++ Halcyon repo,
+# which vendors the IBM Db2 CLI driver. A DB2_CLIDRIVER_ROOT already present in
+# the environment takes precedence (force defaults to false).
+DB2_CLIDRIVER_ROOT = { value = "../Halcyon/third_party/clidriver", relative = true }

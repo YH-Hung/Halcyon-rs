@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.DS_Store
+.idea/
+.vscode/
+
+# Vendored IBM Db2 CLI driver (user-supplied, never committed)
+/third_party/clidriver/

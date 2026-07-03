@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["halcyon", "halcyon-sys"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "BSD-3-Clause"
+repository = "https://github.com/YH-Hung/Halcyon-rs"

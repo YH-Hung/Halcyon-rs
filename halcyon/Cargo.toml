@@ -1,0 +1,17 @@
+[package]
+name = "halcyon"
+description = "A high-level, ergonomic IBM Db2 client for Rust, built on the Db2 CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["db2"]
+# Links the IBM Db2 CLI driver (clidriver) and enables the real Db2CliDriver.
+# Disable to build/test the pure-Rust layers without clidriver installed.
+db2 = ["dep:halcyon-sys"]
+
+[dependencies]
+halcyon-sys = { path = "../halcyon-sys", optional = true }

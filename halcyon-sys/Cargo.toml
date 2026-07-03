@@ -1,0 +1,10 @@
+[package]
+name = "halcyon-sys"
+description = "Raw FFI bindings to the IBM Db2 CLI (clidriver) for Halcyon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+links = "db2"
+build = "build.rs"
