@@ -82,6 +82,60 @@ jobs:
           cargo test -p halcyon --no-default-features --features derive
 
   # ---------------------------------------------------------------------------
+  # Concurrency stress scenarios on stable (fast feedback). Pure-Rust: the fake
+  # driver needs no clidriver. Also runs the stress module's own unit tests.
+  # ---------------------------------------------------------------------------
+  stress:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Stress scenarios + unit tests
+        run: |
+          cargo test -p halcyon --no-default-features --features stress --lib
+          cargo test -p halcyon --no-default-features --features stress --test stress
+
+  # ---------------------------------------------------------------------------
+  # The same scenarios under ThreadSanitizer on nightly — proves race/deadlock
+  # freedom on interleavings the deterministic runs don't reach. Pure-Rust, so
+  # no clidriver. -Zbuild-std rebuilds std with the sanitizer.
+  # ---------------------------------------------------------------------------
+  stress-tsan:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: "-Zsanitizer=thread"
+      RUST_TEST_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Stress scenarios under TSan
+        run: |
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            -p halcyon --no-default-features --features stress --test stress
+
+  # ---------------------------------------------------------------------------
+  # loom model-checking of the pool's Mutex/Condvar handoff. `--cfg loom` swaps
+  # in loom's instrumented primitives (see src/sync.rs); the std unit tests are
+  # excluded under loom, so only the loom models run.
+  # ---------------------------------------------------------------------------
+  loom:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: "--cfg loom"
+      LOOM_MAX_PREEMPTIONS: "3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: loom models
+        run: cargo test -p halcyon --no-default-features --lib loom_tests
+
+  # ---------------------------------------------------------------------------
   # Full build + tests with the real Db2CliDriver linked against the clidriver.
   # No live DB here: the integration test skips without HALCYON_TEST_DSN.
   # ---------------------------------------------------------------------------
