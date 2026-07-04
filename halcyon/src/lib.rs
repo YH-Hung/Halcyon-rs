@@ -56,6 +56,9 @@ pub mod pool;
 pub mod retry;
 mod value;
 
+// Synchronization shim (std, or loom under `--cfg loom`). See sync.rs.
+mod sync;
+
 // Shared, scriptable mock driver for the layers above the seam. Test-only, so
 // it never ships in a normal build; every upper-layer unit test builds on it.
 #[cfg(test)]

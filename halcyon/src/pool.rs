@@ -21,14 +21,15 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::ops::Deref;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::Connection;
 use crate::driver::{CliDriver, ConnectionParams};
 use crate::error::{Error, ErrorCode, Result};
 use crate::retry::BackoffPolicy;
+use crate::sync::thread::{self, JoinHandle};
+use crate::sync::{Condvar, Mutex};
 
 /// Configuration for a [`ConnectionPool`]: sizing, timeouts, validation, and
 /// reconnect backoff. Plain `Clone` data with reasonable defaults (1–8
@@ -145,7 +146,7 @@ impl PoolInner {
                     if !retriable || attempt == attempts {
                         break;
                     }
-                    thread::sleep(self.config.backoff.delay_for(attempt));
+                    std::thread::sleep(self.config.backoff.delay_for(attempt));
                 }
             }
         }
@@ -410,12 +411,14 @@ impl ConnectionPool {
             inner,
             maintenance: None,
         };
+        #[cfg(not(loom))]
         if config.start_maintenance_thread {
             pool.start_maintenance();
         }
         Ok(pool)
     }
 
+    #[cfg(not(loom))]
     fn start_maintenance(&mut self) {
         let inner = Arc::clone(&self.inner);
         let interval = inner.config.maintenance_interval;
@@ -561,7 +564,7 @@ impl fmt::Debug for PooledConnection {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::testing::MockCliDriver;

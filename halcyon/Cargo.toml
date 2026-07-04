@@ -10,6 +10,12 @@ readme = "../README.md"
 keywords = ["db2", "database", "sql", "ibm", "cli"]
 categories = ["database", "api-bindings", "external-ffi-bindings"]
 
+# `cfg(loom)` is not a Cargo feature — it's set by the dedicated loom CI job /
+# manual `--cfg loom` runs (see sync.rs). Registering it here keeps rustc's
+# `unexpected_cfgs` lint quiet under normal `-D warnings` builds.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
 [features]
 default = ["db2", "derive"]
 # Links the IBM Db2 CLI driver (clidriver) and enables the real Db2CliDriver.
@@ -33,3 +39,9 @@ trybuild = "1"
 [package.metadata.docs.rs]
 no-default-features = true
 features = ["derive"]
+
+# loom is pulled in ONLY under `--cfg loom` (the dedicated CI job / manual runs).
+# Normal builds, MSRV, and docs.rs never see it. It backs the cfg-gated `sync`
+# shim so the pool's Mutex/Condvar/thread logic can be model-checked.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
