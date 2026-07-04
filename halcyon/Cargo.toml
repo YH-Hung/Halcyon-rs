@@ -64,3 +64,7 @@ required-features = ["stress"]
 [[example]]
 name = "throughput"
 required-features = ["stress"]
+
+[[example]]
+name = "batch_bench"
+required-features = ["db2"]
