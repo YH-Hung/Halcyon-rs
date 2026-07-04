@@ -60,3 +60,7 @@ loom = "0.7"
 name = "pool_bench"
 harness = false
 required-features = ["stress"]
+
+[[example]]
+name = "throughput"
+required-features = ["stress"]
