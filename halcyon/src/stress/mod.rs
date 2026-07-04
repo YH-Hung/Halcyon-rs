@@ -6,7 +6,11 @@
 mod fake_driver;
 mod histogram;
 mod runner;
+mod scenarios;
 
 pub use fake_driver::ConcurrentFakeDriver;
 pub use histogram::LatencyHistogram;
 pub use runner::{run_workload, RunConfig, RunReport, Stop, WorkerCtx};
+pub use scenarios::{
+    config_for, make_pool_contention, make_reconnect_faults, make_txn_churn, select_n, Scenario,
+};
