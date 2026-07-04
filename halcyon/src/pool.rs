@@ -1,0 +1,860 @@
+//! Thread-safe connection pool with lazy growth, blocking acquire, transparent
+//! reconnect, and background reaping.
+//!
+//! Ported from the C++ `ConnectionPool` (`include/halcyon/pool.hpp`), minus the
+//! observability sinks and per-connection statement cache (Phases 5–6) and the
+//! async executor (Phase 7). The C++ slot-pointer bookkeeping collapses in Rust
+//! to ownership moves: an idle connection lives *in* the pool,
+//! [`acquire`](ConnectionPool::acquire) moves it out into a [`PooledConnection`]
+//! lease, and the lease's [`Drop`] moves it back (or discards it, if marked
+//! broken). A lease holds an `Arc<PoolInner>`, so it may safely outlive the
+//! [`ConnectionPool`] handle — the pool tears down only when the last of the
+//! handle, the leases, and the maintenance thread is gone.
+//!
+//! Determinism: the C++ pool injects a fake clock and sleep for instant,
+//! reproducible tests. Here the same coverage comes from boundary durations —
+//! zero backoff (so `thread::sleep` returns at once) and zero / very-large
+//! timeouts (so a reap is definite either way) — and by driving
+//! [`maintain`](ConnectionPool::maintain) directly rather than racing the
+//! background thread.
+
+use std::collections::VecDeque;
+use std::fmt;
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use crate::core::Connection;
+use crate::driver::{CliDriver, ConnectionParams};
+use crate::error::{Error, ErrorCode, Result};
+use crate::retry::BackoffPolicy;
+
+/// Configuration for a [`ConnectionPool`]: sizing, timeouts, validation, and
+/// reconnect backoff. Plain `Clone` data with reasonable defaults (1–8
+/// connections, 5 s acquire, 60 s idle, 30 min lifetime). Ported from the C++
+/// `PoolConfig`; the observability and statement-cache fields land in later
+/// phases, and the injected clock/sleep are gone (see the module docs).
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// Minimum warm connections kept alive; the pool refills up to this on
+    /// maintenance and never reaps below it (except for lifetime expiry).
+    pub min: usize,
+    /// Hard ceiling on physical connections (idle + leased + in-flight connects).
+    pub max: usize,
+    /// How long [`acquire`](ConnectionPool::acquire) blocks for a connection
+    /// before returning a [`ErrorCode::Pool`] timeout.
+    pub acquire_timeout: Duration,
+    /// Idle connections above `min` are reaped once idle this long.
+    pub idle_timeout: Duration,
+    /// Any connection older than this is reaped on maintenance, even at `min`.
+    pub max_lifetime: Duration,
+    /// Probe (and reconnect if dead) each connection as it is acquired.
+    pub validate_on_acquire: bool,
+    /// Backoff applied to reconnect attempts inside the pool.
+    pub backoff: BackoffPolicy,
+    /// How often the background maintenance thread reaps and refills.
+    pub maintenance_interval: Duration,
+    /// Spawn the background maintenance thread. Disable to drive
+    /// [`maintain`](ConnectionPool::maintain) manually (tests do this).
+    pub start_maintenance_thread: bool,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        PoolConfig {
+            min: 1,
+            max: 8,
+            acquire_timeout: Duration::from_millis(5000),
+            idle_timeout: Duration::from_millis(60_000),
+            max_lifetime: Duration::from_millis(1_800_000),
+            validate_on_acquire: false,
+            backoff: BackoffPolicy::default(),
+            maintenance_interval: Duration::from_millis(1000),
+            start_maintenance_thread: true,
+        }
+    }
+}
+
+/// One idle physical connection plus the bookkeeping the reaper needs.
+struct IdleConn {
+    conn: Connection,
+    /// When the physical connection was opened (reset on reconnect); drives
+    /// `max_lifetime` expiry.
+    created_at: Instant,
+    /// When it was last returned to the pool; drives `idle_timeout` expiry.
+    last_used_at: Instant,
+}
+
+/// Mutable pool state behind the mutex.
+struct PoolState {
+    idle: VecDeque<IdleConn>,
+    /// Connections currently leased out (neither idle nor in-flight).
+    leased: usize,
+    /// In-flight connects reserved against `max` while the lock is dropped, so
+    /// concurrent acquirers/refillers can't collectively exceed `max`.
+    pending: usize,
+    stopping: bool,
+}
+
+impl PoolState {
+    /// Established physical connections (idle + leased), excluding in-flight
+    /// connects — the C++ `slots_.size()`.
+    fn established(&self) -> usize {
+        self.idle.len() + self.leased
+    }
+}
+
+/// Shared pool internals, reference-counted so leases and the maintenance thread
+/// keep it alive independently of the [`ConnectionPool`] handle.
+struct PoolInner {
+    driver: Arc<dyn CliDriver>,
+    params: ConnectionParams,
+    config: PoolConfig,
+    state: Mutex<PoolState>,
+    /// Signals an acquirer that an idle connection is available or that reserved
+    /// capacity was freed.
+    available: Condvar,
+    /// Wakes the maintenance thread promptly on shutdown.
+    maint: Condvar,
+}
+
+fn acquire_timeout_error() -> Error {
+    // Matches the C++ acquire timeout: a non-retriable pool-class error.
+    Error::new(ErrorCode::Pool, "connection acquire timed out")
+}
+
+impl PoolInner {
+    /// Opens one physical connection with bounded exponential backoff. Called
+    /// with the state lock **not** held, so a slow Db2 connect or backoff sleep
+    /// never blocks other acquirers, releasers, or the reaper.
+    fn make_connection(&self) -> Result<Connection> {
+        let attempts = self.config.backoff.max_attempts.max(1);
+        let mut last = Error::new(ErrorCode::Connection, "no connect attempt made");
+        for attempt in 1..=attempts {
+            match Connection::open(Arc::clone(&self.driver), &self.params) {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    // Retry is driven by `Error.retriable` (the repo rule; spec
+                    // Phase 4 "transparent reconnect … driven by Error.retriable").
+                    // A non-retriable connect failure — bad credentials, unknown
+                    // database — fails identically every attempt, so surface it at
+                    // once rather than sleeping through the backoff.
+                    let retriable = e.retriable;
+                    last = e;
+                    if !retriable || attempt == attempts {
+                        break;
+                    }
+                    thread::sleep(self.config.backoff.delay_for(attempt));
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// Completes an acquire of a popped idle connection under
+    /// `validate_on_acquire`: probes it (the lock is already dropped), and if dead
+    /// reconnects in place — disconnecting the dead connection **outside** the
+    /// lock, matching the `release`/`maintain` discipline so a slow disconnect
+    /// can't stall other acquirers/releasers/the reaper. `leased` is already
+    /// charged; on a reconnect failure it is un-charged and capacity freed. The
+    /// C++ `ensure_alive` analog.
+    fn validated_lease(
+        self: &Arc<Self>,
+        conn: Connection,
+        created_at: Instant,
+    ) -> Result<PooledConnection> {
+        if self.driver.is_alive(conn.handle()).unwrap_or(false) {
+            return Ok(PooledConnection::new(Arc::clone(self), conn, created_at));
+        }
+        // Dead: disconnect it (unlocked), then reconnect in its place.
+        drop(conn);
+        match self.make_connection() {
+            Ok(fresh) => Ok(PooledConnection::new(
+                Arc::clone(self),
+                fresh,
+                Instant::now(),
+            )),
+            Err(e) => {
+                let mut guard = self.state.lock().expect("pool mutex poisoned");
+                guard.leased -= 1;
+                self.available.notify_one(); // capacity freed → wake a waiter
+                Err(e)
+            }
+        }
+    }
+
+    /// Acquires a connection, blocking up to `acquire_timeout`. Reuses an idle
+    /// connection if one exists, else grows the pool up to `max`, else waits for
+    /// a release. Mirrors the C++ `ConnectionPool::acquire` loop.
+    fn acquire(self: &Arc<Self>) -> Result<PooledConnection> {
+        let mut guard = self.state.lock().expect("pool mutex poisoned");
+        let start = Instant::now();
+        loop {
+            if guard.stopping {
+                return Err(Error::new(
+                    ErrorCode::Pool,
+                    "connection pool is shutting down",
+                ));
+            }
+
+            // 1. Reuse an idle connection.
+            if let Some(idle) = guard.idle.pop_front() {
+                guard.leased += 1;
+                let IdleConn {
+                    conn, created_at, ..
+                } = idle;
+                if self.config.validate_on_acquire {
+                    // `leased` is already charged, so capacity accounting stays
+                    // correct and no one else can hand out this connection while
+                    // we validate it with the lock dropped.
+                    drop(guard);
+                    return self.validated_lease(conn, created_at);
+                }
+                return Ok(PooledConnection::new(Arc::clone(self), conn, created_at));
+            }
+
+            // 2. Grow if under `max`. Reserve via `pending`, connect without the
+            //    lock, then re-check.
+            if guard.established() + guard.pending < self.config.max {
+                guard.pending += 1;
+                drop(guard);
+                let made = self.make_connection();
+                guard = self.state.lock().expect("pool mutex poisoned");
+                guard.pending -= 1;
+                match made {
+                    Ok(conn) => {
+                        guard.leased += 1;
+                        return Ok(PooledConnection::new(
+                            Arc::clone(self),
+                            conn,
+                            Instant::now(),
+                        ));
+                    }
+                    Err(e) => {
+                        self.available.notify_one(); // reserved capacity freed
+                        return Err(e);
+                    }
+                }
+            }
+
+            // 3. At capacity: block until a release, or time out.
+            let remaining = match self.config.acquire_timeout.checked_sub(start.elapsed()) {
+                Some(r) if !r.is_zero() => r,
+                _ => return Err(acquire_timeout_error()),
+            };
+            let (g, timeout) = self
+                .available
+                .wait_timeout(guard, remaining)
+                .expect("pool mutex poisoned");
+            guard = g;
+            if timeout.timed_out()
+                && guard.idle.is_empty()
+                && guard.established() + guard.pending >= self.config.max
+            {
+                return Err(acquire_timeout_error());
+            }
+        }
+    }
+
+    /// Returns a leased connection to the pool, or discards it (disconnecting)
+    /// when broken or during shutdown. Mirrors the C++ `release_slot`.
+    fn release(&self, conn: Connection, created_at: Instant, broken: bool) {
+        let mut guard = self.state.lock().expect("pool mutex poisoned");
+        guard.leased -= 1;
+        if broken || guard.stopping {
+            self.available.notify_one(); // capacity freed → wake a waiter
+            drop(guard);
+            drop(conn); // Connection::drop disconnects, outside the lock
+        } else {
+            let now = Instant::now();
+            guard.idle.push_back(IdleConn {
+                conn,
+                created_at,
+                last_used_at: now,
+            });
+            self.available.notify_one();
+        }
+    }
+
+    /// One maintenance pass: reap expired idle connections (respecting `min` for
+    /// idle expiry, always for lifetime expiry) and refill back up to `min`.
+    /// Ported from the C++ `ConnectionPool::maintain`.
+    fn maintain(&self) {
+        let mut discarded: Vec<Connection> = Vec::new();
+        let mut guard = self.state.lock().expect("pool mutex poisoned");
+        let now = Instant::now();
+
+        // Reap. `total` tracks established connections as we remove them so the
+        // `min` floor is enforced against the shrinking count (C++ over_min).
+        let idles = std::mem::take(&mut guard.idle);
+        let mut total = idles.len() + guard.leased;
+        let mut kept = VecDeque::with_capacity(idles.len());
+        for ic in idles {
+            let expired_life =
+                now.saturating_duration_since(ic.created_at) >= self.config.max_lifetime;
+            let expired_idle =
+                now.saturating_duration_since(ic.last_used_at) >= self.config.idle_timeout;
+            let over_min = total > self.config.min;
+            if expired_life || (expired_idle && over_min) {
+                total -= 1;
+                discarded.push(ic.conn); // disconnect after the lock is released
+            } else {
+                kept.push_back(ic);
+            }
+        }
+        guard.idle = kept;
+
+        // Refill up to `min` (best effort; a failed connect retries next pass).
+        // Connect without the lock, reserving via `pending` like acquire().
+        loop {
+            if guard.stopping || guard.established() + guard.pending >= self.config.min {
+                break;
+            }
+            guard.pending += 1;
+            drop(guard);
+            let made = self.make_connection();
+            guard = self.state.lock().expect("pool mutex poisoned");
+            guard.pending -= 1;
+            let added = made.is_ok() && !guard.stopping;
+            if let Ok(conn) = made {
+                if guard.stopping {
+                    discarded.push(conn);
+                } else {
+                    let t = Instant::now();
+                    guard.idle.push_back(IdleConn {
+                        conn,
+                        created_at: t,
+                        last_used_at: t,
+                    });
+                }
+            }
+            self.available.notify_one(); // capacity may be free → wake a waiter
+            if !added {
+                break;
+            }
+        }
+        drop(guard);
+        drop(discarded); // disconnect reaped/leftover connections outside the lock
+    }
+}
+
+/// A thread-safe pool of Db2 connections. Create with [`ConnectionPool::create`];
+/// [`Database`](crate::Database) manages one internally, so prefer `Database` for
+/// application code. Cloneable handles are not provided — share via `Arc` if
+/// needed; leases already keep the pool alive on their own.
+pub struct ConnectionPool {
+    inner: Arc<PoolInner>,
+    maintenance: Option<JoinHandle<()>>,
+}
+
+impl ConnectionPool {
+    /// Builds a pool over `driver`, warms it up to `config.min` connections, and
+    /// (unless disabled) starts the background maintenance thread. A warmup
+    /// connect failure aborts creation and returns the error.
+    pub fn create(
+        driver: Arc<dyn CliDriver>,
+        params: ConnectionParams,
+        config: PoolConfig,
+    ) -> Result<ConnectionPool> {
+        let inner = Arc::new(PoolInner {
+            driver,
+            params,
+            config: config.clone(),
+            state: Mutex::new(PoolState {
+                idle: VecDeque::new(),
+                leased: 0,
+                pending: 0,
+                stopping: false,
+            }),
+            available: Condvar::new(),
+            maint: Condvar::new(),
+        });
+
+        // Warm up to `min`. Single-threaded here — nothing else observes the pool
+        // yet — so connect directly and stash the results; a failure drops any
+        // connections opened so far (disconnecting them) and returns the error.
+        let mut idle = VecDeque::with_capacity(config.min);
+        for _ in 0..config.min {
+            let conn = inner.make_connection()?;
+            let t = Instant::now();
+            idle.push_back(IdleConn {
+                conn,
+                created_at: t,
+                last_used_at: t,
+            });
+        }
+        inner.state.lock().expect("pool mutex poisoned").idle = idle;
+
+        let mut pool = ConnectionPool {
+            inner,
+            maintenance: None,
+        };
+        if config.start_maintenance_thread {
+            pool.start_maintenance();
+        }
+        Ok(pool)
+    }
+
+    fn start_maintenance(&mut self) {
+        let inner = Arc::clone(&self.inner);
+        let interval = inner.config.maintenance_interval;
+        let handle = thread::spawn(move || loop {
+            let guard = inner.state.lock().expect("pool mutex poisoned");
+            // Wait up to `interval`, or wake immediately on shutdown.
+            let (guard, _) = inner
+                .maint
+                .wait_timeout_while(guard, interval, |s| !s.stopping)
+                .expect("pool mutex poisoned");
+            if guard.stopping {
+                break;
+            }
+            drop(guard); // maintain() takes the lock itself
+            inner.maintain();
+        });
+        self.maintenance = Some(handle);
+    }
+
+    /// Leases a connection, blocking up to `acquire_timeout`.
+    pub fn acquire(&self) -> Result<PooledConnection> {
+        self.inner.acquire()
+    }
+
+    /// Runs one maintenance pass (reap expired idle, refill to `min`). Public so
+    /// callers — and tests — can drive it deterministically.
+    pub fn maintain(&self) {
+        self.inner.maintain();
+    }
+
+    /// Total established connections (idle + leased).
+    pub fn total_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .expect("pool mutex poisoned")
+            .established()
+    }
+
+    /// Idle (available) connections.
+    pub fn idle_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .expect("pool mutex poisoned")
+            .idle
+            .len()
+    }
+
+    /// Leased (in-use) connections.
+    pub fn active_count(&self) -> usize {
+        self.inner.state.lock().expect("pool mutex poisoned").leased
+    }
+
+    /// The reconnect backoff this pool was configured with — the facade derives
+    /// its default per-call retry policy from it.
+    pub fn backoff_policy(&self) -> BackoffPolicy {
+        self.inner.config.backoff.clone()
+    }
+}
+
+impl Drop for ConnectionPool {
+    fn drop(&mut self) {
+        {
+            let mut guard = self.inner.state.lock().expect("pool mutex poisoned");
+            guard.stopping = true;
+        }
+        self.inner.maint.notify_all();
+        self.inner.available.notify_all();
+        if let Some(handle) = self.maintenance.take() {
+            let _ = handle.join();
+        }
+        // Idle connections disconnect when the last `Arc<PoolInner>` drops — here,
+        // unless outstanding leases still hold clones, in which case teardown
+        // waits for the final lease.
+    }
+}
+
+impl fmt::Debug for ConnectionPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let guard = self.inner.state.lock().expect("pool mutex poisoned");
+        f.debug_struct("ConnectionPool")
+            .field("min", &self.inner.config.min)
+            .field("max", &self.inner.config.max)
+            .field("idle", &guard.idle.len())
+            .field("leased", &guard.leased)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An RAII lease on a pooled connection. Derefs to [`Connection`], so it drives
+/// queries/executes/transactions transparently. On drop it returns the
+/// connection to the pool — or discards it if [`mark_broken`](Self::mark_broken)
+/// was called. Move-only and `!Sync`, like the [`Connection`] it wraps.
+pub struct PooledConnection {
+    inner: Arc<PoolInner>,
+    // `Some` until dropped; taken in `Drop` to hand the connection back.
+    conn: Option<Connection>,
+    created_at: Instant,
+    broken: bool,
+}
+
+impl PooledConnection {
+    fn new(inner: Arc<PoolInner>, conn: Connection, created_at: Instant) -> Self {
+        PooledConnection {
+            inner,
+            conn: Some(conn),
+            created_at,
+            broken: false,
+        }
+    }
+
+    /// Marks the leased connection unusable: on drop it is discarded and replaced
+    /// rather than returned to the pool. The facade calls this after a
+    /// connection-class error. Mirrors the C++ `PooledConnection::markBroken`.
+    pub fn mark_broken(&mut self) {
+        self.broken = true;
+    }
+}
+
+impl Deref for PooledConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+            .as_ref()
+            .expect("pooled connection used after drop")
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.inner.release(conn, self.created_at, self.broken);
+        }
+    }
+}
+
+impl fmt::Debug for PooledConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PooledConnection")
+            .field("broken", &self.broken)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::MockCliDriver;
+    use std::sync::mpsc;
+
+    fn params() -> ConnectionParams {
+        ConnectionParams {
+            connection_string: "DSN=mock".into(),
+        }
+    }
+
+    /// A config with no background thread and zero backoff — the deterministic
+    /// base every test tweaks. `min`/`max` are set per test.
+    fn cfg(min: usize, max: usize) -> PoolConfig {
+        PoolConfig {
+            min,
+            max,
+            acquire_timeout: Duration::from_millis(200),
+            idle_timeout: Duration::from_secs(3600),
+            max_lifetime: Duration::from_secs(3600),
+            validate_on_acquire: false,
+            backoff: BackoffPolicy {
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+                max_attempts: 1,
+            },
+            maintenance_interval: Duration::from_millis(1000),
+            start_maintenance_thread: false,
+        }
+    }
+
+    fn pool(mock: &Arc<MockCliDriver>, config: PoolConfig) -> ConnectionPool {
+        ConnectionPool::create(mock.clone(), params(), config).unwrap()
+    }
+
+    fn retriable_conn(msg: &str) -> Error {
+        let mut e = Error::new(ErrorCode::Connection, msg);
+        e.retriable = true;
+        e
+    }
+
+    #[test]
+    fn create_warms_up_min_connections() {
+        let mock = Arc::new(MockCliDriver::new());
+        let p = pool(&mock, cfg(2, 4));
+        assert_eq!(mock.connect_calls(), 2);
+        assert_eq!(p.total_count(), 2);
+        assert_eq!(p.idle_count(), 2);
+        assert_eq!(p.active_count(), 0);
+    }
+
+    #[test]
+    fn create_propagates_warmup_connect_error() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_connect_error(Error::new(ErrorCode::Connection, "refused"));
+        let err = ConnectionPool::create(mock.clone(), params(), cfg(1, 4)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Connection);
+    }
+
+    #[test]
+    fn reconnect_retries_a_retriable_connect_error() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(0, 2);
+        config.backoff.max_attempts = 3; // base_delay is ZERO → instant retries
+        let p = pool(&mock, config);
+        mock.push_connect_error(retriable_conn("temporarily unreachable"));
+        // Attempt 1 fails (retriable) → backoff → attempt 2 connects.
+        let _lease = p.acquire().unwrap();
+        assert_eq!(mock.connect_calls(), 2);
+    }
+
+    #[test]
+    fn reconnect_does_not_retry_a_non_retriable_connect_error() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(0, 2);
+        config.backoff.max_attempts = 3;
+        let p = pool(&mock, config);
+        // Non-retriable (default): a bad-credentials-style failure fails the same
+        // way every time, so retry is pointless — surface it after one attempt.
+        mock.push_connect_error(Error::new(ErrorCode::Connection, "invalid credentials"));
+        let err = p.acquire().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Connection);
+        assert_eq!(mock.connect_calls(), 1);
+    }
+
+    #[test]
+    fn acquire_reuses_idle_and_returns_on_drop() {
+        let mock = Arc::new(MockCliDriver::new());
+        let p = pool(&mock, cfg(1, 4));
+        {
+            let lease = p.acquire().unwrap();
+            assert_eq!(lease.handle().0, 1); // the warmed-up connection
+            assert_eq!(p.active_count(), 1);
+            assert_eq!(p.idle_count(), 0);
+        } // lease drops → returned
+        assert_eq!(p.active_count(), 0);
+        assert_eq!(p.idle_count(), 1);
+        // A second acquire reuses it: no new physical connect.
+        let _l2 = p.acquire().unwrap();
+        assert_eq!(mock.connect_calls(), 1);
+    }
+
+    #[test]
+    fn acquire_grows_lazily_up_to_max() {
+        let mock = Arc::new(MockCliDriver::new());
+        let p = pool(&mock, cfg(0, 2));
+        assert_eq!(mock.connect_calls(), 0); // min=0 → no warmup
+        let a = p.acquire().unwrap();
+        let b = p.acquire().unwrap();
+        assert_eq!(mock.connect_calls(), 2);
+        assert_eq!(p.total_count(), 2);
+        // At max with both leased: the next acquire times out.
+        let err = p.acquire().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Pool);
+        drop(a);
+        drop(b);
+    }
+
+    #[test]
+    fn acquire_times_out_at_capacity() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(1, 1);
+        config.acquire_timeout = Duration::from_millis(60);
+        let p = pool(&mock, config);
+        let _held = p.acquire().unwrap();
+        let start = Instant::now();
+        let err = p.acquire().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Pool);
+        assert!(!err.retriable);
+        assert!(start.elapsed() >= Duration::from_millis(50)); // actually waited
+    }
+
+    #[test]
+    fn acquire_connect_failure_frees_reserved_capacity() {
+        let mock = Arc::new(MockCliDriver::new());
+        let p = pool(&mock, cfg(0, 2));
+        mock.push_connect_error(Error::new(ErrorCode::Connection, "refused"));
+        let err = p.acquire().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Connection);
+        // The reserved slot was released, so a later acquire can still grow.
+        assert_eq!(p.total_count(), 0);
+        let _ok = p.acquire().unwrap();
+        assert_eq!(p.total_count(), 1);
+    }
+
+    #[test]
+    fn broken_lease_is_discarded_on_return() {
+        let mock = Arc::new(MockCliDriver::new());
+        let p = pool(&mock, cfg(1, 4));
+        {
+            let mut lease = p.acquire().unwrap();
+            lease.mark_broken();
+        }
+        assert_eq!(p.total_count(), 0);
+        assert_eq!(p.idle_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn validate_on_acquire_passes_live_connection_through() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(1, 4);
+        config.validate_on_acquire = true;
+        let p = pool(&mock, config);
+        let _lease = p.acquire().unwrap();
+        assert_eq!(mock.alive_calls(), 1);
+        assert_eq!(mock.connect_calls(), 1); // no reconnect — it was alive
+    }
+
+    #[test]
+    fn validate_on_acquire_reconnects_a_dead_connection() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(1, 4);
+        config.validate_on_acquire = true;
+        let p = pool(&mock, config);
+        mock.push_alive_result(false); // the warmed-up connection is dead
+        let lease = p.acquire().unwrap();
+        assert_eq!(mock.alive_calls(), 1);
+        assert_eq!(mock.connect_calls(), 2); // warmup + reconnect
+        assert_eq!(mock.disconnect_calls(), 1); // the dead one was dropped
+        assert_eq!(lease.handle().0, 2); // fresh handle
+        assert_eq!(p.total_count(), 1); // reconnected in place
+    }
+
+    #[test]
+    fn validate_reconnect_failure_frees_capacity_and_errors() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(1, 4);
+        config.validate_on_acquire = true;
+        let p = pool(&mock, config);
+        mock.push_alive_result(false);
+        mock.push_connect_error(Error::new(ErrorCode::Connection, "still refused"));
+        let err = p.acquire().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Connection);
+        // The dead connection is gone and the slot was freed.
+        assert_eq!(p.total_count(), 0);
+        assert_eq!(p.idle_count(), 0);
+    }
+
+    #[test]
+    fn maintain_reaps_idle_above_min() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(1, 4);
+        config.idle_timeout = Duration::ZERO; // every idle connection is expired
+        let p = pool(&mock, config);
+        // Grow to 3 leased, then release all → 3 idle.
+        let a = p.acquire().unwrap();
+        let b = p.acquire().unwrap();
+        let c = p.acquire().unwrap();
+        drop((a, b, c));
+        assert_eq!(p.idle_count(), 3);
+        p.maintain();
+        // Reaped down to min=1.
+        assert_eq!(p.idle_count(), 1);
+        assert_eq!(p.total_count(), 1);
+        assert_eq!(mock.disconnect_calls(), 2);
+    }
+
+    #[test]
+    fn maintain_keeps_fresh_idle_and_honors_min_floor() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(2, 4);
+        config.idle_timeout = Duration::ZERO; // expired by time...
+        let p = pool(&mock, config); // ...but total == min, so nothing is reaped
+        p.maintain();
+        assert_eq!(p.idle_count(), 2);
+        assert_eq!(mock.disconnect_calls(), 0);
+    }
+
+    #[test]
+    fn maintain_reaps_lifetime_expired_below_min_then_refills() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(1, 4);
+        config.max_lifetime = Duration::ZERO; // the warmed-up connection is too old
+        let p = pool(&mock, config);
+        p.maintain();
+        // The old connection was reaped (lifetime overrides the min floor) and a
+        // fresh one connected to refill back to min.
+        assert_eq!(p.idle_count(), 1);
+        assert_eq!(p.total_count(), 1);
+        assert_eq!(mock.disconnect_calls(), 1);
+        assert_eq!(mock.connect_calls(), 2); // warmup + refill
+    }
+
+    #[test]
+    fn maintain_refills_up_to_min() {
+        let mock = Arc::new(MockCliDriver::new());
+        let p = pool(&mock, cfg(2, 4));
+        // Drop below min by discarding one connection as broken.
+        {
+            let mut lease = p.acquire().unwrap();
+            lease.mark_broken();
+        }
+        assert_eq!(p.total_count(), 1);
+        p.maintain();
+        assert_eq!(p.total_count(), 2);
+        assert_eq!(p.idle_count(), 2);
+    }
+
+    #[test]
+    fn acquire_blocks_until_a_release_hands_over() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(0, 1);
+        config.acquire_timeout = Duration::from_secs(5);
+        let p = Arc::new(pool(&mock, config));
+
+        let held = p.acquire().unwrap(); // the only connection
+        let (tx, rx) = mpsc::channel();
+        let p2 = Arc::clone(&p);
+        let waiter = thread::spawn(move || {
+            let lease = p2.acquire().unwrap(); // blocks until `held` is released
+            tx.send(lease.handle().0).unwrap();
+        });
+
+        // The waiter can't have a connection yet.
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(held); // hand it over
+        let handed = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(handed, 1); // reused the same physical connection
+        waiter.join().unwrap();
+        assert_eq!(mock.connect_calls(), 1);
+    }
+
+    #[test]
+    fn dropping_the_pool_disconnects_idle_connections() {
+        let mock = Arc::new(MockCliDriver::new());
+        {
+            let _p = pool(&mock, cfg(3, 4));
+            assert_eq!(mock.connect_calls(), 3);
+        } // pool drops here
+        assert_eq!(mock.disconnect_calls(), 3);
+    }
+
+    #[test]
+    fn maintenance_thread_starts_and_stops_cleanly() {
+        // A live background thread with a short interval; creating and dropping
+        // the pool must not hang, and the idle connection is disconnected.
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(1, 2);
+        config.start_maintenance_thread = true;
+        config.maintenance_interval = Duration::from_millis(5);
+        {
+            let _p = pool(&mock, config);
+            thread::sleep(Duration::from_millis(20)); // let a few passes run
+        }
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn pool_and_lease_thread_safety_markers() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_send<T: Send>() {}
+        assert_send_sync::<ConnectionPool>();
+        assert_send::<PooledConnection>(); // Send (movable to a worker) but !Sync
+    }
+}

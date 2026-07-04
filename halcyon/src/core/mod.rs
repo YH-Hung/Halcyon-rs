@@ -21,6 +21,9 @@ pub use connection::{Connection, Statement};
 pub use params::{IntoParams, Named, Params};
 pub use result_set::{FromRow, QueryMap, ResultSet, Row};
 pub use transaction::Transaction;
+// Shared with the facade's owned pooled cursor / RAII transaction, which live
+// outside `core` and so can't reach these through the private submodules.
+pub(crate) use transaction::terminate;
 
 use crate::error::{Error, ErrorCode};
 

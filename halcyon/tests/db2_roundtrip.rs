@@ -149,9 +149,9 @@ fn live_round_trip() {
         .expect("drop table");
 }
 
-/// Facade round-trip: the ergonomic [`Database`] and the closure/RAII
-/// [`halcyon::Transaction`] (Phase 3) against a real Db2 — the facade analog of
-/// the seam-primitive transaction coverage in [`live_round_trip`]. Gated on
+/// Facade round-trip: the ergonomic pooled [`Database`] and the closure/RAII
+/// [`halcyon::ScopedTransaction`] against a real Db2 — the facade analog of the
+/// seam-primitive transaction coverage in [`live_round_trip`]. Gated on
 /// `HALCYON_TEST_DSN` the same way (a no-op pass when unset).
 #[test]
 fn live_facade_round_trip() {

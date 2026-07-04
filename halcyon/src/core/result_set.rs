@@ -36,6 +36,25 @@ pub struct Row<'a> {
     errors: &'a RefCell<Option<Error>>,
 }
 
+impl<'a> Row<'a> {
+    /// Builds a row view over the cursor's current row. Used by [`ResultSet`] and
+    /// by the facade's owned pooled cursor, both of which drive the same
+    /// lending-cursor protocol; `errors` is the owning cursor's poison slot.
+    pub(crate) fn new(
+        driver: &'a dyn CliDriver,
+        stmt: StatementHandle,
+        columns: usize,
+        errors: &'a RefCell<Option<Error>>,
+    ) -> Self {
+        Row {
+            driver,
+            stmt,
+            columns,
+            errors,
+        }
+    }
+}
+
 impl Row<'_> {
     pub fn column_count(&self) -> usize {
         self.columns

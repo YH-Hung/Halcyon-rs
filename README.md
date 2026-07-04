@@ -2,7 +2,7 @@
 
 A modern Rust client library for **IBM Db2**, built on the IBM Db2 CLI (`libdb2`). The Rust counterpart of the C++ [Halcyon](https://github.com/YH-Hung/Halcyon) library — same layered architecture, same error model, same driver-seam philosophy, expressed idiomatically in Rust.
 
-> **Status: early development.** The driver seam, the core data path, and the single-connection facade (`Database` + transactions) are complete; the connection pool that re-targets the facade is being ported. See the roadmap below.
+> **Status: early development.** The driver seam, the core data path, and the pooled `Database` facade — connection pool (bounded sizing, blocking acquire, idle/lifetime reaping, transparent reconnect), safe auto-retry, and RAII transactions — are implemented and covered by mock + live-Db2 tests. The pool's concurrency-correctness track (loom + ThreadSanitizer stress + perf) that *gates* Phase 4 acceptance is still outstanding, and the per-connection statement cache is next. See the roadmap below.
 
 ## Architecture
 
@@ -82,8 +82,8 @@ TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --no-default-feature
 - [x] Batch shape validation (rectangular, type-homogeneous) enforced inside the driver
 - [x] Core: `Connection`, `Statement`, `ResultSet`, named (`:name`) & positional (`?`) parameters, row → tuple mapping (streaming cursor + `query_map`)
 - [x] `#[derive(FromRow)]` proc macro (`halcyon-derive`) — by-position struct mapping + `Connection::query_as`
-- [x] Facade (single-connection): `Database` entry point, RAII + closure `transaction()` (commit on `Ok`, rollback on `Err`/panic via a `Drop` guard), `execute_batch`, `query`/`query_as`/`execute` — validated on mock **and** live Db2; re-targeted onto the pool in Phase 4
-- [ ] Pool: min/max bounds, acquire timeout, validation, idle/lifetime reaping, transparent reconnect, safe auto-retry
+- [x] Facade: `Database` entry point (a cheap, cloneable, `Send + Sync` handle over the pool), RAII + closure `transaction()` (commit on `Ok`, rollback on `Err`/panic via a `Drop` guard), `execute_batch`, `query`/`query_as`/`execute` — validated on mock **and** live Db2; re-targeted onto the pool in Phase 4 (`query` now returns an owned `QueryResult` cursor, `begin` an owned `ScopedTransaction`, each holding its lease)
+- [ ] Pool: min/max bounds, acquire timeout, validation, idle/lifetime reaping, transparent reconnect, safe auto-retry — **implemented** (`ConnectionPool`/`PoolConfig`/`PooledConnection`, retry driven by `BackoffPolicy`/`ExecPolicy` + read-only detection: writes run once, reads replay on a transient error) and covered by mock unit tests with no live database or real clock (boundary durations keep reaping/backoff deterministic). **Not yet accepted:** Phase 4's exit gate also requires the concurrency-correctness track — `loom` model-checking of the lock/condvar logic, a `ConcurrentFakeDriver` stress harness under ThreadSanitizer, and a perf harness — which is still outstanding
 - [ ] Statement cache (per-connection LRU)
 - [ ] `tokio` async facade (feature-gated, `spawn_blocking`)
 - [ ] Observability: `metrics`/`tracing`-facade adapters (feature-gated)

@@ -6,14 +6,16 @@
 //!
 //! **Status: early development.** The target architecture mirrors the C++
 //! layering. The driver seam, the core data path ([`Connection`], [`Statement`],
-//! [`ResultSet`]/[`Row`], `?`/`:name` params, row → tuple mapping), and the
-//! single-connection facade ([`Database`], closure/RAII [`Transaction`]) are
-//! implemented; the connection pool that re-targets the facade is being ported.
-//! See the README roadmap:
+//! [`ResultSet`]/[`Row`], `?`/`:name` params, row → tuple mapping), the
+//! connection [`pool`] (bounded sizing, blocking acquire, reaping, transparent
+//! reconnect) with safe auto-[`retry`], and the pooled [`Database`] facade
+//! (owned [`QueryResult`] cursors and [`ScopedTransaction`]s) are implemented and
+//! mock-tested. The pool's concurrency-correctness verification (loom +
+//! ThreadSanitizer stress) that gates Phase 4 acceptance is still outstanding;
+//! the per-connection statement cache is next. See the README roadmap:
 //!
 //! ```text
 //! facade ─► pool ─► core ─► driver (CliDriver seam) ─► halcyon-sys ─► libdb2
-//! (single-conn) (planned) (done)     (implemented)
 //! ```
 //!
 //! Only `driver::db2` (feature `db2`) touches the CLI ABI; everything above the
@@ -50,6 +52,8 @@ mod core;
 pub mod driver;
 mod error;
 mod facade;
+pub mod pool;
+pub mod retry;
 mod value;
 
 // Shared, scriptable mock driver for the layers above the seam. Test-only, so
@@ -62,7 +66,9 @@ pub use core::{
     Statement, Transaction,
 };
 pub use error::{Error, ErrorCode, Result};
-pub use facade::Database;
+pub use facade::{Database, QueryResult, ScopedTransaction};
+pub use pool::{ConnectionPool, PoolConfig, PooledConnection};
+pub use retry::{BackoffPolicy, ExecPolicy};
 pub use value::Value;
 
 /// Derives [`FromRow`] for a struct, mapping a result-set row into its fields by

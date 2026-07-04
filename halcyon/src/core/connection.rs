@@ -10,6 +10,7 @@
 //! The per-connection statement cache (C++ `StatementCache`) is Phase 5; here
 //! every `query`/`execute` prepares a fresh statement.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
@@ -105,17 +106,51 @@ impl Connection {
     }
 
     fn prepare_and_bind(&self, sql: &str, params: Params) -> Result<Statement<'_>> {
-        match params {
-            Params::Positional(values) => {
-                let stmt = self.prepare(sql)?;
-                self.driver.bind_params(stmt.handle, &values)?;
-                Ok(stmt)
-            }
+        let handle = self.prepare_and_bind_raw(sql, params)?;
+        Ok(Statement { conn: self, handle })
+    }
+
+    /// Prepares and binds `sql` (rewriting named params to positional), returning
+    /// a **raw** statement handle the caller owns and must `finalize`. On a bind
+    /// failure the handle is finalized here. [`prepare_and_bind`] wraps this in an
+    /// RAII [`Statement`]; [`execute_query_raw`](Self::execute_query_raw) hands the
+    /// raw handle to the facade's owned pooled cursor.
+    fn prepare_and_bind_raw(&self, sql: &str, params: Params) -> Result<StatementHandle> {
+        let (sql, values) = match params {
+            Params::Positional(values) => (Cow::Borrowed(sql), values),
             Params::Named(pairs) => {
                 let pre = bind_named(sql, &pairs)?;
-                let stmt = self.prepare(&pre.sql)?;
-                self.driver.bind_params(stmt.handle, &pre.params)?;
-                Ok(stmt)
+                (Cow::Owned(pre.sql), pre.params)
+            }
+        };
+        let handle = self.driver.prepare(self.handle, &sql)?;
+        if let Err(e) = self.driver.bind_params(handle, &values) {
+            let _ = self.driver.finalize(handle);
+            return Err(e);
+        }
+        Ok(handle)
+    }
+
+    /// Prepares, binds, and executes `sql`, returning the executed statement's raw
+    /// handle and its column count — transferring finalize responsibility to the
+    /// caller. On any failure the handle is finalized here. The facade's pooled
+    /// [`QueryResult`](crate::QueryResult) owns the handle for the cursor's life,
+    /// so it cannot borrow the leased [`Connection`] the way [`ResultSet`] does.
+    pub(crate) fn execute_query_raw(
+        &self,
+        sql: &str,
+        params: Params,
+    ) -> Result<(StatementHandle, usize)> {
+        let handle = self.prepare_and_bind_raw(sql, params)?;
+        match self
+            .driver
+            .execute(handle)
+            .and_then(|_| self.driver.column_count(handle))
+        {
+            Ok(columns) => Ok((handle, columns)),
+            Err(e) => {
+                let _ = self.driver.finalize(handle);
+                Err(e)
             }
         }
     }

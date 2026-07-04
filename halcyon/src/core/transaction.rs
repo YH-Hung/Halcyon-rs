@@ -13,6 +13,7 @@ use std::fmt;
 use crate::core::connection::Connection;
 use crate::core::params::IntoParams;
 use crate::core::result_set::{FromRow, ResultSet};
+use crate::driver::{CliDriver, ConnectionHandle};
 use crate::error::Result;
 use crate::value::Value;
 
@@ -100,20 +101,39 @@ impl<'c> Transaction<'c> {
         if !self.active {
             return Ok(());
         }
-        let driver = self.conn.driver_ref();
-        let handle = self.conn.handle();
-        let ended = match outcome {
-            Outcome::Commit => driver.commit(handle),
-            Outcome::Rollback => driver.rollback(handle),
-        };
+        let (result, poisoned) = terminate(
+            self.conn.driver_ref(),
+            self.conn.handle(),
+            matches!(outcome, Outcome::Commit),
+        );
         self.active = false;
-        let restored = driver.set_auto_commit(handle, true);
-        if ended.is_err() || restored.is_err() {
+        if poisoned {
             self.poisoned = true; // dead connection or autocommit lost
         }
-        ended?;
-        restored
+        result
     }
+}
+
+/// Runs the terminal transaction op (commit if `commit`, else rollback) then
+/// restores autocommit — the exact order the C++ `Transaction::commit`/`rollback`
+/// use. Returns the op's error if it failed, otherwise the autocommit-restore
+/// result, plus whether the connection is now poisoned (dead, or autocommit left
+/// in an unknown state). Shared by [`Transaction`] and the facade's owned
+/// `ScopedTransaction`, which both wrap it with their own `active`/`poisoned`
+/// bookkeeping.
+pub(crate) fn terminate(
+    driver: &dyn CliDriver,
+    handle: ConnectionHandle,
+    commit: bool,
+) -> (Result<()>, bool) {
+    let ended = if commit {
+        driver.commit(handle)
+    } else {
+        driver.rollback(handle)
+    };
+    let restored = driver.set_auto_commit(handle, true);
+    let poisoned = ended.is_err() || restored.is_err();
+    (ended.and(restored), poisoned)
 }
 
 impl Drop for Transaction<'_> {

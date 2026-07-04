@@ -2,7 +2,7 @@
 //!
 //! Positional params are supplied as a tuple of bindable values (`(21, "NYC")`)
 //! or a `Vec<Value>`. Named params are supplied as [`Named`] (or the [`named!`]
-//! macro) and rewritten to positional `?` by [`bind_named`], a literal-aware
+//! macro) and rewritten to positional `?` by `bind_named`, a literal-aware
 //! scanner ported from the C++ `detail::bind_named`.
 
 use crate::core::mapping;
@@ -10,10 +10,14 @@ use crate::error::Result;
 use crate::value::Value;
 
 /// Parameters bound to a statement, after erasing concrete types to [`Value`].
+///
+/// `Clone` so the facade can hold one owned `Params` and re-bind it on each
+/// auto-retry attempt (each attempt leases a fresh connection).
+#[derive(Clone)]
 pub enum Params {
     /// Positional `?` parameters in order.
     Positional(Vec<Value>),
-    /// Named `:name` bindings, resolved by [`bind_named`].
+    /// Named `:name` bindings, resolved by `bind_named`.
     Named(Vec<(String, Value)>),
 }
 
