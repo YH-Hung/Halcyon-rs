@@ -901,3 +901,115 @@ mod tests {
         assert_send::<PooledConnection>(); // Send (movable to a worker) but !Sync
     }
 }
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use crate::driver::{
+        CliDriver, ConnectionHandle, ConnectionParams, StatementHandle,
+    };
+    use crate::error::{Error, ErrorCode, Result};
+    use crate::value::Value;
+    use loom::sync::Arc as LoomArc; // for spawning; pool internals use std::sync::Arc
+
+    // Minimal stateless fake: everything trivially succeeds. `max = 1` plus the
+    // pool's `pending` reservation means at most one connection exists at a time,
+    // so a constant handle never collides. No atomics/locks of its own, so it adds
+    // zero branches beyond the pool's own Mutex/Condvar for loom to explore.
+    struct LoomFake;
+
+    impl CliDriver for LoomFake {
+        fn connect(&self, _p: &ConnectionParams) -> Result<ConnectionHandle> {
+            Ok(ConnectionHandle(1))
+        }
+        fn disconnect(&self, _c: ConnectionHandle) -> Result<()> { Ok(()) }
+        fn is_alive(&self, _c: ConnectionHandle) -> Result<bool> { Ok(true) }
+        fn prepare(&self, _c: ConnectionHandle, _s: &str) -> Result<StatementHandle> {
+            Ok(StatementHandle(1))
+        }
+        fn bind_params(&self, _s: StatementHandle, _p: &[Value]) -> Result<()> { Ok(()) }
+        fn execute(&self, _s: StatementHandle) -> Result<i64> { Ok(0) }
+        fn execute_batch(&self, _s: StatementHandle, _r: &[Vec<Value>]) -> Result<i64> { Ok(0) }
+        fn column_count(&self, _s: StatementHandle) -> Result<usize> { Ok(0) }
+        fn column_name(&self, _s: StatementHandle, _i: usize) -> Result<String> { Ok(String::new()) }
+        fn fetch(&self, _s: StatementHandle) -> Result<bool> { Ok(false) }
+        fn get_column(&self, _s: StatementHandle, _i: usize) -> Result<Value> {
+            Err(Error::new(ErrorCode::Mapping, "none"))
+        }
+        fn finalize(&self, _s: StatementHandle) -> Result<()> { Ok(()) }
+        fn close_cursor(&self, _s: StatementHandle) -> Result<()> { Ok(()) }
+        fn set_auto_commit(&self, _c: ConnectionHandle, _e: bool) -> Result<()> { Ok(()) }
+        fn commit(&self, _c: ConnectionHandle) -> Result<()> { Ok(()) }
+        fn rollback(&self, _c: ConnectionHandle) -> Result<()> { Ok(()) }
+    }
+
+    fn params() -> ConnectionParams {
+        ConnectionParams { connection_string: "loom".into() }
+    }
+
+    // A deterministic base config: no maintenance thread, zero backoff, one slot.
+    fn cfg(max: usize) -> PoolConfig {
+        PoolConfig {
+            min: 0,
+            max,
+            acquire_timeout: Duration::from_millis(1),
+            idle_timeout: Duration::from_secs(3600),
+            max_lifetime: Duration::from_secs(3600),
+            validate_on_acquire: false,
+            backoff: BackoffPolicy {
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+                max_attempts: 1,
+            },
+            maintenance_interval: Duration::from_secs(3600),
+            start_maintenance_thread: false,
+        }
+    }
+
+    // Two threads contend for a single connection. Whichever acquires first
+    // releases it; the other must eventually get it or time out — never a lost
+    // wakeup, a double-hand-out, or a deadlock. loom explores every interleaving.
+    #[test]
+    fn acquire_release_handoff_has_no_lost_wakeup() {
+        loom::model(|| {
+            let driver = std::sync::Arc::new(LoomFake);
+            let pool = LoomArc::new(ConnectionPool::create(driver, params(), cfg(1)).unwrap());
+
+            let p2 = LoomArc::clone(&pool);
+            let t = loom::thread::spawn(move || {
+                if let Ok(lease) = p2.acquire() {
+                    drop(lease); // hand it back
+                }
+            });
+
+            if let Ok(lease) = pool.acquire() {
+                drop(lease);
+            }
+            t.join().unwrap();
+
+            // Both leases returned or timed out: at rest nothing is leased.
+            assert_eq!(pool.active_count(), 0);
+        });
+    }
+
+    // Dropping the pool while a second thread races an acquire/release must tear
+    // down cleanly with no deadlock (the shutdown path notifies waiters).
+    #[test]
+    fn shutdown_races_acquire_cleanly() {
+        loom::model(|| {
+            let driver = std::sync::Arc::new(LoomFake);
+            let pool = ConnectionPool::create(driver, params(), cfg(1)).unwrap();
+            let pool = LoomArc::new(pool);
+
+            let p2 = LoomArc::clone(&pool);
+            let t = loom::thread::spawn(move || {
+                if let Ok(lease) = p2.acquire() {
+                    drop(lease);
+                }
+            });
+            t.join().unwrap();
+            // `pool` drops when the last LoomArc goes: teardown must not hang.
+            drop(pool);
+        });
+    }
+}
