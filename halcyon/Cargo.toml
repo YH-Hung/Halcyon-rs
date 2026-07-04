@@ -36,6 +36,13 @@ halcyon-derive = { path = "../halcyon-derive", optional = true }
 # when the `derive` feature is enabled.
 trybuild = "1"
 
+# Micro-benchmarks (benches/pool_bench.rs); default-features off keeps plotters/
+# rayon and their heavier deps out (and off the MSRV path), but `cargo_bench_support`
+# stays on so `harness = false` benches still parse `cargo bench` args. The bench
+# target is gated on `stress` via required-features, so a normal `cargo test`/MSRV
+# build never compiles it.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
 # docs.rs has no clidriver and cannot link libdb2, so build the published docs
 # without the `db2` feature. `derive` is pure-Rust and part of the documented
 # surface, so keep it on. Mirrors the CI `--no-default-features` doc/test path.
@@ -48,3 +55,8 @@ features = ["derive"]
 # shim so the pool's Mutex/Condvar/thread logic can be model-checked.
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
+
+[[bench]]
+name = "pool_bench"
+harness = false
+required-features = ["stress"]
