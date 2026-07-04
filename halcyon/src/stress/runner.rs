@@ -106,6 +106,8 @@ struct WorkerOut {
     errors: u64,
     hist: LatencyHistogram,
     failed: Option<String>,
+    /// Wall-clock of this worker's *measured* phase only (excludes spawn + warmup).
+    wall: Duration,
 }
 
 pub fn run_workload<F>(name: &str, cfg: &RunConfig, body: F) -> RunReport
@@ -115,7 +117,6 @@ where
     let threads = cfg.threads.max(1);
     let barrier = Barrier::new(threads);
     let body = &body;
-    let t0 = Instant::now();
 
     let outs: Vec<WorkerOut> = thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -138,13 +139,18 @@ where
                         ctx.failed = None;
                     }
 
+                    // Time only the measured phase: workers are released together
+                    // by the barrier, so spawn and warmup are excluded from wall.
                     barrier.wait();
+                    let started = Instant::now();
                     let ops = run_phase(&mut ctx, threads, cfg.stop, body);
+                    let wall = started.elapsed();
                     WorkerOut {
                         ops,
                         errors: ctx.errors,
                         hist: ctx.hist,
                         failed: ctx.failed,
+                        wall,
                     }
                 })
             })
@@ -152,13 +158,14 @@ where
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let wall = t0.elapsed();
     let mut report = RunReport {
         name: name.to_string(),
         threads,
         ops: 0,
         errors: 0,
-        wall,
+        // Makespan of the concurrent measured phase: workers start together at the
+        // barrier, so the slowest to finish bounds throughput.
+        wall: Duration::ZERO,
         hist: LatencyHistogram::new(),
         failed: false,
         first_error: None,
@@ -166,6 +173,7 @@ where
     for out in outs {
         report.ops += out.ops;
         report.errors += out.errors;
+        report.wall = report.wall.max(out.wall);
         report.hist.merge(&out.hist);
         if let Some(msg) = out.failed {
             if !report.failed {

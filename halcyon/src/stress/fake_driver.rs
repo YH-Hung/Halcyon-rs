@@ -40,6 +40,13 @@ pub struct ConcurrentFakeDriver {
     pub fail_execute_every: AtomicI64,
     pub kill_connection_every: AtomicI64,
 
+    // --- realism knobs (microseconds; 0 = no sleep) ---
+    // Widen the in-flight / connect windows so concurrent overlap is easier to
+    // force (useful under ThreadSanitizer to surface interleavings). Default 0
+    // keeps the deterministic correctness runs behavior-identical.
+    pub query_latency_us: AtomicI64,
+    pub connect_latency_us: AtomicI64,
+
     // --- counters ---
     connect_calls: AtomicI64,
     disconnect_calls: AtomicI64,
@@ -155,9 +162,16 @@ fn mapping() -> Error {
     Error::new(ErrorCode::Mapping, "column index out of range")
 }
 
+fn sleep_us(us: i64) {
+    if us > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(us as u64));
+    }
+}
+
 impl CliDriver for ConcurrentFakeDriver {
     fn connect(&self, _params: &ConnectionParams) -> Result<ConnectionHandle> {
         let n = self.connect_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        sleep_us(self.connect_latency_us.load(Ordering::Relaxed));
         let every = self.fail_connect_every.load(Ordering::Relaxed);
         if every > 0 && n % every == 0 {
             return Err(transient());
@@ -216,6 +230,8 @@ impl CliDriver for ConcurrentFakeDriver {
     fn execute(&self, stmt: StatementHandle) -> Result<i64> {
         let n = self.execute_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = self.enter_in_flight();
+        // Sleep while in-flight is elevated, widening the overlap window.
+        sleep_us(self.query_latency_us.load(Ordering::Relaxed));
 
         let fe = self.fail_execute_every.load(Ordering::Relaxed);
         if fe > 0 && n % fe == 0 {
@@ -342,6 +358,19 @@ mod tests {
         assert!(d.fetch(s).unwrap()); // one row
         assert_eq!(d.get_column(s, 0).unwrap(), Value::Int(7));
         assert!(!d.fetch(s).unwrap()); // end of cursor
+    }
+
+    #[test]
+    fn latency_knobs_do_not_change_results() {
+        use std::sync::atomic::Ordering;
+        let d = ConcurrentFakeDriver::new();
+        d.connect_latency_us.store(1, Ordering::Relaxed);
+        d.query_latency_us.store(1, Ordering::Relaxed);
+        let c = d.connect(&params()).unwrap();
+        let s = d.prepare(c, "SELECT 5 FROM SYSIBM.SYSDUMMY1").unwrap();
+        assert_eq!(d.execute(s).unwrap(), 0);
+        assert!(d.fetch(s).unwrap());
+        assert_eq!(d.get_column(s, 0).unwrap(), Value::Int(5));
     }
 
     #[test]

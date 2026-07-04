@@ -46,7 +46,9 @@ impl LatencyHistogram {
         if self.total == 0 {
             return 0.0;
         }
-        let target = (p * self.total as f64) as u64;
+        // At least rank 1: a non-empty histogram must never resolve to bucket 0
+        // just because `p * total` floored below 1 (only bites tiny sample counts).
+        let target = ((p * self.total as f64) as u64).max(1);
         let mut cum = 0u64;
         for i in 0..BUCKETS {
             cum += self.counts[i];
@@ -123,5 +125,16 @@ mod tests {
         assert_eq!(h.count(), 0);
         assert_eq!(h.percentile_us(0.5), 0.0);
         assert_eq!(h.max_us(), 0.0);
+    }
+
+    #[test]
+    fn single_sample_reports_its_own_bucket() {
+        // A one-sample histogram whose sample is in a high bucket must report that
+        // bucket for any percentile — not bucket 0 because `p * total` floored to 0.
+        let mut h = LatencyHistogram::new();
+        h.record(1_000_000); // ~1ms, a high bucket
+        assert_eq!(h.percentile_us(0.50), h.max_us());
+        assert_eq!(h.percentile_us(0.99), h.max_us());
+        assert!(h.percentile_us(0.50) > 1.0);
     }
 }

@@ -1024,24 +1024,50 @@ mod loom_tests {
         });
     }
 
-    // Dropping the pool while a second thread races an acquire/release must tear
-    // down cleanly with no deadlock (the shutdown path notifies waiters).
+    // Acquire-timeout path: a waiter blocked at capacity must either time out with
+    // `Err(Pool)` or receive the connection when the holder releases — never
+    // deadlock, never leave the pool mis-accounted. loom explores both the timeout
+    // and the hand-over branches of `Condvar::wait_timeout`.
     #[test]
-    fn shutdown_races_acquire_cleanly() {
+    fn acquire_timeout_or_handover_keeps_accounting_consistent() {
         loom::model(|| {
             let driver = std::sync::Arc::new(LoomFake);
-            let pool = ConnectionPool::create(driver, params(), cfg(1)).unwrap();
-            let pool = LoomArc::new(pool);
+            let pool = LoomArc::new(ConnectionPool::create(driver, params(), cfg(1)).unwrap());
+            let held = pool.acquire().unwrap(); // occupy the only slot
 
             let p2 = LoomArc::clone(&pool);
-            let t = loom::thread::spawn(move || {
+            let waiter = loom::thread::spawn(move || {
                 if let Ok(lease) = p2.acquire() {
                     drop(lease);
                 }
             });
+
+            drop(held); // may hand over to the waiter, or it may have timed out
+            waiter.join().unwrap();
+
+            // Whichever branch each interleaving took, nothing is leased at rest.
+            assert_eq!(pool.active_count(), 0);
+        });
+    }
+
+    // Drop ordering: a leased connection returning (the `release` path) must race
+    // the pool's own teardown (`stopping = true` + notify) in every interleaving
+    // with no deadlock, lost wakeup, or leak. The lease is dropped on a *separate*
+    // thread from the pool so loom explores both drop orders — unlike joining the
+    // worker first, which would serialize them. The lease's `Arc<PoolInner>` keeps
+    // the internals alive until whichever drops last.
+    #[test]
+    fn lease_drop_races_pool_drop_cleanly() {
+        loom::model(|| {
+            let driver = std::sync::Arc::new(LoomFake);
+            let pool = ConnectionPool::create(driver, params(), cfg(1)).unwrap();
+            let lease = pool.acquire().unwrap(); // main holds a lease
+
+            let t = loom::thread::spawn(move || {
+                drop(lease); // worker returns the lease (release path)
+            });
+            drop(pool); // main tears the pool down concurrently
             t.join().unwrap();
-            // `pool` drops when the last LoomArc goes: teardown must not hang.
-            drop(pool);
         });
     }
 }
