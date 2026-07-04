@@ -2,6 +2,12 @@
 //! Port of the C++ `Db2CliDriver` — same locking discipline, same error
 //! classification, same array-binding batch algorithm.
 
+// The Db2 seam: the single place above `halcyon-sys` allowed to use `unsafe`.
+// The crate-wide `#![deny(unsafe_code)]` (lib.rs) forbids it everywhere else;
+// this module-scoped waiver is the one sanctioned exception, kept here at the
+// seam so the boundary is mechanically obvious (per the project's seam rule).
+#![allow(unsafe_code)]
+
 use std::collections::HashMap;
 use std::ptr;
 use std::sync::{Arc, Mutex, MutexGuard};

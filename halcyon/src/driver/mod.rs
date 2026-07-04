@@ -2,7 +2,7 @@
 //!
 //! [`CliDriver`] is the Rust counterpart of the C++ `ICliDriver` interface —
 //! the single boundary behind which all IBM CLI details live. The only real
-//! implementation is [`Db2CliDriver`] (feature `db2`); tests substitute their
+//! implementation is `Db2CliDriver` (feature `db2`); tests substitute their
 //! own implementations and need no live database.
 
 // The core layer validates batches above the seam (as the C++
@@ -12,8 +12,10 @@ pub(crate) mod batch;
 mod sqlstate;
 pub use sqlstate::{classify_sqlstate, Classification};
 
+// `db2` is the one module permitted to use `unsafe`; the crate-wide
+// `#![deny(unsafe_code)]` exception is a module-scoped inner attribute *inside*
+// `db2.rs` itself, so the seam waiver lives at the seam (per the project rule).
 #[cfg(feature = "db2")]
-#[allow(unsafe_code)]
 mod db2;
 #[cfg(feature = "db2")]
 pub use db2::Db2CliDriver;

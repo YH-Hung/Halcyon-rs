@@ -66,7 +66,7 @@ pub use core::{
     Statement, Transaction,
 };
 pub use error::{Error, ErrorCode, Result};
-pub use facade::{Database, QueryResult, ScopedTransaction};
+pub use facade::{Database, QueryResult, ScopedTransaction, TxCursor, TxQueryMap};
 pub use pool::{ConnectionPool, PoolConfig, PooledConnection};
 pub use retry::{BackoffPolicy, ExecPolicy};
 pub use value::Value;

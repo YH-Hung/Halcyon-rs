@@ -1,10 +1,25 @@
 # Halcyon-rs — Production Readiness — Strategy & Roadmap
 
 **Date:** 2026-07-03
-**Status:** Proposed direction (pre-implementation)
+**Status:** Historical (superseded 2026-07-04) — the roadmap it proposed is largely
+built. See the note below; current status lives in
+[README.md](../../../README.md) and the crate docs.
 **Distribution target (locked):** crates.io (published)
 
+> **Historical note (2026-07-04).** This document captured the plan when only the
+> driver seam existed. Since then the entire portable stack above the seam —
+> `core`, `pool`, `facade` (owned `QueryResult` cursors and `ScopedTransaction`s),
+> safe auto-retry, and the `derive` macro — has been implemented, committed, and
+> mock-tested, and the seam has been exercised against a live Db2. Still
+> outstanding: the pool's concurrency-correctness verification (loom +
+> ThreadSanitizer stress) that gates Phase 4 acceptance, the per-connection
+> statement cache, async, observability, and the crates.io release track. Read the
+> sections below as the original strategy, not the current state.
+
 ## 1. Where we are
+
+*(As of the original 2026-07-03 writing — see the historical note above; the stack
+above the seam has since been built.)*
 
 The **driver seam and everything below it is built; nothing above it is.**
 

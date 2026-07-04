@@ -19,8 +19,9 @@
 //! Because a lease holds an `Arc` on the pool internals, either wrapper may
 //! safely outlive every `Database` handle.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::thread;
 
@@ -41,7 +42,7 @@ pub struct Database {
 impl Database {
     /// Opens a `Database` over `driver` with pool `config` — the injectable entry
     /// point, used by tests (against a mock `CliDriver`) and by callers supplying
-    /// their own driver. The `db2`-gated [`Database::connect`] is the
+    /// their own driver. The `db2`-gated `Database::connect` is the
     /// no-CLI-types form. Warms the pool to `config.min`; a warmup failure
     /// returns the error.
     pub fn open(
@@ -117,6 +118,7 @@ impl Database {
             lease,
             active: true,
             poisoned: false,
+            conn_broken: Cell::new(false),
         })
     }
 
@@ -360,6 +362,17 @@ pub struct ScopedTransaction {
     lease: PooledConnection,
     active: bool,
     poisoned: bool,
+    // Set when a statement run *inside* the unit of work dies on a
+    // connection-class error — from a materializing call here or from a streaming
+    // [`TxCursor`] that spoiled mid-scan. The terminal op's own poison
+    // ([`poisoned`](Self::poisoned)) is a separate signal; either one discards the
+    // lease on drop. Interior-mutable because the query/execute methods (and the
+    // cursor that borrows this slot) run behind `&self`, while `mark_broken` needs
+    // `&mut` and so waits for drop. Fixes a gap the C++ reference still carries:
+    // its `ScopedTransaction` consults only the terminal op's poison, so a cursor
+    // that died mid-scan while commit/rollback succeeded would recycle a dead
+    // connection.
+    conn_broken: Cell<bool>,
 }
 
 impl ScopedTransaction {
@@ -377,23 +390,43 @@ impl ScopedTransaction {
 
     /// Executes a non-query statement within the unit of work.
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<i64> {
-        self.lease.execute(sql, params)
+        self.note(self.lease.execute(sql, params))
     }
 
-    /// Runs a streaming query within the unit of work. The cursor borrows the
-    /// transaction, so it must be finished (dropped) before commit/rollback.
-    pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<ResultSet<'_>> {
-        self.lease.query(sql, params)
+    /// Runs a streaming query within the unit of work, returning a [`TxCursor`]
+    /// that borrows the transaction (so it must be finished — dropped — before
+    /// commit/rollback). A connection-class failure while scanning the cursor
+    /// discards the leased connection on transaction drop, exactly as the pooled
+    /// [`QueryResult`] does outside a transaction.
+    pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<TxCursor<'_>> {
+        let rows = self.note(self.lease.query(sql, params))?;
+        Ok(TxCursor {
+            rows,
+            broken: &self.conn_broken,
+        })
     }
 
     /// Runs a query and maps every row into `T`.
     pub fn query_as<T: FromRow>(&self, sql: &str, params: impl IntoParams) -> Result<Vec<T>> {
-        self.lease.query_as(sql, params)
+        self.note(self.lease.query_as(sql, params))
     }
 
     /// Batch insert within the unit of work.
     pub fn execute_batch(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
-        self.lease.execute_batch(sql, rows)
+        self.note(self.lease.execute_batch(sql, rows))
+    }
+
+    /// Flags the unit of work's connection broken if `result` is a
+    /// connection-class error, then passes the result through unchanged. Applied to
+    /// every materializing call so a dead connection surfaced inside the
+    /// transaction discards the lease on drop.
+    fn note<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(ref e) = result {
+            if e.code == ErrorCode::Connection {
+                self.conn_broken.set(true);
+            }
+        }
+        result
     }
 
     /// Commits the unit of work and restores autocommit. A no-op (`Ok`) if
@@ -424,11 +457,13 @@ impl ScopedTransaction {
 impl Drop for ScopedTransaction {
     fn drop(&mut self) {
         // Drive the implicit rollback here so we can see its outcome before the
-        // lease is returned: a poisoned unit of work discards the connection.
+        // lease is returned: a poisoned terminal op *or* a connection-class failure
+        // recorded inside the unit of work (see `conn_broken`) discards the
+        // connection.
         if self.active {
             let _ = self.finish(false);
         }
-        if self.poisoned {
+        if self.poisoned || self.conn_broken.get() {
             self.lease.mark_broken();
         }
     }
@@ -439,6 +474,120 @@ impl fmt::Debug for ScopedTransaction {
         f.debug_struct("ScopedTransaction")
             .field("active", &self.active)
             .field("poisoned", &self.poisoned)
+            .field("conn_broken", &self.conn_broken.get())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A streaming cursor for a query run inside a [`ScopedTransaction`]. Borrows the
+/// transaction (so it must be dropped before commit/rollback) and its core
+/// [`ResultSet`] runs on the transaction's leased connection. On drop it reports a
+/// connection-class scan failure back to the transaction, so a connection that
+/// died mid-scan is discarded rather than recycled — the transaction-scoped analog
+/// of the pooled [`QueryResult`]. Drive it with [`next`](Self::next) or
+/// materialize with [`collect_rows`](Self::collect_rows).
+pub struct TxCursor<'t> {
+    rows: ResultSet<'t>,
+    // The owning transaction's `conn_broken` slot; poisoned on drop if the scan
+    // died on a connection-class error.
+    broken: &'t Cell<bool>,
+}
+
+impl<'t> TxCursor<'t> {
+    pub fn column_count(&self) -> usize {
+        self.rows.column_count()
+    }
+
+    /// The driver-side failure that spoiled the scan, if any — empty after a clean
+    /// end. A connection-class error here discards the leased connection when the
+    /// transaction is dropped.
+    pub fn error(&self) -> Option<Error> {
+        self.rows.error()
+    }
+
+    /// Advances to the next row. `Ok(Some(row))` while rows remain, `Ok(None)` at a
+    /// clean end, `Err` on a mid-stream fetch failure (also retained in
+    /// [`error`](Self::error)).
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Row<'_>>> {
+        self.rows.next()
+    }
+
+    /// Materializes all remaining rows via [`FromRow`]. A mid-stream error (fetch
+    /// or mapping) short-circuits to `Err`.
+    pub fn collect_rows<T: FromRow>(&mut self) -> Result<Vec<T>> {
+        self.rows.collect_rows()
+    }
+
+    /// Adapts the cursor into an `Iterator` of owned `Result<T>`, mapping each row
+    /// with `f` — the transaction-scoped analog of [`ResultSet::query_map`], for
+    /// composing with `for`/`.collect()` despite the lending cursor underneath. The
+    /// returned [`TxQueryMap`] owns this cursor, so the same connection-class
+    /// poison-on-drop still discards a connection that died mid-scan.
+    pub fn query_map<T, F>(self, f: F) -> TxQueryMap<'t, T, F>
+    where
+        F: FnMut(&Row<'_>) -> Result<T>,
+    {
+        TxQueryMap {
+            cursor: self,
+            f,
+            _out: PhantomData,
+        }
+    }
+}
+
+impl Drop for TxCursor<'_> {
+    fn drop(&mut self) {
+        // A connection-class scan failure means the leased connection is dead; flag
+        // it so the transaction discards the lease instead of returning it. `rows`
+        // finalizes its statement when it drops after this.
+        if self
+            .rows
+            .error()
+            .is_some_and(|e| e.code == ErrorCode::Connection)
+        {
+            self.broken.set(true);
+        }
+    }
+}
+
+impl fmt::Debug for TxCursor<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TxCursor")
+            .field("columns", &self.rows.column_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owned-item iterator produced by [`TxCursor::query_map`]. The
+/// transaction-scoped analog of [`QueryMap`](crate::QueryMap): it owns the
+/// [`TxCursor`], so dropping it runs the cursor's poison-on-drop and discards a
+/// connection that died mid-scan.
+pub struct TxQueryMap<'t, T, F> {
+    cursor: TxCursor<'t>,
+    f: F,
+    _out: PhantomData<fn() -> T>,
+}
+
+impl<T, F> Iterator for TxQueryMap<'_, T, F>
+where
+    F: FnMut(&Row<'_>) -> Result<T>,
+{
+    type Item = Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.cursor.next() {
+            Ok(Some(row)) => Some((self.f)(&row)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+impl<T, F> fmt::Debug for TxQueryMap<'_, T, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TxQueryMap")
+            .field("cursor", &self.cursor)
             .finish_non_exhaustive()
     }
 }
@@ -708,6 +857,86 @@ mod tests {
             assert_eq!(err.code, ErrorCode::Connection);
             assert_eq!(rs.error().map(|e| e.code), Some(ErrorCode::Connection));
         } // cursor drops → lease discarded (not returned)
+        assert_eq!(db.pool().idle_count(), 0);
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn transaction_streaming_query_discards_lease_after_midstream_connection_drop() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(
+            ["id"],
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]],
+        ));
+        // The second fetch inside the transaction drops the connection.
+        mock.fail_fetch_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-scan"));
+        let db = open(&mock);
+        let out: Result<()> = db.transaction(|tx| {
+            let mut rs = tx.query("SELECT id FROM t", ())?;
+            while rs.next()?.is_some() {}
+            Ok(())
+        });
+        assert_eq!(out.unwrap_err().code, ErrorCode::Connection);
+        // The connection died mid-scan, so it must be discarded — even though the
+        // rollback on the (mock-)still-responsive handle did not itself poison the
+        // transaction. Without threading the cursor's poison into the lease, the
+        // dead connection would be returned to the pool.
+        assert_eq!(db.pool().idle_count(), 0);
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn transaction_query_as_discards_lease_after_connection_error() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(1)]]));
+        // The materializing read fails with a connection-class error.
+        mock.fail_fetch_on_call(1, Error::new(ErrorCode::Connection, "dropped"));
+        let db = open(&mock);
+        let out: Result<Vec<(i64,)>> = db.transaction(|tx| tx.query_as("SELECT id FROM t", ()));
+        assert_eq!(out.unwrap_err().code, ErrorCode::Connection);
+        // Same discard rule as the streaming case, via the materializing path.
+        assert_eq!(db.pool().idle_count(), 0);
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn transaction_query_map_iterates_owned_items() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(
+            ["id"],
+            vec![vec![Value::Int(2)], vec![Value::Int(5)]],
+        ));
+        let db = open(&mock);
+        let ids = db
+            .transaction(|tx| {
+                tx.query("SELECT id FROM t", ())?
+                    .query_map(|row| row.column::<i64>(0))
+                    .collect::<Result<Vec<i64>>>()
+            })
+            .unwrap();
+        assert_eq!(ids, vec![2, 5]);
+        assert_eq!(db.pool().idle_count(), 1); // clean end → lease returned
+    }
+
+    #[test]
+    fn transaction_query_map_discards_lease_after_midstream_connection_drop() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(
+            ["id"],
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]],
+        ));
+        mock.fail_fetch_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-scan"));
+        let db = open(&mock);
+        let out = db.transaction(|tx| {
+            tx.query("SELECT id FROM t", ())?
+                .query_map(|row| row.column::<i64>(0))
+                .collect::<Result<Vec<i64>>>()
+        });
+        assert_eq!(out.unwrap_err().code, ErrorCode::Connection);
+        // Poison flows through TxQueryMap → the owned TxCursor → drop → discard.
         assert_eq!(db.pool().idle_count(), 0);
         assert_eq!(db.pool().total_count(), 0);
         assert_eq!(mock.disconnect_calls(), 1);

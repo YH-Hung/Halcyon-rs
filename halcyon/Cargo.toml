@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["db2", "database", "sql", "ibm", "cli"]
+categories = ["database", "api-bindings", "external-ffi-bindings"]
 
 [features]
 default = ["db2", "derive"]
@@ -23,3 +26,10 @@ halcyon-derive = { path = "../halcyon-derive", optional = true }
 # UI/compile-fail tests for #[derive(FromRow)] (tests/derive_ui.rs); only run
 # when the `derive` feature is enabled.
 trybuild = "1"
+
+# docs.rs has no clidriver and cannot link libdb2, so build the published docs
+# without the `db2` feature. `derive` is pure-Rust and part of the documented
+# surface, so keep it on. Mirrors the CI `--no-default-features` doc/test path.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["derive"]

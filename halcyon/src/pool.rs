@@ -357,6 +357,26 @@ impl ConnectionPool {
         params: ConnectionParams,
         config: PoolConfig,
     ) -> Result<ConnectionPool> {
+        // Reject an unsatisfiable config before opening anything: `max` is the hard
+        // ceiling, so a pool that can never hand out a connection (`max == 0`) or
+        // whose warm-up floor already exceeds the ceiling (`min > max`) is a
+        // configuration error, not a runtime one.
+        if config.max == 0 {
+            return Err(Error::new(
+                ErrorCode::Pool,
+                "PoolConfig.max must be at least 1",
+            ));
+        }
+        if config.min > config.max {
+            return Err(Error::new(
+                ErrorCode::Pool,
+                format!(
+                    "PoolConfig.min ({}) must not exceed max ({})",
+                    config.min, config.max
+                ),
+            ));
+        }
+
         let inner = Arc::new(PoolInner {
             driver,
             params,
@@ -599,6 +619,26 @@ mod tests {
         mock.push_connect_error(Error::new(ErrorCode::Connection, "refused"));
         let err = ConnectionPool::create(mock.clone(), params(), cfg(1, 4)).unwrap_err();
         assert_eq!(err.code, ErrorCode::Connection);
+    }
+
+    #[test]
+    fn create_rejects_min_greater_than_max() {
+        let mock = Arc::new(MockCliDriver::new());
+        // min=5 > max=2 would warm 5 connections and blow past the advertised
+        // hard ceiling before the pool ever started.
+        let err = ConnectionPool::create(mock.clone(), params(), cfg(5, 2)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Pool);
+        // An invalid config opens no connections.
+        assert_eq!(mock.connect_calls(), 0);
+    }
+
+    #[test]
+    fn create_rejects_zero_max() {
+        let mock = Arc::new(MockCliDriver::new());
+        // max=0 is a pool that can never hand out a connection.
+        let err = ConnectionPool::create(mock.clone(), params(), cfg(0, 0)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Pool);
+        assert_eq!(mock.connect_calls(), 0);
     }
 
     #[test]
