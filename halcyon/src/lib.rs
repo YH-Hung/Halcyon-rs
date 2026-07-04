@@ -10,9 +10,10 @@
 //! connection [`pool`] (bounded sizing, blocking acquire, reaping, transparent
 //! reconnect) with safe auto-[`retry`], and the pooled [`Database`] facade
 //! (owned [`QueryResult`] cursors and [`ScopedTransaction`]s) are implemented and
-//! mock-tested. The pool's concurrency-correctness verification (loom +
-//! ThreadSanitizer stress) that gates Phase 4 acceptance is still outstanding;
-//! the per-connection statement cache is next. See the README roadmap:
+//! mock-tested. The pool's concurrency-correctness track — `loom` model-checking
+//! of the lock/condvar handoff plus a `ConcurrentFakeDriver` ThreadSanitizer
+//! stress harness and perf benchmarks — is in place, so Phase 4 is accepted; the
+//! per-connection statement cache (Phase 5) is next. See the README roadmap:
 //!
 //! ```text
 //! facade ─► pool ─► core ─► driver (CliDriver seam) ─► halcyon-sys ─► libdb2
