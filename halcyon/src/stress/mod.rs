@@ -4,5 +4,7 @@
 //! scenarios. Pure-Rust — no clidriver, no live Db2.
 
 mod fake_driver;
+mod histogram;
 
 pub use fake_driver::ConcurrentFakeDriver;
+pub use histogram::LatencyHistogram;
