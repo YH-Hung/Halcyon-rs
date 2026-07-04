@@ -64,6 +64,12 @@ mod sync;
 #[cfg(test)]
 mod testing;
 
+// Concurrency stress harness (feature `stress`): a deterministic thread-safe
+// fake driver, a workload runner, and the pool scenarios. Public so integration
+// tests, benches, and examples can reach it; absent from a default build.
+#[cfg(feature = "stress")]
+pub mod stress;
+
 pub use core::{
     Connection, FromColumn, FromRow, IntoParams, Named, Params, QueryMap, ResultSet, Row,
     Statement, Transaction,

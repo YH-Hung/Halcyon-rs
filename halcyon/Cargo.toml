@@ -23,6 +23,9 @@ default = ["db2", "derive"]
 db2 = ["dep:halcyon-sys"]
 # Enables `#[derive(FromRow)]`. Pure-Rust (no clidriver); on by default.
 derive = ["dep:halcyon-derive"]
+# Exposes the concurrency stress harness (ConcurrentFakeDriver, runner,
+# scenarios) as `halcyon::stress`. Pure-Rust, test/bench only; off by default.
+stress = []
 
 [dependencies]
 halcyon-sys = { path = "../halcyon-sys", optional = true }
