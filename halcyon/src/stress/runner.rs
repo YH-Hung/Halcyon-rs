@@ -74,14 +74,30 @@ pub struct RunReport {
 impl RunReport {
     pub fn throughput_per_sec(&self) -> f64 {
         let secs = self.wall.as_secs_f64();
-        if secs > 0.0 { self.ops as f64 / secs } else { 0.0 }
+        if secs > 0.0 {
+            self.ops as f64 / secs
+        } else {
+            0.0
+        }
     }
-    pub fn p50_us(&self) -> f64 { self.hist.percentile_us(0.50) }
-    pub fn p95_us(&self) -> f64 { self.hist.percentile_us(0.95) }
-    pub fn p99_us(&self) -> f64 { self.hist.percentile_us(0.99) }
-    pub fn max_us(&self) -> f64 { self.hist.max_us() }
+    pub fn p50_us(&self) -> f64 {
+        self.hist.percentile_us(0.50)
+    }
+    pub fn p95_us(&self) -> f64 {
+        self.hist.percentile_us(0.95)
+    }
+    pub fn p99_us(&self) -> f64 {
+        self.hist.percentile_us(0.99)
+    }
+    pub fn max_us(&self) -> f64 {
+        self.hist.max_us()
+    }
     pub fn error_rate(&self) -> f64 {
-        if self.ops > 0 { self.errors as f64 / self.ops as f64 } else { 0.0 }
+        if self.ops > 0 {
+            self.errors as f64 / self.ops as f64
+        } else {
+            0.0
+        }
     }
 }
 
@@ -173,7 +189,12 @@ where
             // Split iterations across threads; earlier threads take the remainder.
             let base = total / threads as u64;
             let rem = total % threads as u64;
-            let quota = base + if (ctx.thread_index as u64) < rem { 1 } else { 0 };
+            let quota = base
+                + if (ctx.thread_index as u64) < rem {
+                    1
+                } else {
+                    0
+                };
             for _ in 0..quota {
                 if ctx.failed.is_some() {
                     break;
@@ -208,7 +229,12 @@ mod tests {
     #[test]
     fn runs_exactly_total_iterations_across_threads() {
         let ops = AtomicI64::new(0);
-        let cfg = RunConfig { threads: 4, stop: Stop::Iters(4000), warmup: None, seed: 1 };
+        let cfg = RunConfig {
+            threads: 4,
+            stop: Stop::Iters(4000),
+            warmup: None,
+            seed: 1,
+        };
         let r = run_workload("count", &cfg, |_ctx| {
             ops.fetch_add(1, Ordering::Relaxed);
         });
@@ -220,7 +246,12 @@ mod tests {
 
     #[test]
     fn surfaces_worker_failure() {
-        let cfg = RunConfig { threads: 2, stop: Stop::Iters(10), warmup: None, seed: 1 };
+        let cfg = RunConfig {
+            threads: 2,
+            stop: Stop::Iters(10),
+            warmup: None,
+            seed: 1,
+        };
         let r = run_workload("boom", &cfg, |ctx| ctx.fail("kaboom"));
         assert!(r.failed);
         assert_eq!(r.first_error.as_deref(), Some("kaboom"));

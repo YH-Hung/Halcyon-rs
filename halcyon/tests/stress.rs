@@ -7,17 +7,19 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use halcyon::driver::ConnectionParams;
 use halcyon::stress::{
     config_for, make_pool_contention, make_reconnect_faults, make_txn_churn, run_workload,
     ConcurrentFakeDriver, RunConfig, Scenario, Stop,
 };
-use halcyon::driver::ConnectionParams;
 use halcyon::Database;
 
 fn open(fake: Arc<ConcurrentFakeDriver>, scenario: Scenario, pool_max: usize) -> Database {
     Database::open(
         fake,
-        ConnectionParams { connection_string: "dsn".into() },
+        ConnectionParams {
+            connection_string: "dsn".into(),
+        },
         config_for(scenario, pool_max),
     )
     .expect("pool warmup")
@@ -29,7 +31,12 @@ fn pool_contention_stays_consistent() {
     let db = open(fake.clone(), Scenario::Pool, 8);
 
     let body = make_pool_contention(&db);
-    let cfg = RunConfig { threads: 32, stop: Stop::Iters(20_000), warmup: None, seed: 1 };
+    let cfg = RunConfig {
+        threads: 32,
+        stop: Stop::Iters(20_000),
+        warmup: None,
+        seed: 1,
+    };
     let r = run_workload("pool", &cfg, body);
 
     assert!(!r.failed, "{:?}", r.first_error);
@@ -48,11 +55,19 @@ fn reconnect_and_retry_recover_under_faults() {
 
     let recovered = AtomicI64::new(0);
     let body = make_reconnect_faults(&db, &recovered);
-    let cfg = RunConfig { threads: 12, stop: Stop::Iters(30_000), warmup: None, seed: 2 };
+    let cfg = RunConfig {
+        threads: 12,
+        stop: Stop::Iters(30_000),
+        warmup: None,
+        seed: 2,
+    };
     let r = run_workload("reconnect", &cfg, body);
 
     assert!(!r.failed, "{:?}", r.first_error); // no wrong scalar / non-retriable
-    assert!(fake.connect_calls() > connects_after_warmup, "reconnects fired");
+    assert!(
+        fake.connect_calls() > connects_after_warmup,
+        "reconnects fired"
+    );
     assert!(fake.execute_calls() > r.ops as i64, "retries fired");
     assert!(
         recovered.load(Ordering::Relaxed) > (r.ops as i64) * 9 / 10,
@@ -67,7 +82,12 @@ fn transaction_churn_commits_and_rollbacks_balance() {
     let db = open(fake.clone(), Scenario::Txn, 6);
 
     let body = make_txn_churn(&db);
-    let cfg = RunConfig { threads: 8, stop: Stop::Iters(16_000), warmup: None, seed: 3 };
+    let cfg = RunConfig {
+        threads: 8,
+        stop: Stop::Iters(16_000),
+        warmup: None,
+        seed: 3,
+    };
     let r = run_workload("txn", &cfg, body);
 
     assert!(!r.failed, "{:?}", r.first_error);
@@ -93,7 +113,13 @@ fn reaper_races_acquire_release_safely() {
     let r = run_workload("lifecycle", &cfg, body);
 
     assert!(!r.failed, "{:?}", r.first_error);
-    assert!(fake.peak_in_flight() <= 6, "reaper never reaps a live lease");
+    assert!(
+        fake.peak_in_flight() <= 6,
+        "reaper never reaps a live lease"
+    );
     assert_eq!(db.pool().active_count(), 0);
-    assert!(db.pool().total_count() >= db.pool().idle_count(), "accounting consistent");
+    assert!(
+        db.pool().total_count() >= db.pool().idle_count(),
+        "accounting consistent"
+    );
 }

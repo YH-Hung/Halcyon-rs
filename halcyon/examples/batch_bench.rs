@@ -64,7 +64,13 @@ fn main() {
 
     let rps = |s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
     println!("rows={n}");
-    println!("per_row_autocommit : {per_row:.3}s  {:.0} rows/s", rps(per_row));
+    println!(
+        "per_row_autocommit : {per_row:.3}s  {:.0} rows/s",
+        rps(per_row)
+    );
     println!("array_autocommit   : {array:.3}s  {:.0} rows/s", rps(array));
-    println!("array_transaction  : {array_txn:.3}s  {:.0} rows/s", rps(array_txn));
+    println!(
+        "array_transaction  : {array_txn:.3}s  {:.0} rows/s",
+        rps(array_txn)
+    );
 }

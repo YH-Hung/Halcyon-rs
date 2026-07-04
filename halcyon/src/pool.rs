@@ -28,7 +28,11 @@ use crate::core::Connection;
 use crate::driver::{CliDriver, ConnectionParams};
 use crate::error::{Error, ErrorCode, Result};
 use crate::retry::BackoffPolicy;
-use crate::sync::thread::{self, JoinHandle};
+// The `thread` module alias is only used off-loom (the maintenance thread and the
+// std-based unit tests); under `--cfg loom` only `JoinHandle` — the field type — is.
+#[cfg(not(loom))]
+use crate::sync::thread;
+use crate::sync::thread::JoinHandle;
 use crate::sync::{Condvar, Mutex};
 
 /// Configuration for a [`ConnectionPool`]: sizing, timeouts, validation, and
@@ -407,6 +411,8 @@ impl ConnectionPool {
         }
         inner.state.lock().expect("pool mutex poisoned").idle = idle;
 
+        // `mut` is needed only off-loom, where `start_maintenance` takes `&mut self`.
+        #[cfg_attr(loom, allow(unused_mut))]
         let mut pool = ConnectionPool {
             inner,
             maintenance: None,
@@ -905,9 +911,7 @@ mod tests {
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
-    use crate::driver::{
-        CliDriver, ConnectionHandle, ConnectionParams, StatementHandle,
-    };
+    use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
     use crate::error::{Error, ErrorCode, Result};
     use crate::value::Value;
     use loom::sync::Arc as LoomArc; // for spawning; pool internals use std::sync::Arc
@@ -922,29 +926,57 @@ mod loom_tests {
         fn connect(&self, _p: &ConnectionParams) -> Result<ConnectionHandle> {
             Ok(ConnectionHandle(1))
         }
-        fn disconnect(&self, _c: ConnectionHandle) -> Result<()> { Ok(()) }
-        fn is_alive(&self, _c: ConnectionHandle) -> Result<bool> { Ok(true) }
+        fn disconnect(&self, _c: ConnectionHandle) -> Result<()> {
+            Ok(())
+        }
+        fn is_alive(&self, _c: ConnectionHandle) -> Result<bool> {
+            Ok(true)
+        }
         fn prepare(&self, _c: ConnectionHandle, _s: &str) -> Result<StatementHandle> {
             Ok(StatementHandle(1))
         }
-        fn bind_params(&self, _s: StatementHandle, _p: &[Value]) -> Result<()> { Ok(()) }
-        fn execute(&self, _s: StatementHandle) -> Result<i64> { Ok(0) }
-        fn execute_batch(&self, _s: StatementHandle, _r: &[Vec<Value>]) -> Result<i64> { Ok(0) }
-        fn column_count(&self, _s: StatementHandle) -> Result<usize> { Ok(0) }
-        fn column_name(&self, _s: StatementHandle, _i: usize) -> Result<String> { Ok(String::new()) }
-        fn fetch(&self, _s: StatementHandle) -> Result<bool> { Ok(false) }
+        fn bind_params(&self, _s: StatementHandle, _p: &[Value]) -> Result<()> {
+            Ok(())
+        }
+        fn execute(&self, _s: StatementHandle) -> Result<i64> {
+            Ok(0)
+        }
+        fn execute_batch(&self, _s: StatementHandle, _r: &[Vec<Value>]) -> Result<i64> {
+            Ok(0)
+        }
+        fn column_count(&self, _s: StatementHandle) -> Result<usize> {
+            Ok(0)
+        }
+        fn column_name(&self, _s: StatementHandle, _i: usize) -> Result<String> {
+            Ok(String::new())
+        }
+        fn fetch(&self, _s: StatementHandle) -> Result<bool> {
+            Ok(false)
+        }
         fn get_column(&self, _s: StatementHandle, _i: usize) -> Result<Value> {
             Err(Error::new(ErrorCode::Mapping, "none"))
         }
-        fn finalize(&self, _s: StatementHandle) -> Result<()> { Ok(()) }
-        fn close_cursor(&self, _s: StatementHandle) -> Result<()> { Ok(()) }
-        fn set_auto_commit(&self, _c: ConnectionHandle, _e: bool) -> Result<()> { Ok(()) }
-        fn commit(&self, _c: ConnectionHandle) -> Result<()> { Ok(()) }
-        fn rollback(&self, _c: ConnectionHandle) -> Result<()> { Ok(()) }
+        fn finalize(&self, _s: StatementHandle) -> Result<()> {
+            Ok(())
+        }
+        fn close_cursor(&self, _s: StatementHandle) -> Result<()> {
+            Ok(())
+        }
+        fn set_auto_commit(&self, _c: ConnectionHandle, _e: bool) -> Result<()> {
+            Ok(())
+        }
+        fn commit(&self, _c: ConnectionHandle) -> Result<()> {
+            Ok(())
+        }
+        fn rollback(&self, _c: ConnectionHandle) -> Result<()> {
+            Ok(())
+        }
     }
 
     fn params() -> ConnectionParams {
-        ConnectionParams { connection_string: "loom".into() }
+        ConnectionParams {
+            connection_string: "loom".into(),
+        }
     }
 
     // A deterministic base config: no maintenance thread, zero backoff, one slot.

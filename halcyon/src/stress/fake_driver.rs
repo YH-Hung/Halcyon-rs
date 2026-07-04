@@ -9,9 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
-use crate::driver::{
-    CliDriver, ConnectionHandle, ConnectionParams, StatementHandle,
-};
+use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
 
@@ -72,22 +70,43 @@ impl ConcurrentFakeDriver {
     }
 
     // --- counter accessors (loaded snapshots) ---
-    pub fn connect_calls(&self) -> i64 { self.connect_calls.load(Ordering::Relaxed) }
-    pub fn disconnect_calls(&self) -> i64 { self.disconnect_calls.load(Ordering::Relaxed) }
-    pub fn prepare_calls(&self) -> i64 { self.prepare_calls.load(Ordering::Relaxed) }
-    pub fn execute_calls(&self) -> i64 { self.execute_calls.load(Ordering::Relaxed) }
-    pub fn commit_calls(&self) -> i64 { self.commit_calls.load(Ordering::Relaxed) }
-    pub fn rollback_calls(&self) -> i64 { self.rollback_calls.load(Ordering::Relaxed) }
-    pub fn auto_commit_on(&self) -> i64 { self.auto_commit_on.load(Ordering::Relaxed) }
-    pub fn auto_commit_off(&self) -> i64 { self.auto_commit_off.load(Ordering::Relaxed) }
-    pub fn peak_in_flight(&self) -> i64 { self.peak_in_flight.load(Ordering::Relaxed) }
+    pub fn connect_calls(&self) -> i64 {
+        self.connect_calls.load(Ordering::Relaxed)
+    }
+    pub fn disconnect_calls(&self) -> i64 {
+        self.disconnect_calls.load(Ordering::Relaxed)
+    }
+    pub fn prepare_calls(&self) -> i64 {
+        self.prepare_calls.load(Ordering::Relaxed)
+    }
+    pub fn execute_calls(&self) -> i64 {
+        self.execute_calls.load(Ordering::Relaxed)
+    }
+    pub fn commit_calls(&self) -> i64 {
+        self.commit_calls.load(Ordering::Relaxed)
+    }
+    pub fn rollback_calls(&self) -> i64 {
+        self.rollback_calls.load(Ordering::Relaxed)
+    }
+    pub fn auto_commit_on(&self) -> i64 {
+        self.auto_commit_on.load(Ordering::Relaxed)
+    }
+    pub fn auto_commit_off(&self) -> i64 {
+        self.auto_commit_off.load(Ordering::Relaxed)
+    }
+    pub fn peak_in_flight(&self) -> i64 {
+        self.peak_in_flight.load(Ordering::Relaxed)
+    }
 
     fn enter_in_flight(&self) -> InFlightGuard<'_> {
         let cur = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let mut prev = self.peak_in_flight.load(Ordering::Relaxed);
         while cur > prev {
             match self.peak_in_flight.compare_exchange_weak(
-                prev, cur, Ordering::Relaxed, Ordering::Relaxed,
+                prev,
+                cur,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(p) => prev = p,
@@ -175,7 +194,14 @@ impl CliDriver for ConcurrentFakeDriver {
         }
         g.next_stmt += 1;
         let h = g.next_stmt;
-        g.stmts.insert(h, StmtState { conn: conn.0, sql: sql.to_owned(), position: -1 });
+        g.stmts.insert(
+            h,
+            StmtState {
+                conn: conn.0,
+                sql: sql.to_owned(),
+                position: -1,
+            },
+        );
         Ok(StatementHandle(h))
     }
 
@@ -300,7 +326,9 @@ mod tests {
     use crate::value::Value;
 
     fn params() -> ConnectionParams {
-        ConnectionParams { connection_string: "dsn".into() }
+        ConnectionParams {
+            connection_string: "dsn".into(),
+        }
     }
 
     #[test]
@@ -319,7 +347,8 @@ mod tests {
     #[test]
     fn fail_execute_every_trips_at_rate() {
         let d = ConcurrentFakeDriver::new();
-        d.fail_execute_every.store(2, std::sync::atomic::Ordering::Relaxed);
+        d.fail_execute_every
+            .store(2, std::sync::atomic::Ordering::Relaxed);
         let c = d.connect(&params()).unwrap();
         let s = d.prepare(c, "SELECT 1 FROM SYSIBM.SYSDUMMY1").unwrap();
         assert!(d.execute(s).is_ok()); // call 1

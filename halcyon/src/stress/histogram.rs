@@ -20,7 +20,10 @@ impl Default for LatencyHistogram {
 
 impl LatencyHistogram {
     pub fn new() -> Self {
-        LatencyHistogram { counts: [0; BUCKETS], total: 0 }
+        LatencyHistogram {
+            counts: [0; BUCKETS],
+            total: 0,
+        }
     }
 
     pub fn record(&mut self, ns: u64) {
@@ -89,9 +92,13 @@ mod tests {
     #[test]
     fn counts_and_merges() {
         let mut a = LatencyHistogram::new();
-        for _ in 0..100 { a.record(1_000); }
+        for _ in 0..100 {
+            a.record(1_000);
+        }
         let mut b = LatencyHistogram::new();
-        for _ in 0..100 { b.record(1_000); }
+        for _ in 0..100 {
+            b.record(1_000);
+        }
         a.merge(&b);
         assert_eq!(a.count(), 200);
     }
@@ -99,8 +106,12 @@ mod tests {
     #[test]
     fn percentile_is_monotonic() {
         let mut h = LatencyHistogram::new();
-        for _ in 0..1000 { h.record(1_000); }        // ~1us
-        for _ in 0..10 { h.record(1_000 * 1_000); }  // ~1ms tail
+        for _ in 0..1000 {
+            h.record(1_000);
+        } // ~1us
+        for _ in 0..10 {
+            h.record(1_000 * 1_000);
+        } // ~1ms tail
         assert!(h.count() > 0);
         assert!(h.percentile_us(0.50) <= h.percentile_us(0.99));
         assert!(h.percentile_us(0.99) <= h.max_us());

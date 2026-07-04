@@ -22,7 +22,9 @@ fn main() {
         let fake = Arc::new(ConcurrentFakeDriver::new());
         let db = Database::open(
             fake,
-            ConnectionParams { connection_string: "dsn".into() },
+            ConnectionParams {
+                connection_string: "dsn".into(),
+            },
             config_for(Scenario::Pool, pool_max),
         )
         .unwrap();

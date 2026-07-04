@@ -29,7 +29,9 @@ fn db() -> Database {
     };
     Database::open(
         Arc::new(ConcurrentFakeDriver::new()),
-        ConnectionParams { connection_string: "dsn".into() },
+        ConnectionParams {
+            connection_string: "dsn".into(),
+        },
         cfg,
     )
     .unwrap()
@@ -49,8 +51,7 @@ fn bench_scalar_query(c: &mut Criterion) {
     let db = db();
     c.bench_function("query_scalar", |b| {
         b.iter(|| {
-            let rows: Vec<(i64,)> =
-                db.query_as("SELECT 7 FROM SYSIBM.SYSDUMMY1", ()).unwrap();
+            let rows: Vec<(i64,)> = db.query_as("SELECT 7 FROM SYSIBM.SYSDUMMY1", ()).unwrap();
             std::hint::black_box(rows);
         });
     });
