@@ -5,6 +5,8 @@
 
 mod fake_driver;
 mod histogram;
+mod runner;
 
 pub use fake_driver::ConcurrentFakeDriver;
 pub use histogram::LatencyHistogram;
+pub use runner::{run_workload, RunConfig, RunReport, Stop, WorkerCtx};
