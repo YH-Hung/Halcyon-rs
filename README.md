@@ -2,7 +2,7 @@
 
 A modern Rust client library for **IBM Db2**, built on the IBM Db2 CLI (`libdb2`). The Rust counterpart of the C++ [Halcyon](https://github.com/YH-Hung/Halcyon) library — same layered architecture, same error model, same driver-seam philosophy, expressed idiomatically in Rust.
 
-> **Status: early development.** The driver seam, the core data path, and the pooled `Database` facade — connection pool (bounded sizing, blocking acquire, idle/lifetime reaping, transparent reconnect), safe auto-retry, and RAII transactions — are implemented and covered by mock + live-Db2 tests. The pool's concurrency-correctness track (`loom` + TSan stress + perf harnesses) is in place — Phase 4 accepted — and each pooled connection now carries a per-connection prepared-statement LRU (`PoolConfig::statement_cache_size`, default 64; Phase 5), mock-complete with live acceptance riding the `live-db2` reuse round-trip. The `tokio` async facade (Phase 6) is next. See the roadmap below.
+> **Status: early development.** The driver seam, the core data path, and the pooled `Database` facade — connection pool (bounded sizing, blocking acquire, idle/lifetime reaping, transparent reconnect), safe auto-retry, and RAII transactions — are implemented and covered by mock + live-Db2 tests. The pool's concurrency-correctness track (`loom` + TSan stress + perf harnesses) is in place — Phase 4 accepted — and each pooled connection carries a per-connection prepared-statement LRU (`PoolConfig::statement_cache_size`, default 64), validated against live Db2 by the reuse round-trip — Phase 5 accepted. The `tokio` async facade (Phase 6) is next. See the roadmap below.
 
 ## Architecture
 
