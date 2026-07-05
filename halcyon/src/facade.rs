@@ -339,6 +339,12 @@ impl Drop for QueryResult {
         // decide the lease's fate: a mid-stream connection-class failure means
         // the connection is dead, so discard it instead of pooling it.
         if let Some(stmt_lease) = self.stmt_lease.take() {
+            // Any driver-side scan failure poisons the statement so its cache
+            // entry is dropped; a connection-class one additionally discards
+            // the whole connection below.
+            if self.error.borrow().is_some() {
+                stmt_lease.poison();
+            }
             self.lease.release_stmt(stmt_lease);
         }
         let broken = self

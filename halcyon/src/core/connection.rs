@@ -99,15 +99,28 @@ impl Connection {
     /// affected. Accepts positional (`?`) or named (`:name`) parameters.
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<i64> {
         let stmt = self.prepare_and_bind(sql, params.into_params())?;
-        self.driver.execute(stmt.handle)
+        let result = self.driver.execute(stmt.handle());
+        if result.is_err() {
+            stmt.poison();
+        }
+        result
     }
 
     /// Prepares, binds, executes, and returns a streaming [`ResultSet`] cursor.
     /// Accepts positional (`?`) or named (`:name`) parameters.
     pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<ResultSet<'_>> {
         let stmt = self.prepare_and_bind(sql, params.into_params())?;
-        self.driver.execute(stmt.handle)?;
-        let columns = self.driver.column_count(stmt.handle)?;
+        let columns = match self
+            .driver
+            .execute(stmt.handle())
+            .and_then(|_| self.driver.column_count(stmt.handle()))
+        {
+            Ok(columns) => columns,
+            Err(e) => {
+                stmt.poison();
+                return Err(e);
+            }
+        };
         Ok(ResultSet::from_executed(stmt, columns))
     }
 
@@ -127,7 +140,11 @@ impl Connection {
         }
         validate_batch_rows(rows)?;
         let stmt = self.prepare(sql)?;
-        self.driver.execute_batch(stmt.handle(), rows)
+        let result = self.driver.execute_batch(stmt.handle(), rows);
+        if result.is_err() {
+            stmt.poison();
+        }
+        result
     }
 
     fn prepare_and_bind(&self, sql: &str, params: Params) -> Result<Statement<'_>> {
@@ -253,16 +270,33 @@ impl<'c> Statement<'c> {
     /// time — use [`Connection::execute`] for those.
     pub fn execute(&mut self, params: impl IntoParams) -> Result<i64> {
         let values = positional_only(params.into_params())?;
-        self.conn.driver.bind_params(self.handle, &values)?;
-        self.conn.driver.execute(self.handle)
+        let result = self
+            .conn
+            .driver
+            .bind_params(self.handle, &values)
+            .and_then(|_| self.conn.driver.execute(self.handle));
+        if result.is_err() {
+            self.poison();
+        }
+        result
     }
 
     /// Consumes this prepared statement into a streaming query cursor.
     pub fn into_query(self, params: impl IntoParams) -> Result<ResultSet<'c>> {
         let values = positional_only(params.into_params())?;
-        self.conn.driver.bind_params(self.handle, &values)?;
-        self.conn.driver.execute(self.handle)?;
-        let columns = self.conn.driver.column_count(self.handle)?;
+        let columns = match self
+            .conn
+            .driver
+            .bind_params(self.handle, &values)
+            .and_then(|_| self.conn.driver.execute(self.handle))
+            .and_then(|_| self.conn.driver.column_count(self.handle))
+        {
+            Ok(columns) => columns,
+            Err(e) => {
+                self.poison();
+                return Err(e);
+            }
+        };
         Ok(ResultSet::from_executed(self, columns))
     }
 }
@@ -586,6 +620,118 @@ mod tests {
         // The statement was finalized, then the connection disconnected.
         assert_eq!(mock.finalize_calls(), 1);
         assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    /// Builds a caching connection over the mock.
+    fn connect_cached(mock: &Arc<MockCliDriver>, capacity: usize) -> Connection {
+        Connection::open_with_cache(mock.clone(), &params(), capacity).unwrap()
+    }
+
+    #[test]
+    fn cached_connection_reuses_prepared_statement_across_queries() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(users_grid());
+        mock.push_result_set(users_grid());
+        let conn = connect_cached(&mock, 8);
+        for _ in 0..2 {
+            let mut rs = conn.query("SELECT id, name FROM u", ()).unwrap();
+            let _rows: Vec<(i64, String)> = rs.collect_rows().unwrap();
+        }
+        assert_eq!(mock.prepared_sql().len(), 1); // second query was a hit
+        assert_eq!(mock.finalize_calls(), 0); // entry still cached
+        assert_eq!(mock.close_cursor_calls(), 2); // reset on each release
+    }
+
+    #[test]
+    fn named_params_cache_on_the_rewritten_sql() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(users_grid());
+        mock.push_result_set(users_grid());
+        let conn = connect_cached(&mock, 8);
+        for _ in 0..2 {
+            let mut rs = conn
+                .query(
+                    "SELECT id, name FROM u WHERE age > :age",
+                    named! { "age" => 21 },
+                )
+                .unwrap();
+            let _rows: Vec<(i64, String)> = rs.collect_rows().unwrap();
+        }
+        // One prepare, keyed by the rewritten (positional) SQL.
+        assert_eq!(
+            mock.prepared_sql(),
+            vec!["SELECT id, name FROM u WHERE age > ?"]
+        );
+    }
+
+    #[test]
+    fn execute_error_poisons_cached_statement_so_next_use_reprepares() {
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = connect_cached(&mock, 8);
+        conn.execute("UPDATE t SET x = ?", (1,)).unwrap(); // miss: prepare #1
+        mock.push_execute_error(Error::new(ErrorCode::Connection, "broken"));
+        conn.execute("UPDATE t SET x = ?", (2,)).unwrap_err(); // hit, exec fails
+        assert_eq!(mock.finalize_calls(), 1); // poisoned entry dropped
+        conn.execute("UPDATE t SET x = ?", (3,)).unwrap(); // miss again
+        assert_eq!(mock.prepared_sql().len(), 2);
+    }
+
+    #[test]
+    fn fetch_error_drops_cached_statement_via_cursor_drop() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(users_grid());
+        mock.push_result_set(users_grid());
+        mock.fail_fetch_on_call(1, Error::new(ErrorCode::Connection, "boom"));
+        let conn = connect_cached(&mock, 8);
+        {
+            let mut rs = conn.query("SELECT id, name FROM u", ()).unwrap();
+            let _ = rs.next().unwrap_err(); // driver-side scan failure
+        } // ResultSet drop → Statement poisoned → entry finalized + dropped
+        assert_eq!(mock.finalize_calls(), 1);
+        let mut rs = conn.query("SELECT id, name FROM u", ()).unwrap();
+        let _rows: Vec<(i64, String)> = rs.collect_rows().unwrap();
+        assert_eq!(mock.prepared_sql().len(), 2); // re-prepared after the drop
+    }
+
+    #[test]
+    fn client_side_mapping_error_does_not_drop_cached_statement() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(["n"], vec![vec![Value::Int(7)]]));
+        mock.push_result_set(ScriptedRows::new(["n"], vec![vec![Value::Int(7)]]));
+        let conn = connect_cached(&mock, 8);
+        {
+            let mut rs = conn.query("SELECT n FROM u", ()).unwrap();
+            let row = rs.next().unwrap().unwrap();
+            assert!(row.column::<String>(0).is_err()); // Int as String: mapping
+        }
+        let mut rs = conn.query("SELECT n FROM u", ()).unwrap();
+        let _rows: Vec<(i64,)> = rs.collect_rows().unwrap();
+        assert_eq!(mock.prepared_sql().len(), 1); // entry survived: still a hit
+        assert_eq!(mock.finalize_calls(), 0);
+    }
+
+    #[test]
+    fn overlapping_same_sql_statements_use_transient_overflow() {
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = connect_cached(&mock, 8);
+        let s1 = conn.prepare("SELECT 1").unwrap();
+        let s2 = conn.prepare("SELECT 1").unwrap(); // busy hit → transient
+        assert_eq!(mock.prepared_sql().len(), 2);
+        drop(s2);
+        assert_eq!(mock.finalize_calls(), 1); // transient finalized
+        drop(s1);
+        assert_eq!(mock.finalize_calls(), 1); // cached entry kept
+    }
+
+    #[test]
+    fn drop_finalizes_cached_entries_before_disconnect() {
+        let mock = Arc::new(MockCliDriver::new());
+        {
+            let conn = connect_cached(&mock, 8);
+            conn.execute("UPDATE t SET x = 1", ()).unwrap(); // one cached entry
+        }
+        // Cache cleared (finalize) strictly before disconnect.
+        assert_eq!(mock.events(), vec!["finalize", "disconnect"]);
     }
 
     #[test]

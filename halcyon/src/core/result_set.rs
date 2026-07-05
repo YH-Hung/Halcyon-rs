@@ -189,6 +189,9 @@ impl<'c> ResultSet<'c> {
     /// a clean end, `Err` on a mid-stream fetch failure (also retained in
     /// [`error`](ResultSet::error)). Once it yields `None`/`Err` it stays done.
     ///
+    /// (See the `Drop` impl below: a recorded driver-side failure also poisons
+    /// the statement so a cached prepared statement is dropped, not reused.)
+    ///
     /// Not an [`Iterator`]: the yielded [`Row`] borrows the cursor (a lending
     /// iterator), which `std::iter::Iterator` can't express — use `while let` here
     /// or [`query_map`](ResultSet::query_map) for owned-item iteration.
@@ -240,6 +243,19 @@ impl<'c> ResultSet<'c> {
             out.push(T::from_row(&row)?);
         }
         Ok(out)
+    }
+}
+
+impl Drop for ResultSet<'_> {
+    fn drop(&mut self) {
+        // A driver-side scan failure (fetch or column read) may leave the
+        // handle mid-cursor in a bad state: poison the statement so a cached
+        // entry is finalized and dropped on release, not reused (C++ spec §5).
+        // Client-side mapping errors are never recorded here, so they don't
+        // poison.
+        if self.error.borrow().is_some() {
+            self.stmt.poison();
+        }
     }
 }
 
