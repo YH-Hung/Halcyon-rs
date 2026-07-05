@@ -94,6 +94,9 @@ struct State {
     finalized: Vec<StatementHandle>,
     close_cursor_calls: u32,
     close_cursor_errors: VecDeque<Error>,
+    /// Ordered log of lifecycle calls whose relative order tests assert on
+    /// (statement finalize vs. connection disconnect).
+    events: Vec<&'static str>,
 
     // --- transaction scripting ---
     txn_errors: VecDeque<Error>,
@@ -262,6 +265,10 @@ impl MockCliDriver {
     pub fn close_cursor_calls(&self) -> u32 {
         self.lock().close_cursor_calls
     }
+    /// Ordered finalize/disconnect log — asserts teardown ordering.
+    pub fn events(&self) -> Vec<&'static str> {
+        self.lock().events.clone()
+    }
     pub fn commit_calls(&self) -> u32 {
         self.lock().commit_calls
     }
@@ -292,7 +299,9 @@ impl CliDriver for MockCliDriver {
     }
 
     fn disconnect(&self, _conn: ConnectionHandle) -> Result<()> {
-        self.lock().disconnect_calls += 1;
+        let mut s = self.lock();
+        s.disconnect_calls += 1;
+        s.events.push("disconnect");
         Ok(())
     }
 
@@ -416,6 +425,7 @@ impl CliDriver for MockCliDriver {
         // params after the owning Statement is dropped (handles never alias).
         let mut s = self.lock();
         s.finalize_calls += 1;
+        s.events.push("finalize");
         s.finalized.push(stmt);
         Ok(())
     }
@@ -684,6 +694,16 @@ mod tests {
         assert_eq!(m.get_column(s, 1).unwrap_err().code, ErrorCode::Connection); // call 2 fails
         assert_eq!(m.get_column_calls(), 2);
         assert_eq!(m.fetch_calls(), 1);
+    }
+
+    #[test]
+    fn event_log_records_finalize_and_disconnect_order() {
+        let m = MockCliDriver::new();
+        let c = m.connect(&conn_params()).unwrap();
+        let s = m.prepare(c, "SELECT 1").unwrap();
+        m.finalize(s).unwrap();
+        m.disconnect(c).unwrap();
+        assert_eq!(m.events(), vec!["finalize", "disconnect"]);
     }
 
     #[test]
