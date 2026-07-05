@@ -273,7 +273,7 @@ mod tests {
         cache.release(mock.as_ref(), l);
         assert_eq!(mock.finalize_calls(), 1); // exactly one eviction
         assert_eq!(mock.prepared_sql(), vec!["A", "B", "C"]); // A's re-acquire hit
-        // A still hits; B re-prepares.
+                                                              // A still hits; B re-prepares.
         let l = cache.acquire(mock.as_ref(), conn, "A").unwrap();
         cache.release(mock.as_ref(), l);
         let before = mock.prepared_sql().len();

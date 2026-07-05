@@ -12,8 +12,10 @@
 //! (owned [`QueryResult`] cursors and [`ScopedTransaction`]s) are implemented and
 //! mock-tested. The pool's concurrency-correctness track — `loom` model-checking
 //! of the lock/condvar handoff plus a `ConcurrentFakeDriver` ThreadSanitizer
-//! stress harness and perf benchmarks — is in place, so Phase 4 is accepted; the
-//! per-connection statement cache (Phase 5) is next. See the README roadmap:
+//! stress harness and perf benchmarks — is in place (Phase 4), and every pooled
+//! connection carries a per-connection prepared-statement LRU
+//! ([`PoolConfig::statement_cache_size`], default 64; Phase 5). The `tokio`
+//! async facade (Phase 6) is next. See the README roadmap:
 //!
 //! ```text
 //! facade ─► pool ─► core ─► driver (CliDriver seam) ─► halcyon-sys ─► libdb2

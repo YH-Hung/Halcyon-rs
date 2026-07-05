@@ -7,8 +7,11 @@
 //! finalized before the connection is disconnected — the ordering the C++
 //! `Connection::reset` enforces by hand.
 //!
-//! The per-connection statement cache (C++ `StatementCache`) is Phase 5; here
-//! every `query`/`execute` prepares a fresh statement.
+//! Statements are leased from the per-connection statement cache (C++
+//! `StatementCache`, Phase 5): with a nonzero capacity
+//! ([`Connection::open_with_cache`]), repeated SQL reuses its prepared handle;
+//! at capacity 0 (the plain [`Connection::open`] default) every lease is
+//! transient — prepared and finalized per call.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -211,9 +214,7 @@ impl Connection {
     /// leases are finalized, cached ones reset and returned to the LRU (or
     /// dropped if poisoned). The release half of every prepare path above.
     pub(crate) fn release_stmt(&self, lease: StmtLease) {
-        self.cache
-            .borrow_mut()
-            .release(self.driver.as_ref(), lease);
+        self.cache.borrow_mut().release(self.driver.as_ref(), lease);
     }
 }
 
