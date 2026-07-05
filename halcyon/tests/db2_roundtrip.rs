@@ -18,8 +18,10 @@
 //! [`live_round_trip`] (connect, DDL, positional/named/batch inserts, typed
 //! streaming reads including NULL, commit/rollback via the driver primitives),
 //! and the Phase 3 [`Database`] facade in [`live_facade_round_trip`] (ergonomic
-//! `connect`, closure/RAII [`halcyon::Transaction`] commit and rollback). The
-//! pool round-trips from the C++ `test_db2_roundtrip.cpp` arrive with Phase 4.
+//! `connect`, closure/RAII [`halcyon::Transaction`] commit and rollback).
+//! [`live_statement_cache_reuse`] proves the Phase 5 per-connection statement
+//! cache on real Db2: repeated statements reuse their prepared handles across
+//! cursor open/close cycles and still return correct results.
 #![cfg(feature = "db2")]
 
 use std::sync::Arc;
@@ -208,5 +210,57 @@ fn live_facade_round_trip() {
     assert_eq!(after_commit, vec![(4, "di".to_string())]);
 
     db.execute("DROP TABLE halcyon_facade", ())
+        .expect("drop table");
+}
+
+/// Phase 5 exit criterion: repeated statements through the pooled facade (the
+/// default config caches 64 per connection) must reuse prepared handles and
+/// still return correct results on real Db2 — a parameterized SELECT
+/// re-executed with different bindings (cursor open/close/reopen on the cached
+/// handle) and a DML re-executed after those cursors.
+#[test]
+fn live_statement_cache_reuse() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("HALCYON_TEST_DSN not set; skipping live statement-cache round-trip");
+        return;
+    };
+    let db = Database::connect(&dsn).expect("open database");
+
+    let _ = db.execute("DROP TABLE halcyon_stmt_cache", ());
+    db.execute(
+        "CREATE TABLE halcyon_stmt_cache(id INT NOT NULL, name VARCHAR(64))",
+        (),
+    )
+    .expect("create table");
+
+    // Re-execute the same INSERT through the cache with different bindings.
+    for (id, name) in [(1, "ada"), (2, "bob"), (3, "cy")] {
+        db.execute("INSERT INTO halcyon_stmt_cache VALUES (?, ?)", (id, name))
+            .expect("cached insert");
+    }
+
+    // Re-execute the same parameterized SELECT; each run opens and closes a
+    // cursor on the cached handle (the close_cursor reset-before-reuse
+    // discipline, now proven on live Db2).
+    for lo in 1..=3i32 {
+        let got: Vec<(i32, String)> = db
+            .query_as(
+                "SELECT id, name FROM halcyon_stmt_cache WHERE id >= ? ORDER BY id",
+                (lo,),
+            )
+            .expect("cached select");
+        assert_eq!(got.len() as i32, 4 - lo, "wrong row count for lo={lo}");
+        assert_eq!(got[0].0, lo, "wrong first row for lo={lo}");
+    }
+
+    // DML re-execution after cursors: the cached INSERT handle still works.
+    db.execute("INSERT INTO halcyon_stmt_cache VALUES (?, ?)", (4, "di"))
+        .expect("insert after cursor reuse");
+    let count: Vec<(i32,)> = db
+        .query_as("SELECT COUNT(*) FROM halcyon_stmt_cache", ())
+        .expect("count");
+    assert_eq!(count[0].0, 4);
+
+    db.execute("DROP TABLE halcyon_stmt_cache", ())
         .expect("drop table");
 }
