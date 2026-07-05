@@ -11,6 +11,7 @@ mod column;
 mod connection;
 mod params;
 mod result_set;
+mod stmt_cache;
 mod transaction;
 
 #[cfg(all(test, feature = "derive"))]
@@ -24,6 +25,9 @@ pub use transaction::Transaction;
 // Shared with the facade's owned pooled cursor / RAII transaction, which live
 // outside `core` and so can't reach these through the private submodules.
 pub(crate) use transaction::terminate;
+// The statement cache and its lease token cross into `connection.rs` and the
+// facade's owned cursors, which live outside this module tree.
+pub(crate) use stmt_cache::{StatementCache, StmtLease};
 
 use crate::error::{Error, ErrorCode};
 
