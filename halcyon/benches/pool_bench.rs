@@ -11,7 +11,7 @@ use halcyon::retry::BackoffPolicy;
 use halcyon::stress::ConcurrentFakeDriver;
 use halcyon::{Database, PoolConfig};
 
-fn db() -> Database {
+fn db(statement_cache_size: usize) -> Database {
     let cfg = PoolConfig {
         min: 2,
         max: 4,
@@ -26,7 +26,7 @@ fn db() -> Database {
         },
         maintenance_interval: Duration::from_secs(3600),
         start_maintenance_thread: false,
-        statement_cache_size: 64,
+        statement_cache_size,
     };
     Database::open(
         Arc::new(ConcurrentFakeDriver::new()),
@@ -39,7 +39,7 @@ fn db() -> Database {
 }
 
 fn bench_acquire_release(c: &mut Criterion) {
-    let db = db();
+    let db = db(64);
     c.bench_function("pool_acquire_release", |b| {
         b.iter(|| {
             let lease = db.pool().acquire().unwrap();
@@ -48,11 +48,25 @@ fn bench_acquire_release(c: &mut Criterion) {
     });
 }
 
+/// The Phase 5 perf evidence: the same scalar query with the per-connection
+/// statement cache on (default 64) vs. off (0). The cached variant removes the
+/// per-call prepare/finalize round-trip.
 fn bench_scalar_query(c: &mut Criterion) {
-    let db = db();
-    c.bench_function("query_scalar", |b| {
+    let cached = db(64);
+    c.bench_function("query_scalar_cached", |b| {
         b.iter(|| {
-            let rows: Vec<(i64,)> = db.query_as("SELECT 7 FROM SYSIBM.SYSDUMMY1", ()).unwrap();
+            let rows: Vec<(i64,)> = cached
+                .query_as("SELECT 7 FROM SYSIBM.SYSDUMMY1", ())
+                .unwrap();
+            std::hint::black_box(rows);
+        });
+    });
+    let uncached = db(0);
+    c.bench_function("query_scalar_uncached", |b| {
+        b.iter(|| {
+            let rows: Vec<(i64,)> = uncached
+                .query_as("SELECT 7 FROM SYSIBM.SYSDUMMY1", ())
+                .unwrap();
             std::hint::black_box(rows);
         });
     });
