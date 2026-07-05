@@ -7,11 +7,11 @@
 //! to `std` in every normal build, so there is no runtime cost.
 
 #[cfg(not(loom))]
-pub(crate) use std::sync::{Condvar, Mutex};
+pub(crate) use std::sync::{Condvar, Mutex, MutexGuard};
 #[cfg(not(loom))]
 pub(crate) use std::thread;
 
 #[cfg(loom)]
-pub(crate) use loom::sync::{Condvar, Mutex};
+pub(crate) use loom::sync::{Condvar, Mutex, MutexGuard};
 #[cfg(loom)]
 pub(crate) use loom::thread;

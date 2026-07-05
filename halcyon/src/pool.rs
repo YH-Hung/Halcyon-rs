@@ -33,7 +33,7 @@ use crate::retry::BackoffPolicy;
 #[cfg(not(loom))]
 use crate::sync::thread;
 use crate::sync::thread::JoinHandle;
-use crate::sync::{Condvar, Mutex};
+use crate::sync::{Condvar, Mutex, MutexGuard};
 
 /// Configuration for a [`ConnectionPool`]: sizing, timeouts, validation,
 /// reconnect backoff, and the per-connection statement cache. Plain `Clone`
@@ -136,6 +136,16 @@ fn acquire_timeout_error() -> Error {
 }
 
 impl PoolInner {
+    /// Locks the pool state, recovering a poisoned mutex rather than propagating
+    /// the panic. Every critical section here is pure bookkeeping — the lock is
+    /// never held across a connect, disconnect, or any user code — so a thread
+    /// that panicked while holding it left the state structurally consistent, and
+    /// re-entering is safe. Mirrors [`Db2CliDriver::lock`] and keeps the pool's
+    /// public API panic-free (the repo's "no panicking public APIs" rule).
+    fn lock(&self) -> MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Opens one physical connection with bounded exponential backoff. Called
     /// with the state lock **not** held, so a slow Db2 connect or backoff sleep
     /// never blocks other acquirers, releasers, or the reaper.
@@ -191,7 +201,7 @@ impl PoolInner {
                 Instant::now(),
             )),
             Err(e) => {
-                let mut guard = self.state.lock().expect("pool mutex poisoned");
+                let mut guard = self.lock();
                 guard.leased -= 1;
                 self.available.notify_one(); // capacity freed → wake a waiter
                 Err(e)
@@ -203,7 +213,7 @@ impl PoolInner {
     /// connection if one exists, else grows the pool up to `max`, else waits for
     /// a release. Mirrors the C++ `ConnectionPool::acquire` loop.
     fn acquire(self: &Arc<Self>) -> Result<PooledConnection> {
-        let mut guard = self.state.lock().expect("pool mutex poisoned");
+        let mut guard = self.lock();
         let start = Instant::now();
         loop {
             if guard.stopping {
@@ -235,7 +245,7 @@ impl PoolInner {
                 guard.pending += 1;
                 drop(guard);
                 let made = self.make_connection();
-                guard = self.state.lock().expect("pool mutex poisoned");
+                guard = self.lock();
                 guard.pending -= 1;
                 match made {
                     Ok(conn) => {
@@ -261,7 +271,7 @@ impl PoolInner {
             let (g, timeout) = self
                 .available
                 .wait_timeout(guard, remaining)
-                .expect("pool mutex poisoned");
+                .unwrap_or_else(|p| p.into_inner());
             guard = g;
             if timeout.timed_out()
                 && guard.idle.is_empty()
@@ -275,7 +285,7 @@ impl PoolInner {
     /// Returns a leased connection to the pool, or discards it (disconnecting)
     /// when broken or during shutdown. Mirrors the C++ `release_slot`.
     fn release(&self, conn: Connection, created_at: Instant, broken: bool) {
-        let mut guard = self.state.lock().expect("pool mutex poisoned");
+        let mut guard = self.lock();
         guard.leased -= 1;
         if broken || guard.stopping {
             self.available.notify_one(); // capacity freed → wake a waiter
@@ -297,7 +307,7 @@ impl PoolInner {
     /// Ported from the C++ `ConnectionPool::maintain`.
     fn maintain(&self) {
         let mut discarded: Vec<Connection> = Vec::new();
-        let mut guard = self.state.lock().expect("pool mutex poisoned");
+        let mut guard = self.lock();
         let now = Instant::now();
 
         // Reap. `total` tracks established connections as we remove them so the
@@ -329,7 +339,7 @@ impl PoolInner {
             guard.pending += 1;
             drop(guard);
             let made = self.make_connection();
-            guard = self.state.lock().expect("pool mutex poisoned");
+            guard = self.lock();
             guard.pending -= 1;
             let added = made.is_ok() && !guard.stopping;
             if let Ok(conn) = made {
@@ -419,7 +429,7 @@ impl ConnectionPool {
                 last_used_at: t,
             });
         }
-        inner.state.lock().expect("pool mutex poisoned").idle = idle;
+        inner.lock().idle = idle;
 
         // `mut` is needed only off-loom, where `start_maintenance` takes `&mut self`.
         #[cfg_attr(loom, allow(unused_mut))]
@@ -439,12 +449,12 @@ impl ConnectionPool {
         let inner = Arc::clone(&self.inner);
         let interval = inner.config.maintenance_interval;
         let handle = thread::spawn(move || loop {
-            let guard = inner.state.lock().expect("pool mutex poisoned");
+            let guard = inner.lock();
             // Wait up to `interval`, or wake immediately on shutdown.
             let (guard, _) = inner
                 .maint
                 .wait_timeout_while(guard, interval, |s| !s.stopping)
-                .expect("pool mutex poisoned");
+                .unwrap_or_else(|p| p.into_inner());
             if guard.stopping {
                 break;
             }
@@ -467,26 +477,17 @@ impl ConnectionPool {
 
     /// Total established connections (idle + leased).
     pub fn total_count(&self) -> usize {
-        self.inner
-            .state
-            .lock()
-            .expect("pool mutex poisoned")
-            .established()
+        self.inner.lock().established()
     }
 
     /// Idle (available) connections.
     pub fn idle_count(&self) -> usize {
-        self.inner
-            .state
-            .lock()
-            .expect("pool mutex poisoned")
-            .idle
-            .len()
+        self.inner.lock().idle.len()
     }
 
     /// Leased (in-use) connections.
     pub fn active_count(&self) -> usize {
-        self.inner.state.lock().expect("pool mutex poisoned").leased
+        self.inner.lock().leased
     }
 
     /// The reconnect backoff this pool was configured with — the facade derives
@@ -499,7 +500,7 @@ impl ConnectionPool {
 impl Drop for ConnectionPool {
     fn drop(&mut self) {
         {
-            let mut guard = self.inner.state.lock().expect("pool mutex poisoned");
+            let mut guard = self.inner.lock();
             guard.stopping = true;
         }
         self.inner.maint.notify_all();
@@ -515,7 +516,7 @@ impl Drop for ConnectionPool {
 
 impl fmt::Debug for ConnectionPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let guard = self.inner.state.lock().expect("pool mutex poisoned");
+        let guard = self.inner.lock();
         f.debug_struct("ConnectionPool")
             .field("min", &self.inner.config.min)
             .field("max", &self.inner.config.max)
@@ -927,6 +928,26 @@ mod tests {
             thread::sleep(Duration::from_millis(20)); // let a few passes run
         }
         assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn poisoned_state_mutex_is_recovered_not_propagated() {
+        let mock = Arc::new(MockCliDriver::new());
+        let p = pool(&mock, cfg(1, 4));
+        // Poison the state mutex: panic on another thread while holding it.
+        let inner = Arc::clone(&p.inner);
+        let poisoner = thread::spawn(move || {
+            let _guard = inner.state.lock().unwrap();
+            panic!("poison the pool state mutex");
+        });
+        assert!(poisoner.join().is_err()); // the thread panicked → mutex is poisoned
+        // Public paths recover the poisoned lock instead of panicking (the repo's
+        // "no panicking public APIs" rule); the warmed-up connection is intact.
+        assert_eq!(p.idle_count(), 1);
+        let lease = p.acquire().unwrap();
+        assert_eq!(p.active_count(), 1);
+        drop(lease);
+        assert_eq!(p.idle_count(), 1);
     }
 
     #[test]

@@ -186,8 +186,14 @@ pub struct Db2CliDriver {
 impl Db2CliDriver {
     pub fn new() -> Db2CliDriver {
         let mut env: cli::SQLHANDLE = ptr::null_mut();
-        unsafe {
-            cli::SQLAllocHandle(cli::SQL_HANDLE_ENV, cli::SQL_NULL_HANDLE, &mut env);
+        let rc = unsafe { cli::SQLAllocHandle(cli::SQL_HANDLE_ENV, cli::SQL_NULL_HANDLE, &mut env) };
+        // Construction stays infallible (env alloc fails only on OOM / a broken
+        // driver manager), so normalize a failed alloc to a null handle. That
+        // makes the failure unambiguous at `connect`, which reports it as a clear
+        // `ErrorCode::Connection` rather than deferring a murky diagnostic off a
+        // dangling handle.
+        if !cli_ok(rc) {
+            env = ptr::null_mut();
         }
         Db2CliDriver {
             env: RawHandle(env),
@@ -356,6 +362,14 @@ fn get_binary(h: cli::SQLHANDLE, col: cli::SQLUSMALLINT) -> Result<Value> {
 
 impl CliDriver for Db2CliDriver {
     fn connect(&self, params: &ConnectionParams) -> Result<ConnectionHandle> {
+        // A null env means SQLAllocHandle(SQL_HANDLE_ENV) failed at construction
+        // (see `Db2CliDriver::new`); no connection can be allocated against it.
+        if self.env.0.is_null() {
+            return Err(Error::new(
+                ErrorCode::Connection,
+                "Db2 environment handle allocation failed",
+            ));
+        }
         let mut dbc: cli::SQLHANDLE = ptr::null_mut();
         {
             // Allocating a DBC touches the shared env handle; serialize it.
@@ -373,6 +387,19 @@ impl CliDriver for Db2CliDriver {
         // The dbc is private to this thread until it is published into conns
         // below, so the (potentially slow, network-bound) connect runs unlocked.
         let mut dsn = params.connection_string.clone().into_bytes();
+        // SQLDriverConnect takes the string length as an SQLSMALLINT (i16); a DSN
+        // past 32767 bytes would wrap negative before crossing the ABI. Reject it
+        // with a structured error (freeing the dbc first) instead of casting.
+        let dsn_len = match cli::SQLSMALLINT::try_from(dsn.len()) {
+            Ok(n) => n,
+            Err(_) => {
+                unsafe { cli::SQLFreeHandle(cli::SQL_HANDLE_DBC, dbc) };
+                return Err(Error::new(
+                    ErrorCode::Connection,
+                    "connection string exceeds the CLI maximum of 32767 bytes",
+                ));
+            }
+        };
         let mut out = [0u8; 1024];
         let mut out_len: cli::SQLSMALLINT = 0;
         let rc = unsafe {
@@ -380,7 +407,7 @@ impl CliDriver for Db2CliDriver {
                 dbc,
                 ptr::null_mut(),
                 dsn.as_mut_ptr(),
-                dsn.len() as cli::SQLSMALLINT,
+                dsn_len,
                 out.as_mut_ptr(),
                 out.len() as cli::SQLSMALLINT,
                 &mut out_len,
@@ -1092,6 +1119,20 @@ mod tests {
         assert_eq!(d.execute(stmt).unwrap_err().code, ErrorCode::Unknown);
         assert_eq!(d.fetch(stmt).unwrap_err().code, ErrorCode::Unknown);
         assert_eq!(d.column_count(stmt).unwrap_err().code, ErrorCode::Unknown);
+    }
+
+    #[test]
+    fn connect_rejects_oversized_connection_string() {
+        // A DSN longer than SQLSMALLINT::MAX (32767) bytes would wrap to a
+        // negative length at the ABI; the checked conversion rejects it cleanly.
+        // Runs without a live database: the length check fires before
+        // SQLDriverConnect ever opens a socket.
+        let d = Db2CliDriver::new();
+        let params = ConnectionParams {
+            connection_string: "A".repeat(40_000),
+        };
+        let err = d.connect(&params).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Connection);
     }
 
     #[test]
