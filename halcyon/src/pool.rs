@@ -35,11 +35,12 @@ use crate::sync::thread;
 use crate::sync::thread::JoinHandle;
 use crate::sync::{Condvar, Mutex};
 
-/// Configuration for a [`ConnectionPool`]: sizing, timeouts, validation, and
-/// reconnect backoff. Plain `Clone` data with reasonable defaults (1–8
-/// connections, 5 s acquire, 60 s idle, 30 min lifetime). Ported from the C++
-/// `PoolConfig`; the observability and statement-cache fields land in later
-/// phases, and the injected clock/sleep are gone (see the module docs).
+/// Configuration for a [`ConnectionPool`]: sizing, timeouts, validation,
+/// reconnect backoff, and the per-connection statement cache. Plain `Clone`
+/// data with reasonable defaults (1–8 connections, 5 s acquire, 60 s idle,
+/// 30 min lifetime, 64 cached statements). Ported from the C++ `PoolConfig`;
+/// the observability fields land in a later phase, and the injected
+/// clock/sleep are gone (see the module docs).
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     /// Minimum warm connections kept alive; the pool refills up to this on
@@ -63,6 +64,10 @@ pub struct PoolConfig {
     /// Spawn the background maintenance thread. Disable to drive
     /// [`maintain`](ConnectionPool::maintain) manually (tests do this).
     pub start_maintenance_thread: bool,
+    /// Per-connection prepared-statement LRU capacity; 0 disables caching.
+    /// Every pooled connection (including transparent reconnects) gets its own
+    /// cache of this size, cleared when the physical connection is dropped.
+    pub statement_cache_size: usize,
 }
 
 impl Default for PoolConfig {
@@ -77,6 +82,7 @@ impl Default for PoolConfig {
             backoff: BackoffPolicy::default(),
             maintenance_interval: Duration::from_millis(1000),
             start_maintenance_thread: true,
+            statement_cache_size: 64,
         }
     }
 }
@@ -137,7 +143,11 @@ impl PoolInner {
         let attempts = self.config.backoff.max_attempts.max(1);
         let mut last = Error::new(ErrorCode::Connection, "no connect attempt made");
         for attempt in 1..=attempts {
-            match Connection::open(Arc::clone(&self.driver), &self.params) {
+            match Connection::open_with_cache(
+                Arc::clone(&self.driver),
+                &self.params,
+                self.config.statement_cache_size,
+            ) {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
                     // Retry is driven by `Error.retriable` (the repo rule; spec
@@ -599,6 +609,7 @@ mod tests {
             },
             maintenance_interval: Duration::from_millis(1000),
             start_maintenance_thread: false,
+            statement_cache_size: 0,
         }
     }
 
@@ -610,6 +621,25 @@ mod tests {
         let mut e = Error::new(ErrorCode::Connection, msg);
         e.retriable = true;
         e
+    }
+
+    #[test]
+    fn default_config_enables_the_statement_cache() {
+        assert_eq!(PoolConfig::default().statement_cache_size, 64);
+    }
+
+    #[test]
+    fn pooled_connection_keeps_cached_statements_across_lease_cycles() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(1, 1);
+        config.statement_cache_size = 8;
+        let p = pool(&mock, config);
+        for _ in 0..2 {
+            let lease = p.acquire().unwrap();
+            lease.execute("UPDATE t SET x = 1", ()).unwrap();
+        }
+        // The prepared statement survived the release/re-acquire cycle.
+        assert_eq!(mock.prepared_sql().len(), 1);
     }
 
     #[test]
@@ -995,6 +1025,7 @@ mod loom_tests {
             },
             maintenance_interval: Duration::from_secs(3600),
             start_maintenance_thread: false,
+            statement_cache_size: 0,
         }
     }
 

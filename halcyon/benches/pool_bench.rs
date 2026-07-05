@@ -26,6 +26,7 @@ fn db() -> Database {
         },
         maintenance_interval: Duration::from_secs(3600),
         start_maintenance_thread: false,
+        statement_cache_size: 64,
     };
     Database::open(
         Arc::new(ConcurrentFakeDriver::new()),

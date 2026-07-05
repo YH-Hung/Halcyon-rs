@@ -640,6 +640,18 @@ mod tests {
             },
             maintenance_interval: Duration::from_secs(3600),
             start_maintenance_thread: false,
+            statement_cache_size: 0,
+        }
+    }
+
+    /// A single-connection pool with the statement cache on, so cache hits can
+    /// be asserted across pooled calls (every lease is the same connection).
+    fn cached_config() -> PoolConfig {
+        PoolConfig {
+            min: 1,
+            max: 1,
+            statement_cache_size: 8,
+            ..config()
         }
     }
 
@@ -651,6 +663,34 @@ mod tests {
         let mut e = Error::new(code, msg);
         e.retriable = true;
         e
+    }
+
+    #[test]
+    fn pooled_facade_reuses_cached_statement_across_leases() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(7)]]));
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(7)]]));
+        let db = Database::open(mock.clone(), params(), cached_config()).unwrap();
+        for _ in 0..2 {
+            let rows: Vec<(i64,)> = db.query_as("SELECT id FROM t", ()).unwrap();
+            assert_eq!(rows, vec![(7,)]);
+        }
+        assert_eq!(mock.prepared_sql().len(), 1); // second call hit the cache
+        assert_eq!(mock.close_cursor_calls(), 2); // QueryResult released cleanly
+    }
+
+    #[test]
+    fn read_retry_after_transient_error_reprepares_the_poisoned_statement() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_execute_error(retriable(ErrorCode::Deadlock, "40001"));
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(7)]]));
+        let db = Database::open(mock.clone(), params(), cached_config()).unwrap();
+        let rows: Vec<(i64,)> = db.query_as("SELECT id FROM t", ()).unwrap();
+        assert_eq!(rows, vec![(7,)]);
+        // Attempt 1 prepared + failed (entry poisoned and dropped); the replay
+        // re-acquired the same connection and re-prepared.
+        assert_eq!(mock.prepared_sql().len(), 2);
+        assert_eq!(mock.finalize_calls(), 1); // exactly the poisoned statement
     }
 
     #[test]
