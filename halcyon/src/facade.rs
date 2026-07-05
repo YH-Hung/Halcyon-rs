@@ -25,7 +25,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::thread;
 
-use crate::core::{terminate, Connection, FromRow, IntoParams, Params, ResultSet, Row};
+use crate::core::{terminate, Connection, FromRow, IntoParams, Params, ResultSet, Row, StmtLease};
 use crate::driver::{CliDriver, ConnectionParams, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
 use crate::pool::{ConnectionPool, PoolConfig, PooledConnection};
@@ -205,7 +205,9 @@ impl Database {
         for attempt in 1..=policy.max_attempts {
             let mut lease = self.pool.acquire()?;
             match lease.execute_query_raw(sql, params.clone()) {
-                Ok((stmt, columns)) => return Ok(QueryResult::new(lease, stmt, columns)),
+                Ok((stmt_lease, columns)) => {
+                    return Ok(QueryResult::new(lease, stmt_lease, columns))
+                }
                 Err(e) => {
                     if e.code == ErrorCode::Connection {
                         lease.mark_broken();
@@ -253,6 +255,10 @@ impl Database {
 /// died on a connection-class error. The Rust analog of the C++ `QueryResult`.
 pub struct QueryResult {
     lease: PooledConnection,
+    /// The statement lease, released back to the connection's cache on drop.
+    /// `Option` so `Drop` can move it out.
+    stmt_lease: Option<StmtLease>,
+    /// Copied handle for fetch/read calls (infallible access).
     stmt: StatementHandle,
     columns: usize,
     // The cursor's poison slot: a driver-side read failure is recorded here (as
@@ -262,9 +268,11 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
-    fn new(lease: PooledConnection, stmt: StatementHandle, columns: usize) -> Self {
+    fn new(lease: PooledConnection, stmt_lease: StmtLease, columns: usize) -> Self {
+        let stmt = stmt_lease.handle();
         QueryResult {
             lease,
+            stmt_lease: Some(stmt_lease),
             stmt,
             columns,
             error: RefCell::new(None),
@@ -327,10 +335,12 @@ impl QueryResult {
 
 impl Drop for QueryResult {
     fn drop(&mut self) {
-        // Finalize the statement on the leased connection, then decide the lease's
-        // fate: a mid-stream connection-class failure means it is dead, so discard
-        // it instead of returning it to the pool.
-        let _ = self.lease.driver_ref().finalize(self.stmt);
+        // Release the statement back to the leased connection's cache, then
+        // decide the lease's fate: a mid-stream connection-class failure means
+        // the connection is dead, so discard it instead of pooling it.
+        if let Some(stmt_lease) = self.stmt_lease.take() {
+            self.lease.release_stmt(stmt_lease);
+        }
         let broken = self
             .error
             .borrow()

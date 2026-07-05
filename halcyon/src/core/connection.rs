@@ -11,7 +11,7 @@
 //! every `query`/`execute` prepares a fresh statement.
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use std::sync::Arc;
 use crate::core::mapping;
 use crate::core::params::{bind_named, IntoParams, Params};
 use crate::core::result_set::{FromRow, ResultSet};
+use crate::core::{StatementCache, StmtLease};
 use crate::driver::batch::validate_batch_rows;
 use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
 use crate::error::Result;
@@ -38,18 +39,34 @@ use crate::value::Value;
 pub struct Connection {
     driver: Arc<dyn CliDriver>,
     handle: ConnectionHandle,
+    /// Per-connection prepared-statement LRU (Phase 5). `RefCell`, not a lock:
+    /// `Connection` is `Send + !Sync`, one owner at a time.
+    cache: RefCell<StatementCache>,
     // `Cell<()>` is `Send + !Sync`, which propagates to `Connection` without a
     // runtime cost or any borrowed data. It carries no value.
     _not_sync: PhantomData<Cell<()>>,
 }
 
 impl Connection {
-    /// Opens a connection through `driver`.
+    /// Opens a connection through `driver` with statement caching disabled.
     pub fn open(driver: Arc<dyn CliDriver>, params: &ConnectionParams) -> Result<Self> {
+        Self::open_with_cache(driver, params, 0)
+    }
+
+    /// Opens a connection with a per-connection prepared-statement LRU of
+    /// `cache_capacity` entries (0 disables caching — every statement is
+    /// prepared and finalized per call). The pool passes
+    /// `PoolConfig::statement_cache_size` here.
+    pub fn open_with_cache(
+        driver: Arc<dyn CliDriver>,
+        params: &ConnectionParams,
+        cache_capacity: usize,
+    ) -> Result<Self> {
         let handle = driver.connect(params)?;
         Ok(Connection {
             driver,
             handle,
+            cache: RefCell::new(StatementCache::new(cache_capacity)),
             _not_sync: PhantomData,
         })
     }
@@ -64,10 +81,18 @@ impl Connection {
         self.driver.as_ref()
     }
 
-    /// Prepares `sql`, returning a reusable [`Statement`].
+    /// Prepares `sql` (or leases it from the statement cache), returning a
+    /// reusable [`Statement`].
     pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
-        let handle = self.driver.prepare(self.handle, sql)?;
-        Ok(Statement { conn: self, handle })
+        let lease = self
+            .cache
+            .borrow_mut()
+            .acquire(self.driver.as_ref(), self.handle, sql)?;
+        Ok(Statement {
+            conn: self,
+            handle: lease.handle(),
+            lease: Some(lease),
+        })
     }
 
     /// Prepares, binds, and executes a non-query statement, returning rows
@@ -102,20 +127,24 @@ impl Connection {
         }
         validate_batch_rows(rows)?;
         let stmt = self.prepare(sql)?;
-        self.driver.execute_batch(stmt.handle, rows)
+        self.driver.execute_batch(stmt.handle(), rows)
     }
 
     fn prepare_and_bind(&self, sql: &str, params: Params) -> Result<Statement<'_>> {
-        let handle = self.prepare_and_bind_raw(sql, params)?;
-        Ok(Statement { conn: self, handle })
+        let lease = self.prepare_and_bind_raw(sql, params)?;
+        Ok(Statement {
+            conn: self,
+            handle: lease.handle(),
+            lease: Some(lease),
+        })
     }
 
-    /// Prepares and binds `sql` (rewriting named params to positional), returning
-    /// a **raw** statement handle the caller owns and must `finalize`. On a bind
-    /// failure the handle is finalized here. [`prepare_and_bind`] wraps this in an
-    /// RAII [`Statement`]; [`execute_query_raw`](Self::execute_query_raw) hands the
-    /// raw handle to the facade's owned pooled cursor.
-    fn prepare_and_bind_raw(&self, sql: &str, params: Params) -> Result<StatementHandle> {
+    /// Prepares and binds `sql` (rewriting named params to positional),
+    /// returning the statement **lease** the caller must hand back via
+    /// [`release_stmt`](Self::release_stmt) (RAII holders do this from `Drop`).
+    /// The cache key is the final, rewritten SQL. On a bind failure the lease
+    /// is poisoned and released here.
+    fn prepare_and_bind_raw(&self, sql: &str, params: Params) -> Result<StmtLease> {
         let (sql, values) = match params {
             Params::Positional(values) => (Cow::Borrowed(sql), values),
             Params::Named(pairs) => {
@@ -123,41 +152,60 @@ impl Connection {
                 (Cow::Owned(pre.sql), pre.params)
             }
         };
-        let handle = self.driver.prepare(self.handle, &sql)?;
-        if let Err(e) = self.driver.bind_params(handle, &values) {
-            let _ = self.driver.finalize(handle);
+        let lease = self
+            .cache
+            .borrow_mut()
+            .acquire(self.driver.as_ref(), self.handle, &sql)?;
+        if let Err(e) = self.driver.bind_params(lease.handle(), &values) {
+            lease.poison();
+            self.release_stmt(lease);
             return Err(e);
         }
-        Ok(handle)
+        Ok(lease)
     }
 
-    /// Prepares, binds, and executes `sql`, returning the executed statement's raw
-    /// handle and its column count — transferring finalize responsibility to the
-    /// caller. On any failure the handle is finalized here. The facade's pooled
-    /// [`QueryResult`](crate::QueryResult) owns the handle for the cursor's life,
-    /// so it cannot borrow the leased [`Connection`] the way [`ResultSet`] does.
+    /// Prepares, binds, and executes `sql`, returning the executed statement's
+    /// lease and its column count — transferring release responsibility to the
+    /// caller. On any failure the lease is poisoned and released here. The
+    /// facade's pooled [`QueryResult`](crate::QueryResult) holds the lease for
+    /// the cursor's life, so it cannot borrow the leased [`Connection`] the
+    /// way [`ResultSet`] does.
     pub(crate) fn execute_query_raw(
         &self,
         sql: &str,
         params: Params,
-    ) -> Result<(StatementHandle, usize)> {
-        let handle = self.prepare_and_bind_raw(sql, params)?;
+    ) -> Result<(StmtLease, usize)> {
+        let lease = self.prepare_and_bind_raw(sql, params)?;
         match self
             .driver
-            .execute(handle)
-            .and_then(|_| self.driver.column_count(handle))
+            .execute(lease.handle())
+            .and_then(|_| self.driver.column_count(lease.handle()))
         {
-            Ok(columns) => Ok((handle, columns)),
+            Ok(columns) => Ok((lease, columns)),
             Err(e) => {
-                let _ = self.driver.finalize(handle);
+                lease.poison();
+                self.release_stmt(lease);
                 Err(e)
             }
         }
+    }
+
+    /// Hands a statement lease back to this connection's cache: transient
+    /// leases are finalized, cached ones reset and returned to the LRU (or
+    /// dropped if poisoned). The release half of every prepare path above.
+    pub(crate) fn release_stmt(&self, lease: StmtLease) {
+        self.cache
+            .borrow_mut()
+            .release(self.driver.as_ref(), lease);
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Cached statement handles must be finalized BEFORE disconnecting:
+        // they are invalid once their connection is gone (the C++ destructor
+        // ordering, `cache_.reset()` before the handle drop).
+        self.cache.borrow_mut().clear(self.driver.as_ref());
         if self.handle.is_valid() {
             let _ = self.driver.disconnect(self.handle);
         }
@@ -172,11 +220,13 @@ impl fmt::Debug for Connection {
     }
 }
 
-/// A prepared, reusable statement. Owns its driver statement handle and finalizes
-/// it on drop. Borrows the owning [`Connection`] so it cannot outlive it.
+/// A prepared, reusable statement leased from its connection's statement
+/// cache (or transient when caching is off/overflowed). Releases the lease on
+/// drop. Borrows the owning [`Connection`] so it cannot outlive it.
 pub struct Statement<'c> {
     conn: &'c Connection,
     handle: StatementHandle,
+    lease: Option<StmtLease>,
 }
 
 impl<'c> Statement<'c> {
@@ -187,6 +237,14 @@ impl<'c> Statement<'c> {
     /// The shared driver, as a trait object — for the cursor to fetch/read rows.
     pub(crate) fn driver_ref(&self) -> &dyn CliDriver {
         self.conn.driver.as_ref()
+    }
+
+    /// Marks the leased statement possibly corrupt (driver-side failure while
+    /// in use), so release drops the cache entry instead of reusing it.
+    pub(crate) fn poison(&self) {
+        if let Some(lease) = &self.lease {
+            lease.poison();
+        }
     }
 
     /// Rebinds positional params and re-executes, returning rows affected. A
@@ -211,8 +269,8 @@ impl<'c> Statement<'c> {
 
 impl Drop for Statement<'_> {
     fn drop(&mut self) {
-        if self.handle.is_valid() {
-            let _ = self.conn.driver.finalize(self.handle);
+        if let Some(lease) = self.lease.take() {
+            self.conn.release_stmt(lease);
         }
     }
 }
