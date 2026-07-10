@@ -292,8 +292,10 @@ mod tests {
         // Spawn onto the runtime so the propagated panic is captured as a
         // JoinError instead of unwinding the test thread.
         let db2 = db.clone();
-        let handle =
-            tokio::spawn(async move { db2.transaction(|_tx| -> Result<()> { panic!("boom") }).await });
+        let handle = tokio::spawn(async move {
+            db2.transaction(|_tx| -> Result<()> { panic!("boom") })
+                .await
+        });
         let joined = handle.await; // Err(JoinError::is_panic) if the panic propagated
         std::panic::set_hook(prev);
 
@@ -388,8 +390,14 @@ mod live_tests {
         // A whole unit of work on one blocking thread.
         let n = db
             .transaction(|tx| {
-                tx.execute("INSERT INTO halcyon_async (id, name) VALUES (?, ?)", (2, "bob"))?;
-                tx.execute("INSERT INTO halcyon_async (id, name) VALUES (?, ?)", (3, "cy"))
+                tx.execute(
+                    "INSERT INTO halcyon_async (id, name) VALUES (?, ?)",
+                    (2, "bob"),
+                )?;
+                tx.execute(
+                    "INSERT INTO halcyon_async (id, name) VALUES (?, ?)",
+                    (3, "cy"),
+                )
             })
             .await
             .expect("transaction");

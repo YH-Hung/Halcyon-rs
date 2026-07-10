@@ -79,14 +79,14 @@ mod testing;
 #[cfg(feature = "stress")]
 pub mod stress;
 
+#[cfg(feature = "tokio")]
+pub use async_db::AsyncDatabase;
 pub use core::{
     Connection, FromColumn, FromRow, IntoParams, Named, Params, QueryMap, ResultSet, Row,
     Statement, Transaction,
 };
 pub use error::{Error, ErrorCode, Result};
 pub use facade::{Database, QueryResult, ScopedTransaction, TxCursor, TxQueryMap};
-#[cfg(feature = "tokio")]
-pub use async_db::AsyncDatabase;
 pub use pool::{ConnectionPool, PoolConfig, PooledConnection};
 pub use retry::{BackoffPolicy, ExecPolicy};
 pub use value::Value;

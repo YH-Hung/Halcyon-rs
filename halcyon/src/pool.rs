@@ -941,8 +941,8 @@ mod tests {
             panic!("poison the pool state mutex");
         });
         assert!(poisoner.join().is_err()); // the thread panicked → mutex is poisoned
-        // Public paths recover the poisoned lock instead of panicking (the repo's
-        // "no panicking public APIs" rule); the warmed-up connection is intact.
+                                           // Public paths recover the poisoned lock instead of panicking (the repo's
+                                           // "no panicking public APIs" rule); the warmed-up connection is intact.
         assert_eq!(p.idle_count(), 1);
         let lease = p.acquire().unwrap();
         assert_eq!(p.active_count(), 1);

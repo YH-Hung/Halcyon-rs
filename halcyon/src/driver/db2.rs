@@ -186,7 +186,8 @@ pub struct Db2CliDriver {
 impl Db2CliDriver {
     pub fn new() -> Db2CliDriver {
         let mut env: cli::SQLHANDLE = ptr::null_mut();
-        let rc = unsafe { cli::SQLAllocHandle(cli::SQL_HANDLE_ENV, cli::SQL_NULL_HANDLE, &mut env) };
+        let rc =
+            unsafe { cli::SQLAllocHandle(cli::SQL_HANDLE_ENV, cli::SQL_NULL_HANDLE, &mut env) };
         // Construction stays infallible (env alloc fails only on OOM / a broken
         // driver manager), so normalize a failed alloc to a null handle. That
         // makes the failure unambiguous at `connect`, which reports it as a clear
