@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::driver::ConnectionParams;
-use crate::error::{Error, ErrorCode};
+use crate::error::{Error, ErrorCode, Result};
 use crate::facade::Database;
 use crate::obs::{count, find_span, obs_lock, with_obs};
 use crate::pool::PoolConfig;
@@ -100,5 +100,43 @@ fn error_path_emits_errors_total_and_error_status() {
         let guard = spans.lock().unwrap();
         let exec = find_span(&guard, "halcyon.execute").expect("execute span");
         assert!(exec.errored);
+    });
+}
+
+#[test]
+fn retries_emit_retried_then_exhausted() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    for _ in 0..3 {
+        let mut e = Error::new(ErrorCode::Deadlock, "deadlock");
+        e.retriable = true;
+        mock.push_execute_error(e);
+    }
+    let db = Database::open(mock, params(), config()).unwrap();
+
+    with_obs(|rec, _spans| {
+        let r: Result<Vec<(i64,)>> = db.query_as("SELECT n FROM t", ());
+        assert!(r.is_err());
+        let samples = rec.snapshot();
+        assert_eq!(
+            count(&samples, "halcyon_retries_total", &[("outcome", "retried")]),
+            2
+        );
+        assert_eq!(
+            count(
+                &samples,
+                "halcyon_retries_total",
+                &[("outcome", "exhausted")]
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &samples,
+                "halcyon_queries_total",
+                &[("status", "error")]
+            ),
+            1
+        );
     });
 }

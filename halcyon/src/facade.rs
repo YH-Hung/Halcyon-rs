@@ -199,6 +199,8 @@ impl Database {
         op: impl Fn(&Connection) -> Result<T>,
     ) -> Result<T> {
         let mut last = Error::new(ErrorCode::Unknown, "no attempt made");
+        #[cfg(feature = "observability")]
+        let mut emitted_retry = false;
         for attempt in 1..=policy.max_attempts {
             let mut lease = self.pool.acquire()?;
             match op(&lease) {
@@ -209,7 +211,16 @@ impl Database {
                     }
                     last = e;
                     if !last.retriable || attempt == policy.max_attempts {
+                        #[cfg(feature = "observability")]
+                        if emitted_retry {
+                            crate::obs::emit_retry("exhausted");
+                        }
                         return Err(last);
+                    }
+                    #[cfg(feature = "observability")]
+                    {
+                        crate::obs::emit_retry("retried");
+                        emitted_retry = true;
                     }
                     drop(lease); // return/discard before the backoff sleep
                     thread::sleep(policy.backoff.delay_for(attempt));
@@ -229,6 +240,8 @@ impl Database {
         params: Params,
     ) -> Result<QueryResult> {
         let mut last = Error::new(ErrorCode::Unknown, "no attempt made");
+        #[cfg(feature = "observability")]
+        let mut emitted_retry = false;
         for attempt in 1..=policy.max_attempts {
             let mut lease = self.pool.acquire()?;
             match lease.execute_query_raw(sql, params.clone()) {
@@ -241,7 +254,16 @@ impl Database {
                     }
                     last = e;
                     if !last.retriable || attempt == policy.max_attempts {
+                        #[cfg(feature = "observability")]
+                        if emitted_retry {
+                            crate::obs::emit_retry("exhausted");
+                        }
                         return Err(last);
+                    }
+                    #[cfg(feature = "observability")]
+                    {
+                        crate::obs::emit_retry("retried");
+                        emitted_retry = true;
                     }
                     drop(lease);
                     thread::sleep(policy.backoff.delay_for(attempt));

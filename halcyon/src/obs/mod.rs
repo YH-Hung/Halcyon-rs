@@ -6,6 +6,7 @@
 mod labels;
 mod instrument;
 
+#[allow(unused_imports)] // instrument_transaction wired in Task 5
 pub(crate) use instrument::{
     emit_retry, instrument_execute, instrument_query, instrument_transaction,
 };

@@ -67,7 +67,6 @@ fn emit_query_metrics<T>(
 }
 
 /// Emits `halcyon_retries_total{outcome}`.
-#[allow(dead_code)] // wired in Task 4
 pub(crate) fn emit_retry(outcome: &'static str) {
     metrics::counter!("halcyon_retries_total", "outcome" => outcome).increment(1);
 }
