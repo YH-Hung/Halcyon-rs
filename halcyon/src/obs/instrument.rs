@@ -72,7 +72,6 @@ pub(crate) fn emit_retry(outcome: &'static str) {
 }
 
 /// Wraps a transaction unit of work in a `halcyon.transaction` span.
-#[allow(dead_code)] // wired in Task 5
 pub(crate) fn instrument_transaction<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     let span = tracing::info_span!(
         "halcyon.transaction",

@@ -119,6 +119,17 @@ impl Database {
     /// through the driver's array-binding path. No auto-retry — the caller
     /// re-drives on failure; a connection-class failure discards the lease.
     pub fn execute_batch(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
+        #[cfg(feature = "observability")]
+        {
+            return crate::obs::instrument_execute(sql, || self.execute_batch_inner(sql, rows));
+        }
+        #[cfg(not(feature = "observability"))]
+        {
+            self.execute_batch_inner(sql, rows)
+        }
+    }
+
+    fn execute_batch_inner(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
         let mut lease = self.pool.acquire()?;
         let result = lease.execute_batch(sql, rows);
         if let Err(ref e) = result {
@@ -155,6 +166,20 @@ impl Database {
     /// the panic unwinds, discarding the lease if the rollback poisoned it).
     /// Mirrors the C++ `Database::transaction`.
     pub fn transaction<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&ScopedTransaction) -> Result<T>,
+    {
+        #[cfg(feature = "observability")]
+        {
+            return crate::obs::instrument_transaction(|| self.transaction_inner(f));
+        }
+        #[cfg(not(feature = "observability"))]
+        {
+            self.transaction_inner(f)
+        }
+    }
+
+    fn transaction_inner<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&ScopedTransaction) -> Result<T>,
     {
@@ -464,7 +489,17 @@ impl ScopedTransaction {
 
     /// Executes a non-query statement within the unit of work.
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<i64> {
-        self.note(self.lease.execute(sql, params))
+        let params = params.into_params();
+        #[cfg(feature = "observability")]
+        {
+            return crate::obs::instrument_execute(sql, || {
+                self.note(self.lease.execute(sql, params.clone()))
+            });
+        }
+        #[cfg(not(feature = "observability"))]
+        {
+            self.note(self.lease.execute(sql, params))
+        }
     }
 
     /// Runs a streaming query within the unit of work, returning a [`TxCursor`]
@@ -473,21 +508,54 @@ impl ScopedTransaction {
     /// discards the leased connection on transaction drop, exactly as the pooled
     /// [`QueryResult`] does outside a transaction.
     pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<TxCursor<'_>> {
-        let rows = self.note(self.lease.query(sql, params))?;
-        Ok(TxCursor {
-            rows,
-            broken: &self.conn_broken,
-        })
+        let params = params.into_params();
+        #[cfg(feature = "observability")]
+        {
+            return crate::obs::instrument_query(sql, || {
+                let rows = self.note(self.lease.query(sql, params.clone()))?;
+                Ok(TxCursor {
+                    rows,
+                    broken: &self.conn_broken,
+                })
+            });
+        }
+        #[cfg(not(feature = "observability"))]
+        {
+            let rows = self.note(self.lease.query(sql, params))?;
+            Ok(TxCursor {
+                rows,
+                broken: &self.conn_broken,
+            })
+        }
     }
 
     /// Runs a query and maps every row into `T`.
     pub fn query_as<T: FromRow>(&self, sql: &str, params: impl IntoParams) -> Result<Vec<T>> {
-        self.note(self.lease.query_as(sql, params))
+        let params = params.into_params();
+        #[cfg(feature = "observability")]
+        {
+            return crate::obs::instrument_query(sql, || {
+                self.note(self.lease.query_as(sql, params.clone()))
+            });
+        }
+        #[cfg(not(feature = "observability"))]
+        {
+            self.note(self.lease.query_as(sql, params))
+        }
     }
 
     /// Batch insert within the unit of work.
     pub fn execute_batch(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
-        self.note(self.lease.execute_batch(sql, rows))
+        #[cfg(feature = "observability")]
+        {
+            return crate::obs::instrument_execute(sql, || {
+                self.note(self.lease.execute_batch(sql, rows))
+            });
+        }
+        #[cfg(not(feature = "observability"))]
+        {
+            self.note(self.lease.execute_batch(sql, rows))
+        }
     }
 
     /// Flags the unit of work's connection broken if `result` is a

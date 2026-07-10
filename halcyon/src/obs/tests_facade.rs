@@ -6,7 +6,8 @@ use std::time::Duration;
 use crate::driver::ConnectionParams;
 use crate::error::{Error, ErrorCode, Result};
 use crate::facade::Database;
-use crate::obs::{count, find_span, obs_lock, with_obs};
+use crate::obs::{count, find_child, find_span, obs_lock, with_obs};
+use crate::value::Value;
 use crate::pool::PoolConfig;
 use crate::retry::BackoffPolicy;
 use crate::testing::MockCliDriver;
@@ -138,5 +139,48 @@ fn retries_emit_retried_then_exhausted() {
             ),
             1
         );
+    });
+}
+
+#[test]
+fn execute_batch_emits_execute_metrics() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    mock.push_exec_row_count(2);
+    let db = Database::open(mock, params(), config()).unwrap();
+    let rows = vec![vec![Value::Int(1)], vec![Value::Int(2)]];
+
+    with_obs(|rec, spans| {
+        assert_eq!(db.execute_batch("INSERT INTO t VALUES (?)", &rows).unwrap(), 2);
+        let samples = rec.snapshot();
+        assert_eq!(
+            count(
+                &samples,
+                "halcyon_queries_total",
+                &[("op", "insert"), ("status", "ok")]
+            ),
+            1
+        );
+        let guard = spans.lock().unwrap();
+        assert!(find_span(&guard, "halcyon.execute").is_some());
+    });
+}
+
+#[test]
+fn scoped_transaction_execute_emits_execute_span_under_transaction() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    mock.push_exec_row_count(1);
+    let db = Database::open(mock, params(), config()).unwrap();
+
+    with_obs(|_rec, spans| {
+        db.transaction(|tx| {
+            tx.execute("INSERT INTO t VALUES (?)", (1,))?;
+            Ok(())
+        })
+        .unwrap();
+        let guard = spans.lock().unwrap();
+        let txn = find_span(&guard, "halcyon.transaction").expect("txn span");
+        assert!(find_child(&guard, "halcyon.execute", txn.id).is_some());
     });
 }
