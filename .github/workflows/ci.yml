@@ -157,6 +157,10 @@ jobs:
         uses: ./.github/actions/setup-db2-clidriver
       - name: Clippy (all features)
         run: cargo clippy --all-targets -- -D warnings
+      # PR-gated: default features omit `tokio`, so compile the db2+tokio combo
+      # here (connect/connect_with + live_tests). live-db2 only runs on main.
+      - name: Clippy (db2 + tokio)
+        run: cargo clippy --features tokio --all-targets -- -D warnings
       - name: Build
         run: cargo build
       - name: Test (unit + integration-skipped)
