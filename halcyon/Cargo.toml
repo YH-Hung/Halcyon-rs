@@ -30,6 +30,11 @@ derive = ["dep:halcyon-derive"]
 # `rt`, so the `#[tokio::test]` suite runs from lib unit tests with no
 # dev-dependency — keeping tokio out of every build that omits this feature.
 tokio = ["dep:tokio"]
+# Feature-gated observability: process-global `tracing` spans + `metrics`
+# counters/histograms/gauges (C++ Halcyon catalog). Off by default so pure-Rust
+# and MSRV lanes never compile these deps. Downstream installs a subscriber /
+# recorder (and exporters); Halcyon does not ship Prometheus/OTel adapters.
+observability = ["dep:tracing", "dep:metrics"]
 # Exposes the concurrency stress harness (ConcurrentFakeDriver, runner,
 # scenarios) as `halcyon::stress`. Pure-Rust, test/bench only; off by default.
 stress = []
@@ -42,6 +47,10 @@ halcyon-derive = { path = "../halcyon-derive", optional = true }
 # `#[tokio::test]` async unit tests build without a separate dev-dependency
 # (which would otherwise compile tokio on the pure-Rust/MSRV test lanes).
 tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
+# Observability facades (feature `observability`). MSRV-friendly: tracing 0.1
+# (MSRV 1.65) and metrics 0.24 (MSRV 1.71.1) both build on Halcyon's 1.75.
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
+metrics = { version = "0.24", optional = true, default-features = false }
 
 [dev-dependencies]
 # UI/compile-fail tests for #[derive(FromRow)] (tests/derive_ui.rs); only run
@@ -60,7 +69,7 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # clidriver) and part of the documented surface, so keep them on.
 [package.metadata.docs.rs]
 no-default-features = true
-features = ["derive", "tokio"]
+features = ["derive", "tokio", "observability"]
 
 # loom is pulled in ONLY under `--cfg loom` (the dedicated CI job / manual runs).
 # Normal builds, MSRV, and docs.rs never see it. It backs the cfg-gated `sync`

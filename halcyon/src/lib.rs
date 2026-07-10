@@ -61,6 +61,9 @@ mod facade;
 // Feature-gated async facade (tokio spawn_blocking). See async_db.rs.
 #[cfg(feature = "tokio")]
 mod async_db;
+// Feature-gated observability helpers (tracing + metrics). See obs/.
+#[cfg(feature = "observability")]
+mod obs;
 pub mod pool;
 pub mod retry;
 mod value;
