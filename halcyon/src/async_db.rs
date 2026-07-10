@@ -266,4 +266,26 @@ mod tests {
         assert_eq!(mock.commit_calls(), 0);
         assert_eq!(mock.rollback_calls(), 1);
     }
+
+    #[tokio::test]
+    async fn transaction_panic_rolls_back_and_propagates() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        // Spawn onto the runtime so the propagated panic is captured as a
+        // JoinError instead of unwinding the test thread.
+        let db2 = db.clone();
+        let handle =
+            tokio::spawn(async move { db2.transaction(|_tx| -> Result<()> { panic!("boom") }).await });
+        let joined = handle.await; // Err(JoinError::is_panic) if the panic propagated
+        std::panic::set_hook(prev);
+
+        assert!(joined.is_err()); // the panic surfaced through the future
+        assert!(joined.unwrap_err().is_panic());
+        assert_eq!(mock.commit_calls(), 0);
+        assert_eq!(mock.rollback_calls(), 1); // drop guard rolled back
+        assert_eq!(mock.auto_commit_calls(), vec![false, true]);
+    }
 }
