@@ -27,7 +27,7 @@
 //! surplus concurrent calls block on the pool's `acquire`, exactly as concurrent
 //! sync threads do.
 
-use crate::core::IntoParams;
+use crate::core::{FromRow, IntoParams};
 use crate::error::Result;
 use crate::facade::Database;
 use crate::pool::ConnectionPool;
@@ -69,6 +69,23 @@ impl AsyncDatabase {
         let params = params.into_params();
         join(tokio::task::spawn_blocking(move || db.execute(&sql, params)).await)
     }
+
+    /// Runs a query and maps every row into `T` via [`FromRow`], collecting a
+    /// `Vec` on a blocking thread (no pool lease escapes the future). Auto-retried
+    /// for reads.
+    pub async fn query_as<T>(
+        &self,
+        sql: impl Into<String>,
+        params: impl IntoParams,
+    ) -> Result<Vec<T>>
+    where
+        T: FromRow + Send + 'static,
+    {
+        let db = self.inner.clone();
+        let sql = sql.into();
+        let params = params.into_params();
+        join(tokio::task::spawn_blocking(move || db.query_as::<T>(&sql, params)).await)
+    }
 }
 
 /// Flattens a `spawn_blocking` join result: the inner `Result<T, Error>` passes
@@ -91,7 +108,8 @@ mod tests {
     use crate::driver::ConnectionParams;
     use crate::pool::PoolConfig;
     use crate::retry::BackoffPolicy;
-    use crate::testing::MockCliDriver;
+    use crate::testing::{MockCliDriver, ScriptedRows};
+    use crate::value::Value;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -151,5 +169,24 @@ mod tests {
         // Lease returned to the pool after the call.
         assert_eq!(db.pool().idle_count(), 1);
         assert_eq!(db.pool().active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_as_maps_tuples() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(
+            ["id", "name"],
+            vec![
+                vec![Value::Int(1), Value::Text("ann".into())],
+                vec![Value::Int(2), Value::Text("bob".into())],
+            ],
+        ));
+        let db = open(&mock);
+        let people: Vec<(i64, String)> = db
+            .query_as("SELECT id, name FROM people", ())
+            .await
+            .unwrap();
+        assert_eq!(people, vec![(1, "ann".to_string()), (2, "bob".to_string())]);
+        assert_eq!(db.pool().idle_count(), 1); // lease released inside the call
     }
 }
