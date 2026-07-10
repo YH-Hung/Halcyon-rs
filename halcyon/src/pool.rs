@@ -490,6 +490,11 @@ impl ConnectionPool {
         self.inner.lock().leased
     }
 
+    /// Configured hard ceiling on established + pending connections.
+    pub fn max(&self) -> usize {
+        self.inner.config.max
+    }
+
     /// The reconnect backoff this pool was configured with — the facade derives
     /// its default per-call retry policy from it.
     pub fn backoff_policy(&self) -> BackoffPolicy {

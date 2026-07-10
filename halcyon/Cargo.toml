@@ -41,7 +41,7 @@ halcyon-derive = { path = "../halcyon-derive", optional = true }
 # (for spawn_blocking); `rt-multi-thread` + `macros` are here so the gated
 # `#[tokio::test]` async unit tests build without a separate dev-dependency
 # (which would otherwise compile tokio on the pure-Rust/MSRV test lanes).
-tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
 
 [dev-dependencies]
 # UI/compile-fail tests for #[derive(FromRow)] (tests/derive_ui.rs); only run

@@ -2,7 +2,7 @@
 //! synchronous pooled [`Database`].
 //!
 //! Ported from the C++ `Database::executeAsync`/`queryAsync`
-//! (`../Halcyon/include/halcyon/async.hpp`). The C++ submits work to a bespoke
+//! (`../Halcyon/include/halcyon/async.hpp`). The C++ submits work to a fixed-size
 //! `Executor` thread pool and returns `std::future`; the Rust port offloads each
 //! sync `Database` method to tokio's blocking pool with
 //! [`tokio::task::spawn_blocking`] and awaits it. The synchronous data path is
@@ -24,11 +24,21 @@
 //! Methods must be called from within a tokio runtime. Calling them with no
 //! current runtime returns [`Error`](crate::Error) (`ErrorCode::Unknown`) rather
 //! than panicking — checked via [`Handle::try_current`](tokio::runtime::Handle::try_current)
-//! before [`spawn_blocking`](tokio::task::spawn_blocking). Effective DB
-//! concurrency is bounded by [`PoolConfig::max`](crate::PoolConfig), not tokio's
-//! blocking-thread ceiling — surplus concurrent calls still occupy a blocking
-//! thread while waiting on the pool's `acquire`, exactly as concurrent sync
-//! threads do (admission is at the pool, not before spawn).
+//! before [`spawn_blocking`](tokio::task::spawn_blocking).
+//!
+//! ## Admission control
+//! An async [`Semaphore`](tokio::sync::Semaphore) with
+//! [`PoolConfig::max`](crate::PoolConfig) permits is acquired **before**
+//! `spawn_blocking` (the permit moves into the blocking closure). Surplus
+//! callers wait as async tasks — matching the C++ fixed-size `Executor` — so a
+//! large fan-out cannot exhaust Tokio's shared blocking pool. DB parallelism
+//! remains capped by the connection pool; blocking-thread occupancy is capped
+//! by the same `max`.
+
+use std::fmt;
+use std::sync::Arc;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::core::{FromRow, IntoParams};
 use crate::error::{Error, ErrorCode, Result};
@@ -37,10 +47,22 @@ use crate::pool::ConnectionPool;
 use crate::value::Value;
 
 /// Async, pooled Db2 handle: a feature-gated `tokio` wrapper over [`Database`].
-/// Cloneable and thread-safe — clones share one underlying [`ConnectionPool`].
-#[derive(Clone, Debug)]
+/// Cloneable and thread-safe — clones share one underlying [`ConnectionPool`]
+/// and one admission [`Semaphore`].
+#[derive(Clone)]
 pub struct AsyncDatabase {
     inner: Database,
+    /// Caps in-flight `spawn_blocking` work to [`ConnectionPool::max`].
+    admit: Arc<Semaphore>,
+}
+
+impl fmt::Debug for AsyncDatabase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AsyncDatabase")
+            .field("inner", &self.inner)
+            .field("admit_available", &self.admit.available_permits())
+            .finish()
+    }
 }
 
 impl AsyncDatabase {
@@ -48,7 +70,11 @@ impl AsyncDatabase {
     /// entry point (used by tests over a mock driver and by callers supplying
     /// their own `Database`). See also [`Database::into_async`].
     pub fn new(db: Database) -> Self {
-        AsyncDatabase { inner: db }
+        let max = db.pool().max().max(1);
+        AsyncDatabase {
+            admit: Arc::new(Semaphore::new(max)),
+            inner: db,
+        }
     }
 
     /// Borrows the underlying synchronous [`Database`] — e.g. to run a streaming
@@ -71,7 +97,7 @@ impl AsyncDatabase {
         let db = self.inner.clone();
         let sql = sql.into();
         let params = params.into_params();
-        run_blocking(move || db.execute(&sql, params)).await
+        run_blocking(&self.admit, move || db.execute(&sql, params)).await
     }
 
     /// Runs a query and maps every row into `T` via [`FromRow`], collecting a
@@ -88,7 +114,7 @@ impl AsyncDatabase {
         let db = self.inner.clone();
         let sql = sql.into();
         let params = params.into_params();
-        run_blocking(move || db.query_as::<T>(&sql, params)).await
+        run_blocking(&self.admit, move || db.query_as::<T>(&sql, params)).await
     }
 
     /// Validates and runs a column-wise batch (rectangular + type-homogeneous)
@@ -102,7 +128,7 @@ impl AsyncDatabase {
     ) -> Result<i64> {
         let db = self.inner.clone();
         let sql = sql.into();
-        run_blocking(move || db.execute_batch(&sql, &rows)).await
+        run_blocking(&self.admit, move || db.execute_batch(&sql, &rows)).await
     }
 
     /// Runs `f` inside a transaction on a single blocking thread: commits if it
@@ -117,7 +143,7 @@ impl AsyncDatabase {
         T: Send + 'static,
     {
         let db = self.inner.clone();
-        run_blocking(move || db.transaction(f)).await
+        run_blocking(&self.admit, move || db.transaction(f)).await
     }
 }
 
@@ -130,13 +156,15 @@ impl AsyncDatabase {
     /// task is not stalled.
     pub async fn connect(dsn: &str) -> Result<Self> {
         let dsn = dsn.to_string();
-        run_blocking(move || Database::connect(&dsn).map(AsyncDatabase::new)).await
+        // Bootstrap has no admission semaphore yet (the pool does not exist);
+        // a single connect occupies one blocking thread.
+        run_blocking_raw(move || Database::connect(&dsn).map(AsyncDatabase::new)).await
     }
 
     /// Like [`connect`](Self::connect) but with an explicit [`PoolConfig`].
     pub async fn connect_with(dsn: &str, config: crate::pool::PoolConfig) -> Result<Self> {
         let dsn = dsn.to_string();
-        run_blocking(move || Database::connect_with(&dsn, config).map(AsyncDatabase::new)).await
+        run_blocking_raw(move || Database::connect_with(&dsn, config).map(AsyncDatabase::new)).await
     }
 }
 
@@ -156,13 +184,43 @@ where
     Ok(handle.spawn_blocking(f))
 }
 
-/// Offloads a fallible sync closure to the blocking pool and flattens the join.
-async fn run_blocking<F, T>(f: F) -> Result<T>
+/// Acquires an admission permit, then offloads `f` to the blocking pool.
+async fn run_blocking<F, T>(admit: &Arc<Semaphore>, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = admit.clone().acquire_owned().await.map_err(|_| {
+        Error::new(
+            ErrorCode::Unknown,
+            "AsyncDatabase admission semaphore closed",
+        )
+    })?;
+    run_blocking_with_permit(permit, f).await
+}
+
+/// Offloads without admission (bootstrap `connect` only).
+#[cfg(feature = "db2")]
+async fn run_blocking_raw<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
     join(spawn_blocking_checked(f)?.await)
+}
+
+async fn run_blocking_with_permit<F, T>(permit: OwnedSemaphorePermit, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    join(
+        spawn_blocking_checked(move || {
+            let _permit = permit;
+            f()
+        })?
+        .await,
+    )
 }
 
 /// Flattens a `spawn_blocking` join result: the inner `Result<T, Error>` passes
@@ -188,6 +246,7 @@ mod tests {
     use crate::retry::BackoffPolicy;
     use crate::testing::{MockCliDriver, ScriptedRows};
     use crate::value::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -232,6 +291,10 @@ mod tests {
         // Both handles share one pool.
         let _l = db.pool().acquire().unwrap();
         assert_eq!(clone.pool().active_count(), 1);
+        assert_eq!(
+            db.admit.available_permits(),
+            clone.admit.available_permits()
+        );
     }
 
     #[test]
@@ -373,23 +436,42 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_calls_share_the_pool() {
         let mock = Arc::new(MockCliDriver::new());
-        for _ in 0..8 {
-            mock.push_exec_row_count(1);
-        }
         let db = open(&mock); // max = 4
+        let peak = Arc::new(AtomicUsize::new(0));
         let mut set = tokio::task::JoinSet::new();
+        // Hold each lease briefly so peak active_count is observable; admission
+        // semaphore + pool max both cap at 4.
         for _ in 0..8 {
             let db = db.clone();
-            set.spawn(async move { db.execute("UPDATE t SET a = 1", ()).await });
+            let peak = peak.clone();
+            set.spawn(async move {
+                let probe = db.clone();
+                db.transaction(move |_tx| {
+                    peak.fetch_max(probe.pool().active_count(), Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(40));
+                    Ok(1i64)
+                })
+                .await
+            });
         }
         let mut total = 0;
         while let Some(res) = set.join_next().await {
             total += res.unwrap().unwrap();
         }
         assert_eq!(total, 8);
-        // All leases returned; real parallelism was bounded by max=4.
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "expected overlapping leases, peak active_count was {peak}"
+        );
+        assert!(
+            peak <= db.pool().max(),
+            "peak active_count {peak} exceeded pool.max {}",
+            db.pool().max()
+        );
         assert_eq!(db.pool().active_count(), 0);
         assert_eq!(db.pool().idle_count(), db.pool().total_count());
+        assert_eq!(db.admit.available_permits(), db.pool().max());
     }
 }
 
