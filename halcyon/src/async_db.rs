@@ -31,6 +31,7 @@ use crate::core::{FromRow, IntoParams};
 use crate::error::Result;
 use crate::facade::Database;
 use crate::pool::ConnectionPool;
+use crate::value::Value;
 
 /// Async, pooled Db2 handle: a feature-gated `tokio` wrapper over [`Database`].
 /// Cloneable and thread-safe — clones share one underlying [`ConnectionPool`].
@@ -85,6 +86,20 @@ impl AsyncDatabase {
         let sql = sql.into();
         let params = params.into_params();
         join(tokio::task::spawn_blocking(move || db.query_as::<T>(&sql, params)).await)
+    }
+
+    /// Validates and runs a column-wise batch (rectangular + type-homogeneous)
+    /// through the driver's array-binding path on a blocking thread. Takes owned
+    /// `rows` (they move into the blocking closure). No auto-retry — the caller
+    /// re-drives on failure; a connection-class failure discards the lease.
+    pub async fn execute_batch(
+        &self,
+        sql: impl Into<String>,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<i64> {
+        let db = self.inner.clone();
+        let sql = sql.into();
+        join(tokio::task::spawn_blocking(move || db.execute_batch(&sql, &rows)).await)
     }
 }
 
@@ -188,5 +203,22 @@ mod tests {
             .unwrap();
         assert_eq!(people, vec![(1, "ann".to_string()), (2, "bob".to_string())]);
         assert_eq!(db.pool().idle_count(), 1); // lease released inside the call
+    }
+
+    #[tokio::test]
+    async fn execute_batch_delegates_to_connection() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+        let rows = vec![
+            vec![Value::Int(1), Value::Text("a".into())],
+            vec![Value::Int(2), Value::Text("b".into())],
+        ];
+        let affected = db
+            .execute_batch("INSERT INTO t VALUES (?, ?)", rows.clone())
+            .await
+            .unwrap();
+        assert_eq!(affected, 2);
+        assert_eq!(mock.execute_batch_calls(), 1);
+        assert_eq!(mock.last_batch_rows(), rows);
     }
 }
