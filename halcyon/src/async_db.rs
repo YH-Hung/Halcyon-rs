@@ -29,7 +29,7 @@
 
 use crate::core::{FromRow, IntoParams};
 use crate::error::Result;
-use crate::facade::Database;
+use crate::facade::{Database, ScopedTransaction};
 use crate::pool::ConnectionPool;
 use crate::value::Value;
 
@@ -101,6 +101,21 @@ impl AsyncDatabase {
         let sql = sql.into();
         join(tokio::task::spawn_blocking(move || db.execute_batch(&sql, &rows)).await)
     }
+
+    /// Runs `f` inside a transaction on a single blocking thread: commits if it
+    /// returns `Ok`, rolls back on `Err`, and rolls back on panic (via the
+    /// [`ScopedTransaction`] drop guard, whose panic then propagates to the
+    /// awaiter). `f` is synchronous — you cannot `.await` inside it (the whole
+    /// unit of work runs on the blocking thread). Delegates to the sync
+    /// [`Database::transaction`].
+    pub async fn transaction<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&ScopedTransaction) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let db = self.inner.clone();
+        join(tokio::task::spawn_blocking(move || db.transaction(f)).await)
+    }
 }
 
 /// Flattens a `spawn_blocking` join result: the inner `Result<T, Error>` passes
@@ -121,6 +136,7 @@ fn join<T>(res: std::result::Result<Result<T>, tokio::task::JoinError>) -> Resul
 mod tests {
     use super::*;
     use crate::driver::ConnectionParams;
+    use crate::error::{Error, ErrorCode};
     use crate::pool::PoolConfig;
     use crate::retry::BackoffPolicy;
     use crate::testing::{MockCliDriver, ScriptedRows};
@@ -220,5 +236,34 @@ mod tests {
         assert_eq!(affected, 2);
         assert_eq!(mock.execute_batch_calls(), 1);
         assert_eq!(mock.last_batch_rows(), rows);
+    }
+
+    #[tokio::test]
+    async fn transaction_commits_on_ok() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+        let out = db
+            .transaction(|tx| -> Result<i32> {
+                tx.execute("INSERT INTO t VALUES (?)", (1,))?;
+                Ok(99)
+            })
+            .await;
+        assert_eq!(out.unwrap(), 99);
+        assert_eq!(mock.commit_calls(), 1);
+        assert_eq!(mock.rollback_calls(), 0);
+        assert_eq!(mock.auto_commit_calls(), vec![false, true]);
+        assert_eq!(db.pool().idle_count(), 1); // lease returned
+    }
+
+    #[tokio::test]
+    async fn transaction_rolls_back_on_err() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+        let out: Result<i32> = db
+            .transaction(|_tx| Err(Error::new(ErrorCode::Constraint, "dup")))
+            .await;
+        assert_eq!(out.unwrap_err().code, ErrorCode::Constraint);
+        assert_eq!(mock.commit_calls(), 0);
+        assert_eq!(mock.rollback_calls(), 1);
     }
 }
