@@ -15,8 +15,10 @@
 //! stress harness and perf benchmarks — is in place (Phase 4), and every pooled
 //! connection carries a per-connection prepared-statement LRU
 //! ([`PoolConfig::statement_cache_size`], default 64; Phase 5, validated
-//! against live Db2). The `tokio` async facade (Phase 6) is next. See the
-//! README roadmap:
+//! against live Db2). The `tokio` async facade ([`AsyncDatabase`], feature
+//! `tokio`) offloads `execute`/`query_as`/`execute_batch`/`transaction` to
+//! `spawn_blocking` (Phase 6, validated against live Db2). Observability
+//! (Phase 7) is next. See the README roadmap:
 //!
 //! ```text
 //! facade ─► pool ─► core ─► driver (CliDriver seam) ─► halcyon-sys ─► libdb2
