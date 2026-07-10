@@ -11,8 +11,10 @@
 //!
 //! Only `execute`, materialized `query_as`, `execute_batch`, and closure
 //! `transaction` are async; streaming `query` stays sync-only (a pool lease must
-//! not cross an await point — a documented C++ non-goal). Observability is
-//! Phase 7 and absent here.
+//! not cross an await point — a documented C++ non-goal). With the
+//! `observability` feature, the current [`tracing`] span and `Dispatch` are
+//! captured on the async task and entered/set inside the blocking closure so
+//! caller spans parent `halcyon.*` spans across `spawn_blocking`.
 //!
 //! ## Cancellation
 //! Dropping the returned future does **not** cancel in-flight work: a
@@ -206,7 +208,23 @@ where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    join(spawn_blocking_checked(f)?.await)
+    #[cfg(feature = "observability")]
+    {
+        let parent = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        return join(
+            spawn_blocking_checked(move || {
+                let _dispatch = tracing::dispatcher::set_default(&dispatch);
+                let _span = parent.entered();
+                f()
+            })?
+            .await,
+        );
+    }
+    #[cfg(not(feature = "observability"))]
+    {
+        join(spawn_blocking_checked(f)?.await)
+    }
 }
 
 async fn run_blocking_with_permit<F, T>(permit: OwnedSemaphorePermit, f: F) -> Result<T>
@@ -214,13 +232,30 @@ where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    join(
-        spawn_blocking_checked(move || {
-            let _permit = permit;
-            f()
-        })?
-        .await,
-    )
+    #[cfg(feature = "observability")]
+    {
+        let parent = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        return join(
+            spawn_blocking_checked(move || {
+                let _permit = permit;
+                let _dispatch = tracing::dispatcher::set_default(&dispatch);
+                let _span = parent.entered();
+                f()
+            })?
+            .await,
+        );
+    }
+    #[cfg(not(feature = "observability"))]
+    {
+        join(
+            spawn_blocking_checked(move || {
+                let _permit = permit;
+                f()
+            })?
+            .await,
+        )
+    }
 }
 
 /// Flattens a `spawn_blocking` join result: the inner `Result<T, Error>` passes
@@ -472,6 +507,39 @@ mod tests {
         assert_eq!(db.pool().active_count(), 0);
         assert_eq!(db.pool().idle_count(), db.pool().total_count());
         assert_eq!(db.admit.available_permits(), db.pool().max());
+    }
+
+    #[cfg(feature = "observability")]
+    #[tokio::test]
+    async fn execute_async_inherits_caller_context() {
+        use crate::obs::{find_span, obs_lock, RecordingSubscriber};
+        use std::sync::Mutex;
+
+        let _g = obs_lock();
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_exec_row_count(1);
+        let db = AsyncDatabase::new(Database::open(mock, params(), config()).unwrap());
+
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let sub = RecordingSubscriber::new(Arc::clone(&spans));
+        let dispatch = tracing::Dispatch::new(sub);
+        let _disp = tracing::dispatcher::set_default(&dispatch);
+
+        let parent = tracing::info_span!("test.parent");
+        let parent_id = {
+            let guard = spans.lock().unwrap();
+            find_span(&guard, "test.parent").map(|s| s.id)
+        };
+        {
+            let _e = parent.enter();
+            assert_eq!(
+                db.execute("INSERT INTO t VALUES (?)", (1,)).await.unwrap(),
+                1
+            );
+        }
+        let guard = spans.lock().unwrap();
+        let exec = find_span(&guard, "halcyon.execute").expect("execute span");
+        assert_eq!(exec.parent_id, parent_id);
     }
 }
 

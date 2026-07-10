@@ -14,6 +14,7 @@ use metrics::{
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata as TraceMetadata, Subscriber};
+use tracing_core::span::Current;
 
 /// Serializes observability tests that touch process-global or shared recorders.
 pub(crate) static OBS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -49,6 +50,8 @@ pub(crate) struct SpanRecord {
     pub errored: bool,
     pub id: u64,
     pub parent_id: Option<u64>,
+    #[allow(dead_code)]
+    meta: &'static TraceMetadata<'static>,
 }
 
 /// Captures every metric emission into a shared sample list.
@@ -304,6 +307,7 @@ impl Subscriber for RecordingSubscriber {
                 errored,
                 id,
                 parent_id,
+                meta: span.metadata(),
             });
 
         Id::from_u64(id)
@@ -343,6 +347,20 @@ impl Subscriber for RecordingSubscriber {
 
     fn exit(&self, _: &Id) {
         self.stack.pop();
+    }
+
+    fn current_span(&self) -> Current {
+        match self.stack.top() {
+            Some(id) => {
+                let guard = self.spans.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(rec) = guard.iter().find(|s| s.id == id) {
+                    Current::new(Id::from_u64(id), rec.meta)
+                } else {
+                    Current::none()
+                }
+            }
+            None => Current::none(),
+        }
     }
 }
 
