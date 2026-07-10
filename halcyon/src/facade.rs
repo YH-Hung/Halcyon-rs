@@ -248,6 +248,15 @@ impl Database {
     }
 }
 
+#[cfg(feature = "tokio")]
+impl Database {
+    /// Wraps this handle in an [`AsyncDatabase`](crate::AsyncDatabase) — the
+    /// feature-gated `tokio` async facade. Cheap (moves the `Arc`-backed handle).
+    pub fn into_async(self) -> crate::AsyncDatabase {
+        crate::AsyncDatabase::new(self)
+    }
+}
+
 /// A streaming query cursor that owns the pooled connection it runs on. Drive it
 /// with [`next`](Self::next) (a lending cursor — each [`Row`] borrows the set) or
 /// materialize with [`collect_rows`](Self::collect_rows). On drop it finalizes the

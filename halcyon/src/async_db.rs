@@ -118,6 +118,21 @@ impl AsyncDatabase {
     }
 }
 
+#[cfg(feature = "db2")]
+impl AsyncDatabase {
+    /// Opens an `AsyncDatabase` over a fresh real
+    /// [`Db2CliDriver`](crate::driver::Db2CliDriver) built from `dsn`, with a
+    /// default [`PoolConfig`] — the async analog of [`Database::connect`].
+    pub fn connect(dsn: &str) -> Result<Self> {
+        Ok(AsyncDatabase::new(Database::connect(dsn)?))
+    }
+
+    /// Like [`connect`](Self::connect) but with an explicit [`PoolConfig`].
+    pub fn connect_with(dsn: &str, config: crate::pool::PoolConfig) -> Result<Self> {
+        Ok(AsyncDatabase::new(Database::connect_with(dsn, config)?))
+    }
+}
+
 /// Flattens a `spawn_blocking` join result: the inner `Result<T, Error>` passes
 /// through, and a panic in the blocking closure is re-raised on this task
 /// (spawn_blocking tasks are never cancelled, so a `JoinError` can only be a
@@ -304,6 +319,16 @@ mod tests {
         assert_eq!(rows, vec![(42,)]);
         assert_eq!(mock.connect_calls(), 2); // warmup + reconnect
         assert_eq!(mock.disconnect_calls(), 1); // the broken one
+    }
+
+    #[tokio::test]
+    async fn into_async_wraps_the_database() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_exec_row_count(1);
+        let db = Database::open(mock.clone(), params(), config())
+            .unwrap()
+            .into_async();
+        assert_eq!(db.execute("UPDATE t SET a = 1", ()).await.unwrap(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
