@@ -352,3 +352,64 @@ mod tests {
         assert_eq!(db.pool().active_count(), 0);
     }
 }
+
+// Live Db2 async round-trip. Lives here (not in tests/db2_roundtrip.rs) so no
+// tokio dev-dependency is needed — keeping tokio off the pure-Rust and MSRV CI
+// lanes. Requires the `db2` feature (real driver) and is DSN-gated like the sync
+// live round-trip: a no-op pass when HALCYON_TEST_DSN is unset.
+#[cfg(all(test, feature = "db2"))]
+mod live_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn live_async_round_trip() {
+        let Some(dsn) = std::env::var("HALCYON_TEST_DSN").ok() else {
+            eprintln!("HALCYON_TEST_DSN not set; skipping live async round-trip");
+            return;
+        };
+        let db = AsyncDatabase::connect(&dsn).expect("connect");
+
+        // Fresh table (ignore the drop error if it does not exist yet).
+        let _ = db.execute("DROP TABLE halcyon_async", ()).await;
+        db.execute(
+            "CREATE TABLE halcyon_async (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(32))",
+            (),
+        )
+        .await
+        .expect("create");
+
+        db.execute(
+            "INSERT INTO halcyon_async (id, name) VALUES (?, ?)",
+            (1, "ann"),
+        )
+        .await
+        .expect("insert");
+
+        // A whole unit of work on one blocking thread.
+        let n = db
+            .transaction(|tx| {
+                tx.execute("INSERT INTO halcyon_async (id, name) VALUES (?, ?)", (2, "bob"))?;
+                tx.execute("INSERT INTO halcyon_async (id, name) VALUES (?, ?)", (3, "cy"))
+            })
+            .await
+            .expect("transaction");
+        assert_eq!(n, 1); // rows affected by the last statement
+
+        let rows: Vec<(i64, String)> = db
+            .query_as("SELECT id, name FROM halcyon_async ORDER BY id", ())
+            .await
+            .expect("query_as");
+        assert_eq!(
+            rows,
+            vec![
+                (1, "ann".to_string()),
+                (2, "bob".to_string()),
+                (3, "cy".to_string()),
+            ]
+        );
+
+        db.execute("DROP TABLE halcyon_async", ())
+            .await
+            .expect("drop");
+    }
+}
