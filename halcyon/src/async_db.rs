@@ -288,4 +288,42 @@ mod tests {
         assert_eq!(mock.rollback_calls(), 1); // drop guard rolled back
         assert_eq!(mock.auto_commit_calls(), vec![false, true]);
     }
+
+    #[tokio::test]
+    async fn read_auto_retries_after_a_transient_connection_error() {
+        let mock = Arc::new(MockCliDriver::new());
+        // First execute of the SELECT dies with a retriable connection error;
+        // the retry (on a fresh connection) succeeds. Confirms the sync retry
+        // policy is intact under spawn_blocking.
+        let mut e = Error::new(ErrorCode::Connection, "dropped");
+        e.retriable = true;
+        mock.push_execute_error(e);
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(42)]]));
+        let db = open(&mock);
+        let rows: Vec<(i64,)> = db.query_as("SELECT id FROM t", ()).await.unwrap();
+        assert_eq!(rows, vec![(42,)]);
+        assert_eq!(mock.connect_calls(), 2); // warmup + reconnect
+        assert_eq!(mock.disconnect_calls(), 1); // the broken one
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_calls_share_the_pool() {
+        let mock = Arc::new(MockCliDriver::new());
+        for _ in 0..8 {
+            mock.push_exec_row_count(1);
+        }
+        let db = open(&mock); // max = 4
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let db = db.clone();
+            set.spawn(async move { db.execute("UPDATE t SET a = 1", ()).await });
+        }
+        let mut total = 0;
+        while let Some(res) = set.join_next().await {
+            total += res.unwrap().unwrap();
+        }
+        assert_eq!(total, 8);
+        // All leases returned; real parallelism was bounded by max=4.
+        assert_eq!(db.pool().active_count(), 0);
+    }
 }
