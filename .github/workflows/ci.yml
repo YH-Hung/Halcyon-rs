@@ -41,11 +41,15 @@ jobs:
           cargo clippy -p halcyon-derive --all-targets -- -D warnings
           cargo clippy -p halcyon --no-default-features --all-targets -- -D warnings
           cargo clippy -p halcyon --no-default-features --features derive --all-targets -- -D warnings
+          cargo clippy -p halcyon --no-default-features --features tokio --all-targets -- -D warnings
+          cargo clippy -p halcyon --no-default-features --features tokio,derive --all-targets -- -D warnings
 
       - name: Test (pure-Rust, no clidriver)
         run: |
           cargo test -p halcyon --no-default-features
           cargo test -p halcyon --no-default-features --features derive
+          cargo test -p halcyon --no-default-features --features tokio
+          cargo test -p halcyon --no-default-features --features tokio,derive
           cargo test -p halcyon-derive
 
   # ---------------------------------------------------------------------------
@@ -230,6 +234,8 @@ jobs:
         run: docker compose -f docker/docker-compose.yml up -d --wait --wait-timeout 600
       - name: Live round-trip
         run: cargo test --test db2_roundtrip -- --nocapture
+      - name: Live async round-trip
+        run: cargo test -p halcyon --features tokio --lib live_async_round_trip -- --nocapture
       - name: Tear down Db2
         if: always()
         run: docker compose -f docker/docker-compose.yml down -v
