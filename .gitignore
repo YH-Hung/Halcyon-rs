@@ -4,5 +4,8 @@
 .idea/
 .vscode/
 
+# Local git worktrees (superpowers / agent isolation)
+.worktrees/
+
 # Vendored IBM Db2 CLI driver (user-supplied, never committed)
 /third_party/clidriver/
