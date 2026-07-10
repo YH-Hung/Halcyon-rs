@@ -56,6 +56,9 @@ mod core;
 pub mod driver;
 mod error;
 mod facade;
+// Feature-gated async facade (tokio spawn_blocking). See async_db.rs.
+#[cfg(feature = "tokio")]
+mod async_db;
 pub mod pool;
 pub mod retry;
 mod value;
@@ -80,6 +83,8 @@ pub use core::{
 };
 pub use error::{Error, ErrorCode, Result};
 pub use facade::{Database, QueryResult, ScopedTransaction, TxCursor, TxQueryMap};
+#[cfg(feature = "tokio")]
+pub use async_db::AsyncDatabase;
 pub use pool::{ConnectionPool, PoolConfig, PooledConnection};
 pub use retry::{BackoffPolicy, ExecPolicy};
 pub use value::Value;

@@ -23,6 +23,13 @@ default = ["db2", "derive"]
 db2 = ["dep:halcyon-sys"]
 # Enables `#[derive(FromRow)]`. Pure-Rust (no clidriver); on by default.
 derive = ["dep:halcyon-derive"]
+# Feature-gated async facade: `AsyncDatabase` over tokio's spawn_blocking. Off
+# by default so the pure-Rust and MSRV lanes never compile tokio (mirrors how
+# the criterion/loom deps are kept off those paths). The optional tokio dep
+# below bundles the test-runtime features (rt-multi-thread, macros) alongside
+# `rt`, so the `#[tokio::test]` suite runs from lib unit tests with no
+# dev-dependency — keeping tokio out of every build that omits this feature.
+tokio = ["dep:tokio"]
 # Exposes the concurrency stress harness (ConcurrentFakeDriver, runner,
 # scenarios) as `halcyon::stress`. Pure-Rust, test/bench only; off by default.
 stress = []
@@ -30,6 +37,11 @@ stress = []
 [dependencies]
 halcyon-sys = { path = "../halcyon-sys", optional = true }
 halcyon-derive = { path = "../halcyon-derive", optional = true }
+# Async facade runtime (feature `tokio`). The library itself needs only `rt`
+# (for spawn_blocking); `rt-multi-thread` + `macros` are here so the gated
+# `#[tokio::test]` async unit tests build without a separate dev-dependency
+# (which would otherwise compile tokio on the pure-Rust/MSRV test lanes).
+tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 # UI/compile-fail tests for #[derive(FromRow)] (tests/derive_ui.rs); only run
