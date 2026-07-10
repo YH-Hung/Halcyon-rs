@@ -4,14 +4,19 @@
 //! catalog via process-global [`tracing`] and [`metrics`] facades.
 
 mod labels;
+mod instrument;
 
-#[allow(unused_imports)] // wired by later tasks
+pub(crate) use instrument::{
+    emit_retry, instrument_execute, instrument_query, instrument_transaction,
+};
+#[allow(unused_imports)] // code_label used via instrument; re-export for pool/cache
 pub(crate) use labels::{code_label, op_label};
 
 #[cfg(test)]
-#[allow(unused_imports)] // exercised by later task tests
 mod record;
 #[cfg(test)]
-#[allow(unused_imports)]
 pub(crate) use record::*;
+
+#[cfg(test)]
+mod tests_facade;
 

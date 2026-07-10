@@ -68,7 +68,16 @@ impl Database {
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<i64> {
         let params = params.into_params();
         let policy = self.default_policy(sql);
-        self.run_with_policy(&policy, |c| c.execute(sql, params.clone()))
+        #[cfg(feature = "observability")]
+        {
+            return crate::obs::instrument_execute(sql, || {
+                self.run_with_policy(&policy, |c| c.execute(sql, params.clone()))
+            });
+        }
+        #[cfg(not(feature = "observability"))]
+        {
+            self.run_with_policy(&policy, |c| c.execute(sql, params.clone()))
+        }
     }
 
     /// Runs a streaming query, returning a [`QueryResult`] cursor that owns its
@@ -77,7 +86,16 @@ impl Database {
     pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<QueryResult> {
         let params = params.into_params();
         let policy = self.default_policy(sql);
-        self.query_with_policy(&policy, sql, params)
+        #[cfg(feature = "observability")]
+        {
+            return crate::obs::instrument_query(sql, || {
+                self.query_with_policy(&policy, sql, params)
+            });
+        }
+        #[cfg(not(feature = "observability"))]
+        {
+            self.query_with_policy(&policy, sql, params)
+        }
     }
 
     /// Runs a query and maps every row into `T` via [`FromRow`], collecting a
@@ -85,7 +103,16 @@ impl Database {
     pub fn query_as<T: FromRow>(&self, sql: &str, params: impl IntoParams) -> Result<Vec<T>> {
         let params = params.into_params();
         let policy = self.default_policy(sql);
-        self.run_with_policy(&policy, |c| c.query_as(sql, params.clone()))
+        #[cfg(feature = "observability")]
+        {
+            return crate::obs::instrument_query(sql, || {
+                self.run_with_policy(&policy, |c| c.query_as(sql, params.clone()))
+            });
+        }
+        #[cfg(not(feature = "observability"))]
+        {
+            self.run_with_policy(&policy, |c| c.query_as(sql, params.clone()))
+        }
     }
 
     /// Validates and runs a column-wise batch (rectangular + type-homogeneous)
