@@ -212,14 +212,14 @@ where
     {
         let parent = tracing::Span::current();
         let dispatch = tracing::dispatcher::get_default(|d| d.clone());
-        return join(
+        join(
             spawn_blocking_checked(move || {
                 let _dispatch = tracing::dispatcher::set_default(&dispatch);
                 let _span = parent.entered();
                 f()
             })?
             .await,
-        );
+        )
     }
     #[cfg(not(feature = "observability"))]
     {
@@ -236,7 +236,7 @@ where
     {
         let parent = tracing::Span::current();
         let dispatch = tracing::dispatcher::get_default(|d| d.clone());
-        return join(
+        join(
             spawn_blocking_checked(move || {
                 let _permit = permit;
                 let _dispatch = tracing::dispatcher::set_default(&dispatch);
@@ -244,7 +244,7 @@ where
                 f()
             })?
             .await,
-        );
+        )
     }
     #[cfg(not(feature = "observability"))]
     {
@@ -329,7 +329,7 @@ mod tests {
         assert_eq!(
             db.admit.available_permits(),
             clone.admit.available_permits()
-        );
+        )
     }
 
     #[test]
@@ -510,7 +510,8 @@ mod tests {
     }
 
     #[cfg(feature = "observability")]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // OBS_LOCK serializes process-global subscriber install across tests
     async fn execute_async_inherits_caller_context() {
         use crate::obs::{find_span, obs_lock, RecordingSubscriber};
         use std::sync::Mutex;
@@ -530,6 +531,7 @@ mod tests {
             let guard = spans.lock().unwrap();
             find_span(&guard, "test.parent").map(|s| s.id)
         };
+        assert!(parent_id.is_some(), "parent span must be recorded");
         {
             let _e = parent.enter();
             assert_eq!(
@@ -538,7 +540,9 @@ mod tests {
             );
         }
         let guard = spans.lock().unwrap();
-        let exec = find_span(&guard, "halcyon.execute").expect("execute span");
+        let names: Vec<_> = guard.iter().map(|s| s.name.as_str()).collect();
+        let exec = find_span(&guard, "halcyon.execute")
+            .unwrap_or_else(|| panic!("execute span missing; saw {names:?}"));
         assert_eq!(exec.parent_id, parent_id);
     }
 }

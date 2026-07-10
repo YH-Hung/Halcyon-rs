@@ -43,6 +43,9 @@ jobs:
           cargo clippy -p halcyon --no-default-features --features derive --all-targets -- -D warnings
           cargo clippy -p halcyon --no-default-features --features tokio --all-targets -- -D warnings
           cargo clippy -p halcyon --no-default-features --features tokio,derive --all-targets -- -D warnings
+          cargo clippy -p halcyon --no-default-features --features observability --all-targets -- -D warnings
+          cargo clippy -p halcyon --no-default-features --features observability,derive --all-targets -- -D warnings
+          cargo clippy -p halcyon --no-default-features --features observability,tokio,derive --all-targets -- -D warnings
 
       - name: Test (pure-Rust, no clidriver)
         run: |
@@ -50,6 +53,9 @@ jobs:
           cargo test -p halcyon --no-default-features --features derive
           cargo test -p halcyon --no-default-features --features tokio
           cargo test -p halcyon --no-default-features --features tokio,derive
+          cargo test -p halcyon --no-default-features --features observability
+          cargo test -p halcyon --no-default-features --features observability,derive
+          cargo test -p halcyon --no-default-features --features observability,tokio,derive
           cargo test -p halcyon-derive
 
   # ---------------------------------------------------------------------------

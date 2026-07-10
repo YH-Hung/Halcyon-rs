@@ -18,7 +18,9 @@
 //! against live Db2). The `tokio` async facade ([`AsyncDatabase`], feature
 //! `tokio`) offloads `execute`/`query_as`/`execute_batch`/`transaction` to
 //! `spawn_blocking` (Phase 6, validated against live Db2). Observability
-//! (Phase 7) is next. See the README roadmap:
+//! (feature `observability`: process-global `tracing` + `metrics`, C++ catalog)
+//! instruments the sync and async paths (Phase 7). The crates.io release track
+//! is next. See the README roadmap:
 //!
 //! ```text
 //! facade ─► pool ─► core ─► driver (CliDriver seam) ─► halcyon-sys ─► libdb2

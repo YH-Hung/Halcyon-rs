@@ -70,9 +70,9 @@ impl Database {
         let policy = self.default_policy(sql);
         #[cfg(feature = "observability")]
         {
-            return crate::obs::instrument_execute(sql, || {
+            crate::obs::instrument_execute(sql, || {
                 self.run_with_policy(&policy, |c| c.execute(sql, params.clone()))
-            });
+            })
         }
         #[cfg(not(feature = "observability"))]
         {
@@ -88,9 +88,9 @@ impl Database {
         let policy = self.default_policy(sql);
         #[cfg(feature = "observability")]
         {
-            return crate::obs::instrument_query(sql, || {
+            crate::obs::instrument_query(sql, || {
                 self.query_with_policy(&policy, sql, params)
-            });
+            })
         }
         #[cfg(not(feature = "observability"))]
         {
@@ -105,9 +105,9 @@ impl Database {
         let policy = self.default_policy(sql);
         #[cfg(feature = "observability")]
         {
-            return crate::obs::instrument_query(sql, || {
+            crate::obs::instrument_query(sql, || {
                 self.run_with_policy(&policy, |c| c.query_as(sql, params.clone()))
-            });
+            })
         }
         #[cfg(not(feature = "observability"))]
         {
@@ -121,7 +121,7 @@ impl Database {
     pub fn execute_batch(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
         #[cfg(feature = "observability")]
         {
-            return crate::obs::instrument_execute(sql, || self.execute_batch_inner(sql, rows));
+            crate::obs::instrument_execute(sql, || self.execute_batch_inner(sql, rows))
         }
         #[cfg(not(feature = "observability"))]
         {
@@ -171,7 +171,7 @@ impl Database {
     {
         #[cfg(feature = "observability")]
         {
-            return crate::obs::instrument_transaction(|| self.transaction_inner(f));
+            crate::obs::instrument_transaction(|| self.transaction_inner(f))
         }
         #[cfg(not(feature = "observability"))]
         {
@@ -492,9 +492,9 @@ impl ScopedTransaction {
         let params = params.into_params();
         #[cfg(feature = "observability")]
         {
-            return crate::obs::instrument_execute(sql, || {
+            crate::obs::instrument_execute(sql, || {
                 self.note(self.lease.execute(sql, params.clone()))
-            });
+            })
         }
         #[cfg(not(feature = "observability"))]
         {
@@ -511,13 +511,13 @@ impl ScopedTransaction {
         let params = params.into_params();
         #[cfg(feature = "observability")]
         {
-            return crate::obs::instrument_query(sql, || {
+            crate::obs::instrument_query(sql, || {
                 let rows = self.note(self.lease.query(sql, params.clone()))?;
                 Ok(TxCursor {
                     rows,
                     broken: &self.conn_broken,
                 })
-            });
+            })
         }
         #[cfg(not(feature = "observability"))]
         {
@@ -534,9 +534,9 @@ impl ScopedTransaction {
         let params = params.into_params();
         #[cfg(feature = "observability")]
         {
-            return crate::obs::instrument_query(sql, || {
+            crate::obs::instrument_query(sql, || {
                 self.note(self.lease.query_as(sql, params.clone()))
-            });
+            })
         }
         #[cfg(not(feature = "observability"))]
         {
@@ -548,9 +548,9 @@ impl ScopedTransaction {
     pub fn execute_batch(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
         #[cfg(feature = "observability")]
         {
-            return crate::obs::instrument_execute(sql, || {
+            crate::obs::instrument_execute(sql, || {
                 self.note(self.lease.execute_batch(sql, rows))
-            });
+            })
         }
         #[cfg(not(feature = "observability"))]
         {
