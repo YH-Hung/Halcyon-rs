@@ -71,6 +71,43 @@ pub(crate) fn emit_retry(outcome: &'static str) {
     metrics::counter!("halcyon_retries_total", "outcome" => outcome).increment(1);
 }
 
+/// Pending pool metric samples — filled under the pool mutex, flushed after unlock.
+#[derive(Default)]
+pub(crate) struct PendingMetrics {
+    pub idle: Option<u64>,
+    pub active: Option<u64>,
+    pub acquire_wait_secs: Option<f64>,
+    pub reconnects: u64,
+    pub emit_reconnect_span: bool,
+}
+
+impl PendingMetrics {
+    pub(crate) fn set_gauges(&mut self, idle: usize, active: usize) {
+        self.idle = Some(idle as u64);
+        self.active = Some(active as u64);
+    }
+}
+
+/// Flush pool metrics / reconnect span. Must not be called while holding the pool lock.
+pub(crate) fn flush_pool_metrics(pm: &PendingMetrics) {
+    if let Some(v) = pm.idle {
+        metrics::gauge!("halcyon_pool_connections", "state" => "idle").set(v as f64);
+    }
+    if let Some(v) = pm.active {
+        metrics::gauge!("halcyon_pool_connections", "state" => "active").set(v as f64);
+    }
+    if let Some(s) = pm.acquire_wait_secs {
+        metrics::histogram!("halcyon_pool_acquire_wait_seconds").record(s);
+    }
+    if pm.reconnects > 0 {
+        metrics::counter!("halcyon_reconnects_total").increment(pm.reconnects);
+    }
+    if pm.emit_reconnect_span {
+        let span = tracing::info_span!("halcyon.reconnect");
+        let _g = span.enter();
+    }
+}
+
 /// Wraps a transaction unit of work in a `halcyon.transaction` span.
 pub(crate) fn instrument_transaction<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     let span = tracing::info_span!(

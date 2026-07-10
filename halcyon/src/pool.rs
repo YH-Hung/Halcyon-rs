@@ -188,21 +188,38 @@ impl PoolInner {
         self: &Arc<Self>,
         conn: Connection,
         created_at: Instant,
+        #[cfg(feature = "observability")] pm: &mut crate::obs::PendingMetrics,
     ) -> Result<PooledConnection> {
         if self.driver.is_alive(conn.handle()).unwrap_or(false) {
+            #[cfg(feature = "observability")]
+            {
+                let guard = self.lock();
+                pm.set_gauges(guard.idle.len(), guard.leased);
+            }
             return Ok(PooledConnection::new(Arc::clone(self), conn, created_at));
         }
         // Dead: disconnect it (unlocked), then reconnect in its place.
         drop(conn);
         match self.make_connection() {
-            Ok(fresh) => Ok(PooledConnection::new(
-                Arc::clone(self),
-                fresh,
-                Instant::now(),
-            )),
+            Ok(fresh) => {
+                #[cfg(feature = "observability")]
+                {
+                    pm.reconnects += 1;
+                    pm.emit_reconnect_span = true;
+                    let guard = self.lock();
+                    pm.set_gauges(guard.idle.len(), guard.leased);
+                }
+                Ok(PooledConnection::new(
+                    Arc::clone(self),
+                    fresh,
+                    Instant::now(),
+                ))
+            }
             Err(e) => {
                 let mut guard = self.lock();
                 guard.leased -= 1;
+                #[cfg(feature = "observability")]
+                pm.set_gauges(guard.idle.len(), guard.leased);
                 self.available.notify_one(); // capacity freed → wake a waiter
                 Err(e)
             }
@@ -213,6 +230,38 @@ impl PoolInner {
     /// connection if one exists, else grows the pool up to `max`, else waits for
     /// a release. Mirrors the C++ `ConnectionPool::acquire` loop.
     fn acquire(self: &Arc<Self>) -> Result<PooledConnection> {
+        #[cfg(feature = "observability")]
+        let span = tracing::info_span!(
+            "halcyon.acquire",
+            error.sqlstate = tracing::field::Empty,
+        );
+        #[cfg(feature = "observability")]
+        let _span_guard = span.enter();
+        #[cfg(feature = "observability")]
+        let start = Instant::now();
+        #[cfg(feature = "observability")]
+        let mut pm = crate::obs::PendingMetrics::default();
+
+        let result = self.acquire_loop(
+            #[cfg(feature = "observability")]
+            &mut pm,
+        );
+
+        #[cfg(feature = "observability")]
+        {
+            pm.acquire_wait_secs = Some(start.elapsed().as_secs_f64());
+            if result.is_err() {
+                tracing::error!("halcyon acquire failed");
+            }
+            crate::obs::flush_pool_metrics(&pm);
+        }
+        result
+    }
+
+    fn acquire_loop(
+        self: &Arc<Self>,
+        #[cfg(feature = "observability")] pm: &mut crate::obs::PendingMetrics,
+    ) -> Result<PooledConnection> {
         let mut guard = self.lock();
         let start = Instant::now();
         loop {
@@ -230,17 +279,20 @@ impl PoolInner {
                     conn, created_at, ..
                 } = idle;
                 if self.config.validate_on_acquire {
-                    // `leased` is already charged, so capacity accounting stays
-                    // correct and no one else can hand out this connection while
-                    // we validate it with the lock dropped.
                     drop(guard);
-                    return self.validated_lease(conn, created_at);
+                    return self.validated_lease(
+                        conn,
+                        created_at,
+                        #[cfg(feature = "observability")]
+                        pm,
+                    );
                 }
+                #[cfg(feature = "observability")]
+                pm.set_gauges(guard.idle.len(), guard.leased);
                 return Ok(PooledConnection::new(Arc::clone(self), conn, created_at));
             }
 
-            // 2. Grow if under `max`. Reserve via `pending`, connect without the
-            //    lock, then re-check.
+            // 2. Grow if under `max`.
             if guard.established() + guard.pending < self.config.max {
                 guard.pending += 1;
                 drop(guard);
@@ -250,6 +302,8 @@ impl PoolInner {
                 match made {
                     Ok(conn) => {
                         guard.leased += 1;
+                        #[cfg(feature = "observability")]
+                        pm.set_gauges(guard.idle.len(), guard.leased);
                         return Ok(PooledConnection::new(
                             Arc::clone(self),
                             conn,
@@ -257,7 +311,7 @@ impl PoolInner {
                         ));
                     }
                     Err(e) => {
-                        self.available.notify_one(); // reserved capacity freed
+                        self.available.notify_one();
                         return Err(e);
                     }
                 }
@@ -287,10 +341,16 @@ impl PoolInner {
     fn release(&self, conn: Connection, created_at: Instant, broken: bool) {
         let mut guard = self.lock();
         guard.leased -= 1;
+        #[cfg(feature = "observability")]
+        let mut pm = crate::obs::PendingMetrics::default();
         if broken || guard.stopping {
+            #[cfg(feature = "observability")]
+            pm.set_gauges(guard.idle.len(), guard.leased);
             self.available.notify_one(); // capacity freed → wake a waiter
             drop(guard);
             drop(conn); // Connection::drop disconnects, outside the lock
+            #[cfg(feature = "observability")]
+            crate::obs::flush_pool_metrics(&pm);
         } else {
             let now = Instant::now();
             guard.idle.push_back(IdleConn {
@@ -298,7 +358,12 @@ impl PoolInner {
                 created_at,
                 last_used_at: now,
             });
+            #[cfg(feature = "observability")]
+            pm.set_gauges(guard.idle.len(), guard.leased);
             self.available.notify_one();
+            drop(guard);
+            #[cfg(feature = "observability")]
+            crate::obs::flush_pool_metrics(&pm);
         }
     }
 
@@ -430,6 +495,13 @@ impl ConnectionPool {
             });
         }
         inner.lock().idle = idle;
+
+        #[cfg(feature = "observability")]
+        {
+            let mut pm = crate::obs::PendingMetrics::default();
+            pm.set_gauges(config.min, 0);
+            crate::obs::flush_pool_metrics(&pm);
+        }
 
         // `mut` is needed only off-loom, where `start_maintenance` takes `&mut self`.
         #[cfg_attr(loom, allow(unused_mut))]
