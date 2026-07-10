@@ -20,7 +20,7 @@ facade ─► pool ─► core ─► driver (CliDriver trait) ─► halcyon-sy
 | `Result<T>` + throwing overloads | idiomatic `Result<T, Error>` only |
 | `Error` (code, SQLSTATE, SQLCODE, message, retriable) | `Error` — identical fields and classification |
 | `HALCYON_REFLECT` struct mapping | `#[derive(FromRow)]` proc macro (`halcyon-derive`) |
-| `std::future` async over executor threads | feature-gated `tokio` facade over `spawn_blocking` *(planned)* |
+| `std::future` async over executor threads | feature-gated `tokio` facade over `spawn_blocking` |
 
 ## Requirements
 

@@ -56,11 +56,11 @@ trybuild = "1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 # docs.rs has no clidriver and cannot link libdb2, so build the published docs
-# without the `db2` feature. `derive` is pure-Rust and part of the documented
-# surface, so keep it on. Mirrors the CI `--no-default-features` doc/test path.
+# without the `db2` feature. `derive` and `tokio` are pure-Rust (relative to
+# clidriver) and part of the documented surface, so keep them on.
 [package.metadata.docs.rs]
 no-default-features = true
-features = ["derive"]
+features = ["derive", "tokio"]
 
 # loom is pulled in ONLY under `--cfg loom` (the dedicated CI job / manual runs).
 # Normal builds, MSRV, and docs.rs never see it. It backs the cfg-gated `sync`

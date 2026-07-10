@@ -21,14 +21,17 @@
 //! a running statement.
 //!
 //! ## Runtime
-//! Methods must be called from within a tokio runtime (tokio's own
-//! `spawn_blocking` contract). Effective DB concurrency is bounded by
-//! [`PoolConfig::max`](crate::PoolConfig), not tokio's blocking-thread ceiling —
-//! surplus concurrent calls block on the pool's `acquire`, exactly as concurrent
-//! sync threads do.
+//! Methods must be called from within a tokio runtime. Calling them with no
+//! current runtime returns [`Error`](crate::Error) (`ErrorCode::Unknown`) rather
+//! than panicking — checked via [`Handle::try_current`](tokio::runtime::Handle::try_current)
+//! before [`spawn_blocking`](tokio::task::spawn_blocking). Effective DB
+//! concurrency is bounded by [`PoolConfig::max`](crate::PoolConfig), not tokio's
+//! blocking-thread ceiling — surplus concurrent calls still occupy a blocking
+//! thread while waiting on the pool's `acquire`, exactly as concurrent sync
+//! threads do (admission is at the pool, not before spawn).
 
 use crate::core::{FromRow, IntoParams};
-use crate::error::Result;
+use crate::error::{Error, ErrorCode, Result};
 use crate::facade::{Database, ScopedTransaction};
 use crate::pool::ConnectionPool;
 use crate::value::Value;
@@ -68,7 +71,7 @@ impl AsyncDatabase {
         let db = self.inner.clone();
         let sql = sql.into();
         let params = params.into_params();
-        join(tokio::task::spawn_blocking(move || db.execute(&sql, params)).await)
+        run_blocking(move || db.execute(&sql, params)).await
     }
 
     /// Runs a query and maps every row into `T` via [`FromRow`], collecting a
@@ -85,7 +88,7 @@ impl AsyncDatabase {
         let db = self.inner.clone();
         let sql = sql.into();
         let params = params.into_params();
-        join(tokio::task::spawn_blocking(move || db.query_as::<T>(&sql, params)).await)
+        run_blocking(move || db.query_as::<T>(&sql, params)).await
     }
 
     /// Validates and runs a column-wise batch (rectangular + type-homogeneous)
@@ -99,7 +102,7 @@ impl AsyncDatabase {
     ) -> Result<i64> {
         let db = self.inner.clone();
         let sql = sql.into();
-        join(tokio::task::spawn_blocking(move || db.execute_batch(&sql, &rows)).await)
+        run_blocking(move || db.execute_batch(&sql, &rows)).await
     }
 
     /// Runs `f` inside a transaction on a single blocking thread: commits if it
@@ -114,7 +117,7 @@ impl AsyncDatabase {
         T: Send + 'static,
     {
         let db = self.inner.clone();
-        join(tokio::task::spawn_blocking(move || db.transaction(f)).await)
+        run_blocking(move || db.transaction(f)).await
     }
 }
 
@@ -123,14 +126,43 @@ impl AsyncDatabase {
     /// Opens an `AsyncDatabase` over a fresh real
     /// [`Db2CliDriver`](crate::driver::Db2CliDriver) built from `dsn`, with a
     /// default [`PoolConfig`] — the async analog of [`Database::connect`].
-    pub fn connect(dsn: &str) -> Result<Self> {
-        Ok(AsyncDatabase::new(Database::connect(dsn)?))
+    /// Pool warmup (network connect) runs on a blocking thread so the caller
+    /// task is not stalled.
+    pub async fn connect(dsn: &str) -> Result<Self> {
+        let dsn = dsn.to_string();
+        run_blocking(move || Database::connect(&dsn).map(AsyncDatabase::new)).await
     }
 
     /// Like [`connect`](Self::connect) but with an explicit [`PoolConfig`].
-    pub fn connect_with(dsn: &str, config: crate::pool::PoolConfig) -> Result<Self> {
-        Ok(AsyncDatabase::new(Database::connect_with(dsn, config)?))
+    pub async fn connect_with(dsn: &str, config: crate::pool::PoolConfig) -> Result<Self> {
+        let dsn = dsn.to_string();
+        run_blocking(move || Database::connect_with(&dsn, config).map(AsyncDatabase::new)).await
     }
+}
+
+/// Spawns `f` onto tokio's blocking pool after confirming a runtime is current.
+/// Returns [`ErrorCode::Unknown`] when called outside a Tokio runtime (no panic).
+fn spawn_blocking_checked<F, R>(f: F) -> Result<tokio::task::JoinHandle<R>>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        Error::new(
+            ErrorCode::Unknown,
+            "AsyncDatabase method called outside a Tokio runtime",
+        )
+    })?;
+    Ok(handle.spawn_blocking(f))
+}
+
+/// Offloads a fallible sync closure to the blocking pool and flattens the join.
+async fn run_blocking<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    join(spawn_blocking_checked(f)?.await)
 }
 
 /// Flattens a `spawn_blocking` join result: the inner `Result<T, Error>` passes
@@ -200,6 +232,13 @@ mod tests {
         // Both handles share one pool.
         let _l = db.pool().acquire().unwrap();
         assert_eq!(clone.pool().active_count(), 1);
+    }
+
+    #[test]
+    fn spawn_blocking_checked_errors_without_runtime() {
+        let err = spawn_blocking_checked(|| ()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unknown);
+        assert!(err.message.contains("Tokio runtime"));
     }
 
     #[tokio::test]
@@ -287,17 +326,15 @@ mod tests {
         let mock = Arc::new(MockCliDriver::new());
         let db = open(&mock);
 
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         // Spawn onto the runtime so the propagated panic is captured as a
-        // JoinError instead of unwinding the test thread.
+        // JoinError instead of unwinding the test thread. Do not touch the
+        // process-global panic hook (races with parallel tests).
         let db2 = db.clone();
         let handle = tokio::spawn(async move {
             db2.transaction(|_tx| -> Result<()> { panic!("boom") })
                 .await
         });
         let joined = handle.await; // Err(JoinError::is_panic) if the panic propagated
-        std::panic::set_hook(prev);
 
         assert!(joined.is_err()); // the panic surfaced through the future
         assert!(joined.unwrap_err().is_panic());
@@ -352,24 +389,29 @@ mod tests {
         assert_eq!(total, 8);
         // All leases returned; real parallelism was bounded by max=4.
         assert_eq!(db.pool().active_count(), 0);
+        assert_eq!(db.pool().idle_count(), db.pool().total_count());
     }
 }
 
 // Live Db2 async round-trip. Lives here (not in tests/db2_roundtrip.rs) so no
 // tokio dev-dependency is needed — keeping tokio off the pure-Rust and MSRV CI
 // lanes. Requires the `db2` feature (real driver) and is DSN-gated like the sync
-// live round-trip: a no-op pass when HALCYON_TEST_DSN is unset.
+// live round-trip: a no-op pass when HALCYON_TEST_DSN is unset or empty.
 #[cfg(all(test, feature = "db2"))]
 mod live_tests {
     use super::*;
+    use crate::error::{Error, ErrorCode};
 
     #[tokio::test]
     async fn live_async_round_trip() {
-        let Some(dsn) = std::env::var("HALCYON_TEST_DSN").ok() else {
+        let Some(dsn) = std::env::var("HALCYON_TEST_DSN")
+            .ok()
+            .filter(|s| !s.is_empty())
+        else {
             eprintln!("HALCYON_TEST_DSN not set; skipping live async round-trip");
             return;
         };
-        let db = AsyncDatabase::connect(&dsn).expect("connect");
+        let db = AsyncDatabase::connect(&dsn).await.expect("connect");
 
         // Fresh table (ignore the drop error if it does not exist yet).
         let _ = db.execute("DROP TABLE halcyon_async", ()).await;
@@ -387,7 +429,7 @@ mod live_tests {
         .await
         .expect("insert");
 
-        // A whole unit of work on one blocking thread.
+        // Commit path: a whole unit of work on one blocking thread.
         let n = db
             .transaction(|tx| {
                 tx.execute(
@@ -400,8 +442,20 @@ mod live_tests {
                 )
             })
             .await
-            .expect("transaction");
+            .expect("transaction commit");
         assert_eq!(n, 1); // rows affected by the last statement
+
+        // Rollback path: failed unit of work must not leave rows behind.
+        let rolled: Result<i64> = db
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO halcyon_async (id, name) VALUES (?, ?)",
+                    (4, "dan"),
+                )?;
+                Err(Error::new(ErrorCode::Constraint, "force rollback"))
+            })
+            .await;
+        assert_eq!(rolled.unwrap_err().code, ErrorCode::Constraint);
 
         let rows: Vec<(i64, String)> = db
             .query_as("SELECT id, name FROM halcyon_async ORDER BY id", ())
