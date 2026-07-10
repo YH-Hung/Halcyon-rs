@@ -27,6 +27,8 @@
 //! surplus concurrent calls block on the pool's `acquire`, exactly as concurrent
 //! sync threads do.
 
+use crate::core::IntoParams;
+use crate::error::Result;
 use crate::facade::Database;
 use crate::pool::ConnectionPool;
 
@@ -55,6 +57,31 @@ impl AsyncDatabase {
     /// `active_count`, `total_count`) and manual `maintain`.
     pub fn pool(&self) -> &ConnectionPool {
         self.inner.pool()
+    }
+
+    /// Executes a non-query statement, returning rows affected. Accepts
+    /// positional (`?`) or named (`:name`) parameters. Runs the sync
+    /// [`Database::execute`] on a blocking thread; a read is auto-retried on a
+    /// transient failure, a write runs once (unchanged from the sync path).
+    pub async fn execute(&self, sql: impl Into<String>, params: impl IntoParams) -> Result<i64> {
+        let db = self.inner.clone();
+        let sql = sql.into();
+        let params = params.into_params();
+        join(tokio::task::spawn_blocking(move || db.execute(&sql, params)).await)
+    }
+}
+
+/// Flattens a `spawn_blocking` join result: the inner `Result<T, Error>` passes
+/// through, and a panic in the blocking closure is re-raised on this task
+/// (spawn_blocking tasks are never cancelled, so a `JoinError` can only be a
+/// panic). This preserves the sync contract — a user transaction closure that
+/// panics rolls back on the blocking thread via the `ScopedTransaction` drop
+/// guard, then the panic propagates to the awaiter — and never turns a panic
+/// into a spurious `Ok`.
+fn join<T>(res: std::result::Result<Result<T>, tokio::task::JoinError>) -> Result<T> {
+    match res {
+        Ok(inner) => inner,
+        Err(err) => std::panic::resume_unwind(err.into_panic()),
     }
 }
 
@@ -109,5 +136,20 @@ mod tests {
         // Both handles share one pool.
         let _l = db.pool().acquire().unwrap();
         assert_eq!(clone.pool().active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_returns_row_count() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_exec_row_count(3);
+        let db = open(&mock);
+        let n = db
+            .execute("UPDATE t SET a = ? WHERE id = ?", (1, 5))
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+        // Lease returned to the pool after the call.
+        assert_eq!(db.pool().idle_count(), 1);
+        assert_eq!(db.pool().active_count(), 0);
     }
 }
