@@ -7,7 +7,7 @@ mod instrument;
 mod labels;
 
 pub(crate) use instrument::{
-    emit_retry, flush_pool_metrics, instrument_execute, instrument_query,
+    emit_retry, emit_stmt_cache, flush_pool_metrics, instrument_execute, instrument_query,
     instrument_transaction, PendingMetrics,
 };
 #[allow(unused_imports)] // re-export for pool/cache call sites
@@ -22,3 +22,5 @@ pub(crate) use record::*;
 mod tests_facade;
 #[cfg(test)]
 mod tests_pool;
+#[cfg(test)]
+mod tests_cache;

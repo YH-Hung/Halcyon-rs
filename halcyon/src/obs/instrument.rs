@@ -108,6 +108,12 @@ pub(crate) fn flush_pool_metrics(pm: &PendingMetrics) {
     }
 }
 
+/// Statement-cache counter + size gauge (`hit`/`miss`/`evict`/`overflow`).
+pub(crate) fn emit_stmt_cache(result: &'static str, size: usize) {
+    metrics::counter!("halcyon_stmt_cache_total", "result" => result).increment(1);
+    metrics::gauge!("halcyon_stmt_cache_size").set(size as f64);
+}
+
 /// Wraps a transaction unit of work in a `halcyon.transaction` span.
 pub(crate) fn instrument_transaction<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     let span = tracing::info_span!(
