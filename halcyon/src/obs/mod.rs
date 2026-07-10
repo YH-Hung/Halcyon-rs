@@ -5,6 +5,13 @@
 
 mod labels;
 
-// Re-exported for facade/pool/cache call sites (wired in later tasks).
-#[allow(unused_imports)]
+#[allow(unused_imports)] // wired by later tasks
 pub(crate) use labels::{code_label, op_label};
+
+#[cfg(test)]
+#[allow(unused_imports)] // exercised by later task tests
+mod record;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use record::*;
+
