@@ -39,7 +39,7 @@ cargo build -p halcyon --no-default-features
 cargo test  -p halcyon --no-default-features
 ```
 
-The clidriver `lib/` directory is embedded as an rpath in test/example binaries, so they run without `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`. Downstream consumers should do the same in their own build script (read `DEP_DB2_LIB_DIR`) or set the library path at runtime.
+The clidriver `lib/` directory is embedded as an rpath in test/example binaries, so on **Linux** they run without `LD_LIBRARY_PATH`. On **macOS** the rpath is not consulted — IBM ships `libdb2.dylib` with a bare install name, and rpaths only apply to `@rpath/` names — so set `DYLD_LIBRARY_PATH` to the clidriver `lib/` directory when running binaries. Downstream consumers can read `DEP_DB2_LIB_DIR` in their own build script or set the library path at runtime.
 
 ### Live integration test
 

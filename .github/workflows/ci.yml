@@ -224,7 +224,13 @@ jobs:
       - name: Build
         run: cargo build
       - name: Test
-        run: cargo test
+        # IBM ships libdb2.dylib with a bare install name, so the rpath that
+        # halcyon-sys embeds is never consulted (rpaths only apply to @rpath/
+        # names) — dyld needs DYLD_LIBRARY_PATH to find the leaf name. It must
+        # be set inside the step script: macOS SIP strips DYLD_* from the
+        # environment of protected binaries like the /bin/bash running this
+        # step, so a job-level `env:` would never reach cargo.
+        run: DYLD_LIBRARY_PATH="$PWD/third_party/clidriver/lib" cargo test
 
   # ---------------------------------------------------------------------------
   # Live Db2 round-trip: stand up the Dockerized Db2 and run the integration

@@ -16,6 +16,12 @@ services:
       DB2INST1_PASSWORD: halcyon
       DBNAME: SAMPLE
       PERSISTENT_HOME: "false"
+      # Without this the image enables archive logging AFTER creating SAMPLE,
+      # briefly putting it in BACKUP PENDING (SQL1116N) — a window the
+      # healthcheck can pass just before, flaking the round-trip. Plain
+      # circular logging is fine for a throwaway test database, and boots
+      # faster too.
+      ARCHIVE_LOGS: "false"
     ports:
       - "50000:50000"
     healthcheck:
