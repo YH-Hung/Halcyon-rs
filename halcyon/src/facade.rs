@@ -469,9 +469,7 @@ impl ScopedTransaction {
     /// Runs a query and maps every row into `T`.
     pub fn query_as<T: FromRow>(&self, sql: &str, params: impl IntoParams) -> Result<Vec<T>> {
         let params = params.into_params();
-        crate::obs::instrument_query(sql, move || {
-            self.note(self.lease.query_as(sql, params))
-        })
+        crate::obs::instrument_query(sql, move || self.note(self.lease.query_as(sql, params)))
     }
 
     /// Batch insert within the unit of work.

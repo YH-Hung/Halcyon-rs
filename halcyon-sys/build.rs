@@ -7,6 +7,12 @@ use std::path::PathBuf;
 /// 1. `DB2_CLIDRIVER_ROOT` environment variable
 /// 2. `third_party/clidriver` at the workspace root
 fn main() {
+    // docs.rs has no clidriver and never runs the resulting rlib; skip locating
+    // and linking libdb2 so the published docs build succeeds.
+    if env::var("DOCS_RS").is_ok() {
+        return;
+    }
+
     println!("cargo:rerun-if-env-changed=DB2_CLIDRIVER_ROOT");
 
     let root = env::var("DB2_CLIDRIVER_ROOT")

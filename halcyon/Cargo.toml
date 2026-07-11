@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
+documentation = "https://docs.rs/halcyon"
 keywords = ["db2", "database", "sql", "ibm", "cli"]
 categories = ["database", "api-bindings", "external-ffi-bindings"]
 
@@ -40,8 +41,8 @@ observability = ["dep:tracing", "dep:tracing-core", "dep:metrics"]
 stress = []
 
 [dependencies]
-halcyon-sys = { path = "../halcyon-sys", optional = true }
-halcyon-derive = { path = "../halcyon-derive", optional = true }
+halcyon-sys = { path = "../halcyon-sys", version = "0.1.0", optional = true }
+halcyon-derive = { path = "../halcyon-derive", version = "0.1.0", optional = true }
 # Async facade runtime (feature `tokio`). The library itself needs only `rt`
 # (for spawn_blocking); `rt-multi-thread` + `macros` are here so the gated
 # `#[tokio::test]` async unit tests build without a separate dev-dependency

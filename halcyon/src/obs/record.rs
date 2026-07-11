@@ -57,7 +57,10 @@ impl RecordingRecorder {
     }
 
     pub(crate) fn snapshot(&self) -> Vec<MetricSample> {
-        self.samples.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.samples
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -367,10 +370,8 @@ pub(crate) fn with_obs<R>(
 }
 
 pub(crate) fn labels_match(have: &[(String, String)], want: &[(&str, &str)]) -> bool {
-    want.iter().all(|(k, v)| {
-        have.iter()
-            .any(|(hk, hv)| hk == k && hv == v)
-    })
+    want.iter()
+        .all(|(k, v)| have.iter().any(|(hk, hv)| hk == k && hv == v))
 }
 
 pub(crate) fn count(samples: &[MetricSample], name: &str, labels: &[(&str, &str)]) -> usize {

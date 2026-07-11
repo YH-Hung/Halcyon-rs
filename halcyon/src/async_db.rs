@@ -212,7 +212,10 @@ where
 fn enter_blocking_trace_context(
     parent: tracing::Span,
     dispatch: tracing::Dispatch,
-) -> (Option<tracing::dispatcher::DefaultGuard>, tracing::span::EnteredSpan) {
+) -> (
+    Option<tracing::dispatcher::DefaultGuard>,
+    tracing::span::EnteredSpan,
+) {
     use tracing::subscriber::NoSubscriber;
     let guard = if dispatch.is::<NoSubscriber>() {
         None

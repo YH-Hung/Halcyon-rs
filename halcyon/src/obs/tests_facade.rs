@@ -7,10 +7,10 @@ use crate::driver::ConnectionParams;
 use crate::error::{Error, ErrorCode, Result};
 use crate::facade::Database;
 use crate::obs::{count, find_child, find_span, obs_lock, with_obs};
-use crate::value::Value;
 use crate::pool::PoolConfig;
 use crate::retry::BackoffPolicy;
 use crate::testing::MockCliDriver;
+use crate::value::Value;
 
 fn params() -> ConnectionParams {
     ConnectionParams {
@@ -56,15 +56,16 @@ fn execute_emits_queries_total_and_duration() {
             1
         );
         assert_eq!(
-            count(&samples, "halcyon_query_duration_seconds", &[("op", "insert")]),
+            count(
+                &samples,
+                "halcyon_query_duration_seconds",
+                &[("op", "insert")]
+            ),
             1
         );
         let guard = spans.lock().unwrap();
         let exec = find_span(&guard, "halcyon.execute").expect("execute span");
-        assert_eq!(
-            exec.attrs.get("db.system").map(String::as_str),
-            Some("db2")
-        );
+        assert_eq!(exec.attrs.get("db.system").map(String::as_str), Some("db2"));
         assert_eq!(
             exec.attrs.get("db.statement").map(String::as_str),
             Some("INSERT INTO t VALUES (?)")
@@ -132,11 +133,7 @@ fn retries_emit_retried_then_exhausted() {
             1
         );
         assert_eq!(
-            count(
-                &samples,
-                "halcyon_queries_total",
-                &[("status", "error")]
-            ),
+            count(&samples, "halcyon_queries_total", &[("status", "error")]),
             1
         );
     });
@@ -180,7 +177,10 @@ fn execute_batch_emits_execute_metrics() {
     let rows = vec![vec![Value::Int(1)], vec![Value::Int(2)]];
 
     with_obs(|rec, spans| {
-        assert_eq!(db.execute_batch("INSERT INTO t VALUES (?)", &rows).unwrap(), 2);
+        assert_eq!(
+            db.execute_batch("INSERT INTO t VALUES (?)", &rows).unwrap(),
+            2
+        );
         let samples = rec.snapshot();
         assert_eq!(
             count(

@@ -27,8 +27,8 @@ mod record;
 pub(crate) use record::*;
 
 #[cfg(all(test, feature = "observability"))]
+mod tests_cache;
+#[cfg(all(test, feature = "observability"))]
 mod tests_facade;
 #[cfg(all(test, feature = "observability"))]
 mod tests_pool;
-#[cfg(all(test, feature = "observability"))]
-mod tests_cache;

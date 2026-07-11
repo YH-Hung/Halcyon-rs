@@ -2,7 +2,7 @@
 
 A modern Rust client library for **IBM Db2**, built on the IBM Db2 CLI (`libdb2`). The Rust counterpart of the C++ [Halcyon](https://github.com/YH-Hung/Halcyon) library — same layered architecture, same error model, same driver-seam philosophy, expressed idiomatically in Rust.
 
-> **Status: early development.** The driver seam, the core data path, and the pooled `Database` facade — connection pool (bounded sizing, blocking acquire, idle/lifetime reaping, transparent reconnect), safe auto-retry, and RAII transactions — are implemented and covered by mock + live-Db2 tests. The pool's concurrency-correctness track (`loom` + TSan stress + perf harnesses) is in place — Phase 4 accepted — and each pooled connection carries a per-connection prepared-statement LRU (`PoolConfig::statement_cache_size`, default 64), validated against live Db2 by the reuse round-trip — Phase 5 accepted. The `tokio` async facade — `AsyncDatabase` over `spawn_blocking`, feature-gated and validated on live Db2 — is implemented (Phase 6 accepted). Observability — process-global `tracing` spans and `metrics` counters/histograms/gauges behind the `observability` feature, C++ catalog parity on sync + async — is implemented (Phase 7 accepted). The crates.io release track is next. See the roadmap below.
+> **Status: feature-complete for v0.1, preparing the crates.io release.** All development phases are accepted: the driver seam (proven against live Db2), the core data path, the pooled `Database` facade with transparent reconnect and safe auto-retry (concurrency-verified under `loom` + ThreadSanitizer), the per-connection prepared-statement LRU, the feature-gated `tokio` async facade, and C++-catalog observability (`tracing` + `metrics`). What remains is the release track itself — publishing to crates.io — plus the [deferred features](#deferred-features) below. See [CHANGELOG.md](CHANGELOG.md) and the roadmap.
 
 ## Architecture
 
@@ -92,7 +92,22 @@ TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --no-default-feature
 - [x] Observability: process-global `tracing` spans + `metrics` counters/histograms/gauges (C++ catalog: query/execute/transaction/acquire/reconnect, pool/retry/cache metrics), feature-gated `observability`, sync + async `spawn_blocking` context propagation — covered by in-tree recording subscriber/recorder mock tests and CI
 - [x] CI (GitHub Actions): fmt/clippy/MSRV + pure-Rust matrix + `db2` Linux x86_64 & macOS-Intel + `live-db2` — runs once a GitHub remote is configured
 - [x] Integration tests against Dockerized Db2 — env-gated round-trip ([tests/db2_roundtrip.rs](halcyon/tests/db2_roundtrip.rs) + [compose](docker/docker-compose.yml)) **validated end-to-end against live Db2**: connect → DDL → positional/named/batch insert → typed streaming read (incl. NULL → `None`) → commit/rollback via the seam primitives. It caught a real seam ABI bug (32-bit `SQLLEN`). Phase 3 adds a facade round-trip alongside it (ergonomic `Database::connect`, closure/RAII `Transaction` commit + rollback); both are wired into CI's `live-db2` job on real x86_64
+- [ ] Release track: publish `halcyon-sys` → `halcyon-derive` → `halcyon` to crates.io, tag v0.1.0, GitHub release — see [docs/RELEASING.md](docs/RELEASING.md)
+
+## Versioning & MSRV
+
+- The public **`halcyon` API is SemVer-stable**; `halcyon-sys` and `halcyon-derive` are implementation details with no stability guarantee of their own (all three crates version in lockstep). Pre-1.0, breaking changes bump the minor version.
+- **MSRV is Rust 1.75**, checked in CI. Raising it is a minor version bump, never a patch.
+
+## Deferred features
+
+Explicitly out of scope for v0.1 (mirroring the C++ v1 scope), tracked for later releases:
+
+- **Block fetch** — the C++ driver binds a rowset so a block of rows arrives per round-trip; the Rust read path is row-at-a-time for now. Correct, but a known read-throughput gap.
+- Savepoints and per-connection isolation levels
+- LOB streaming (LOB values are materialized today)
+- Windows (the seam's type widths are verified for the non-Windows, 32-bit-`SQLLEN` CLI ABI)
 
 ## License
 
-BSD 3-Clause — same as the C++ Halcyon.
+BSD 3-Clause — same as the C++ Halcyon. See [LICENSE](LICENSE).

@@ -91,13 +91,27 @@ fn emit_query_metrics<T>(
 
 fn record_duration(op: &'static str, elapsed: f64) {
     match op {
-        "select" => metrics::histogram!("halcyon_query_duration_seconds", "op" => "select").record(elapsed),
-        "insert" => metrics::histogram!("halcyon_query_duration_seconds", "op" => "insert").record(elapsed),
-        "update" => metrics::histogram!("halcyon_query_duration_seconds", "op" => "update").record(elapsed),
-        "delete" => metrics::histogram!("halcyon_query_duration_seconds", "op" => "delete").record(elapsed),
-        "merge" => metrics::histogram!("halcyon_query_duration_seconds", "op" => "merge").record(elapsed),
-        "with" => metrics::histogram!("halcyon_query_duration_seconds", "op" => "with").record(elapsed),
-        "values" => metrics::histogram!("halcyon_query_duration_seconds", "op" => "values").record(elapsed),
+        "select" => {
+            metrics::histogram!("halcyon_query_duration_seconds", "op" => "select").record(elapsed)
+        }
+        "insert" => {
+            metrics::histogram!("halcyon_query_duration_seconds", "op" => "insert").record(elapsed)
+        }
+        "update" => {
+            metrics::histogram!("halcyon_query_duration_seconds", "op" => "update").record(elapsed)
+        }
+        "delete" => {
+            metrics::histogram!("halcyon_query_duration_seconds", "op" => "delete").record(elapsed)
+        }
+        "merge" => {
+            metrics::histogram!("halcyon_query_duration_seconds", "op" => "merge").record(elapsed)
+        }
+        "with" => {
+            metrics::histogram!("halcyon_query_duration_seconds", "op" => "with").record(elapsed)
+        }
+        "values" => {
+            metrics::histogram!("halcyon_query_duration_seconds", "op" => "values").record(elapsed)
+        }
         _ => metrics::histogram!("halcyon_query_duration_seconds", "op" => "other").record(elapsed),
     }
 }
@@ -105,52 +119,66 @@ fn record_duration(op: &'static str, elapsed: f64) {
 fn bump_queries(op: &'static str, ok: bool) {
     match (op, ok) {
         ("select", true) => {
-            metrics::counter!("halcyon_queries_total", "op" => "select", "status" => "ok").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "select", "status" => "ok")
+                .increment(1)
         }
         ("select", false) => {
-            metrics::counter!("halcyon_queries_total", "op" => "select", "status" => "error").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "select", "status" => "error")
+                .increment(1)
         }
         ("insert", true) => {
-            metrics::counter!("halcyon_queries_total", "op" => "insert", "status" => "ok").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "insert", "status" => "ok")
+                .increment(1)
         }
         ("insert", false) => {
-            metrics::counter!("halcyon_queries_total", "op" => "insert", "status" => "error").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "insert", "status" => "error")
+                .increment(1)
         }
         ("update", true) => {
-            metrics::counter!("halcyon_queries_total", "op" => "update", "status" => "ok").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "update", "status" => "ok")
+                .increment(1)
         }
         ("update", false) => {
-            metrics::counter!("halcyon_queries_total", "op" => "update", "status" => "error").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "update", "status" => "error")
+                .increment(1)
         }
         ("delete", true) => {
-            metrics::counter!("halcyon_queries_total", "op" => "delete", "status" => "ok").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "delete", "status" => "ok")
+                .increment(1)
         }
         ("delete", false) => {
-            metrics::counter!("halcyon_queries_total", "op" => "delete", "status" => "error").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "delete", "status" => "error")
+                .increment(1)
         }
         ("merge", true) => {
-            metrics::counter!("halcyon_queries_total", "op" => "merge", "status" => "ok").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "merge", "status" => "ok")
+                .increment(1)
         }
         ("merge", false) => {
-            metrics::counter!("halcyon_queries_total", "op" => "merge", "status" => "error").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "merge", "status" => "error")
+                .increment(1)
         }
         ("with", true) => {
-            metrics::counter!("halcyon_queries_total", "op" => "with", "status" => "ok").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "with", "status" => "ok")
+                .increment(1)
         }
         ("with", false) => {
-            metrics::counter!("halcyon_queries_total", "op" => "with", "status" => "error").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "with", "status" => "error")
+                .increment(1)
         }
         ("values", true) => {
-            metrics::counter!("halcyon_queries_total", "op" => "values", "status" => "ok").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "values", "status" => "ok")
+                .increment(1)
         }
         ("values", false) => {
-            metrics::counter!("halcyon_queries_total", "op" => "values", "status" => "error").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "values", "status" => "error")
+                .increment(1)
         }
-        (_, true) => {
-            metrics::counter!("halcyon_queries_total", "op" => "other", "status" => "ok").increment(1)
-        }
+        (_, true) => metrics::counter!("halcyon_queries_total", "op" => "other", "status" => "ok")
+            .increment(1),
         (_, false) => {
-            metrics::counter!("halcyon_queries_total", "op" => "other", "status" => "error").increment(1)
+            metrics::counter!("halcyon_queries_total", "op" => "other", "status" => "error")
+                .increment(1)
         }
     }
 }
@@ -179,7 +207,9 @@ fn bump_error(code: crate::error::ErrorCode) {
 /// Emits `halcyon_retries_total{outcome}`.
 pub(crate) fn emit_retry(outcome: &'static str) {
     match outcome {
-        "retried" => metrics::counter!("halcyon_retries_total", "outcome" => "retried").increment(1),
+        "retried" => {
+            metrics::counter!("halcyon_retries_total", "outcome" => "retried").increment(1)
+        }
         "exhausted" => {
             metrics::counter!("halcyon_retries_total", "outcome" => "exhausted").increment(1)
         }

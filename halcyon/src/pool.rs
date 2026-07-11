@@ -236,10 +236,7 @@ impl PoolInner {
             if tracing::dispatcher::get_default(|d| d.is::<NoSubscriber>()) {
                 tracing::Span::none()
             } else {
-                tracing::info_span!(
-                    "halcyon.acquire",
-                    error.sqlstate = tracing::field::Empty,
-                )
+                tracing::info_span!("halcyon.acquire", error.sqlstate = tracing::field::Empty,)
             }
         };
         #[cfg(feature = "observability")]

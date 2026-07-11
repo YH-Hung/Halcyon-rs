@@ -4,23 +4,19 @@
 //! (`libdb2` from clidriver). Rust counterpart of the C++
 //! [Halcyon](https://github.com/YH-Hung/Halcyon) library.
 //!
-//! **Status: early development.** The target architecture mirrors the C++
-//! layering. The driver seam, the core data path ([`Connection`], [`Statement`],
+//! The architecture mirrors the C++ layering. The driver seam (proven against
+//! live Db2), the core data path ([`Connection`], [`Statement`],
 //! [`ResultSet`]/[`Row`], `?`/`:name` params, row → tuple mapping), the
 //! connection [`pool`] (bounded sizing, blocking acquire, reaping, transparent
-//! reconnect) with safe auto-[`retry`], and the pooled [`Database`] facade
-//! (owned [`QueryResult`] cursors and [`ScopedTransaction`]s) are implemented and
-//! mock-tested. The pool's concurrency-correctness track — `loom` model-checking
-//! of the lock/condvar handoff plus a `ConcurrentFakeDriver` ThreadSanitizer
-//! stress harness and perf benchmarks — is in place (Phase 4), and every pooled
-//! connection carries a per-connection prepared-statement LRU
-//! ([`PoolConfig::statement_cache_size`], default 64; Phase 5, validated
-//! against live Db2). The `tokio` async facade ([`AsyncDatabase`], feature
-//! `tokio`) offloads `execute`/`query_as`/`execute_batch`/`transaction` to
-//! `spawn_blocking` (Phase 6, validated against live Db2). Observability
-//! (feature `observability`: process-global `tracing` + `metrics`, C++ catalog)
-//! instruments the sync and async paths (Phase 7). The crates.io release track
-//! is next. See the README roadmap:
+//! reconnect, per-connection prepared-statement LRU via
+//! [`PoolConfig::statement_cache_size`]) with safe auto-[`retry`], and the
+//! pooled [`Database`] facade (owned [`QueryResult`] cursors and
+//! [`ScopedTransaction`]s) are implemented, mock-tested, and
+//! concurrency-verified (`loom` + ThreadSanitizer stress). The `tokio` async
+//! facade ([`AsyncDatabase`], feature `tokio`) offloads
+//! `execute`/`query_as`/`execute_batch`/`transaction` to `spawn_blocking`, and
+//! observability (feature `observability`: process-global `tracing` +
+//! `metrics`, C++ catalog) instruments the sync and async paths:
 //!
 //! ```text
 //! facade ─► pool ─► core ─► driver (CliDriver seam) ─► halcyon-sys ─► libdb2
