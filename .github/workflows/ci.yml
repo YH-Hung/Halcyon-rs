@@ -200,7 +200,9 @@ jobs:
   # macOS build + tests. Intel runner so the x86_64 IBM driver links and loads.
   # ---------------------------------------------------------------------------
   db2-macos:
-    runs-on: macos-13
+    # macos-15-intel: last x86_64 macOS image (macos-13/14 are retired); the
+    # IBM clidriver is x86_64-only, so the arm64 images cannot link it.
+    runs-on: macos-15-intel
     needs: prepare-macos-clidriver
     env:
       DB2_CLIDRIVER_ROOT: third_party/clidriver
