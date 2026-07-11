@@ -68,16 +68,9 @@ impl Database {
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<i64> {
         let params = params.into_params();
         let policy = self.default_policy(sql);
-        #[cfg(feature = "observability")]
-        {
-            crate::obs::instrument_execute(sql, || {
-                self.run_with_policy(&policy, |c| c.execute(sql, params.clone()))
-            })
-        }
-        #[cfg(not(feature = "observability"))]
-        {
+        crate::obs::instrument_execute(sql, || {
             self.run_with_policy(&policy, |c| c.execute(sql, params.clone()))
-        }
+        })
     }
 
     /// Runs a streaming query, returning a [`QueryResult`] cursor that owns its
@@ -86,16 +79,7 @@ impl Database {
     pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<QueryResult> {
         let params = params.into_params();
         let policy = self.default_policy(sql);
-        #[cfg(feature = "observability")]
-        {
-            crate::obs::instrument_query(sql, || {
-                self.query_with_policy(&policy, sql, params)
-            })
-        }
-        #[cfg(not(feature = "observability"))]
-        {
-            self.query_with_policy(&policy, sql, params)
-        }
+        crate::obs::instrument_query(sql, || self.query_with_policy(&policy, sql, params))
     }
 
     /// Runs a query and maps every row into `T` via [`FromRow`], collecting a
@@ -103,30 +87,16 @@ impl Database {
     pub fn query_as<T: FromRow>(&self, sql: &str, params: impl IntoParams) -> Result<Vec<T>> {
         let params = params.into_params();
         let policy = self.default_policy(sql);
-        #[cfg(feature = "observability")]
-        {
-            crate::obs::instrument_query(sql, || {
-                self.run_with_policy(&policy, |c| c.query_as(sql, params.clone()))
-            })
-        }
-        #[cfg(not(feature = "observability"))]
-        {
+        crate::obs::instrument_query(sql, || {
             self.run_with_policy(&policy, |c| c.query_as(sql, params.clone()))
-        }
+        })
     }
 
     /// Validates and runs a column-wise batch (rectangular + type-homogeneous)
     /// through the driver's array-binding path. No auto-retry — the caller
     /// re-drives on failure; a connection-class failure discards the lease.
     pub fn execute_batch(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
-        #[cfg(feature = "observability")]
-        {
-            crate::obs::instrument_execute(sql, || self.execute_batch_inner(sql, rows))
-        }
-        #[cfg(not(feature = "observability"))]
-        {
-            self.execute_batch_inner(sql, rows)
-        }
+        crate::obs::instrument_execute(sql, || self.execute_batch_inner(sql, rows))
     }
 
     fn execute_batch_inner(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
@@ -169,14 +139,7 @@ impl Database {
     where
         F: FnOnce(&ScopedTransaction) -> Result<T>,
     {
-        #[cfg(feature = "observability")]
-        {
-            crate::obs::instrument_transaction(|| self.transaction_inner(f))
-        }
-        #[cfg(not(feature = "observability"))]
-        {
-            self.transaction_inner(f)
-        }
+        crate::obs::instrument_transaction(|| self.transaction_inner(f))
     }
 
     fn transaction_inner<T, F>(&self, f: F) -> Result<T>
@@ -224,7 +187,6 @@ impl Database {
         op: impl Fn(&Connection) -> Result<T>,
     ) -> Result<T> {
         let mut last = Error::new(ErrorCode::Unknown, "no attempt made");
-        #[cfg(feature = "observability")]
         let mut emitted_retry = false;
         for attempt in 1..=policy.max_attempts {
             let mut lease = self.pool.acquire()?;
@@ -236,17 +198,15 @@ impl Database {
                     }
                     last = e;
                     if !last.retriable || attempt == policy.max_attempts {
-                        #[cfg(feature = "observability")]
-                        if emitted_retry {
+                        // C++: exhausted only when attempts actually ran out
+                        // (`attempt > 1 && attempt == maxAttempts`).
+                        if emitted_retry && attempt == policy.max_attempts {
                             crate::obs::emit_retry("exhausted");
                         }
                         return Err(last);
                     }
-                    #[cfg(feature = "observability")]
-                    {
-                        crate::obs::emit_retry("retried");
-                        emitted_retry = true;
-                    }
+                    crate::obs::emit_retry("retried");
+                    emitted_retry = true;
                     drop(lease); // return/discard before the backoff sleep
                     thread::sleep(policy.backoff.delay_for(attempt));
                 }
@@ -265,7 +225,6 @@ impl Database {
         params: Params,
     ) -> Result<QueryResult> {
         let mut last = Error::new(ErrorCode::Unknown, "no attempt made");
-        #[cfg(feature = "observability")]
         let mut emitted_retry = false;
         for attempt in 1..=policy.max_attempts {
             let mut lease = self.pool.acquire()?;
@@ -279,17 +238,15 @@ impl Database {
                     }
                     last = e;
                     if !last.retriable || attempt == policy.max_attempts {
-                        #[cfg(feature = "observability")]
-                        if emitted_retry {
+                        // C++: exhausted only when attempts actually ran out
+                        // (`attempt > 1 && attempt == maxAttempts`).
+                        if emitted_retry && attempt == policy.max_attempts {
                             crate::obs::emit_retry("exhausted");
                         }
                         return Err(last);
                     }
-                    #[cfg(feature = "observability")]
-                    {
-                        crate::obs::emit_retry("retried");
-                        emitted_retry = true;
-                    }
+                    crate::obs::emit_retry("retried");
+                    emitted_retry = true;
                     drop(lease);
                     thread::sleep(policy.backoff.delay_for(attempt));
                 }
@@ -490,16 +447,7 @@ impl ScopedTransaction {
     /// Executes a non-query statement within the unit of work.
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<i64> {
         let params = params.into_params();
-        #[cfg(feature = "observability")]
-        {
-            crate::obs::instrument_execute(sql, || {
-                self.note(self.lease.execute(sql, params.clone()))
-            })
-        }
-        #[cfg(not(feature = "observability"))]
-        {
-            self.note(self.lease.execute(sql, params))
-        }
+        crate::obs::instrument_execute(sql, move || self.note(self.lease.execute(sql, params)))
     }
 
     /// Runs a streaming query within the unit of work, returning a [`TxCursor`]
@@ -509,53 +457,26 @@ impl ScopedTransaction {
     /// [`QueryResult`] does outside a transaction.
     pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<TxCursor<'_>> {
         let params = params.into_params();
-        #[cfg(feature = "observability")]
-        {
-            crate::obs::instrument_query(sql, || {
-                let rows = self.note(self.lease.query(sql, params.clone()))?;
-                Ok(TxCursor {
-                    rows,
-                    broken: &self.conn_broken,
-                })
-            })
-        }
-        #[cfg(not(feature = "observability"))]
-        {
+        crate::obs::instrument_query(sql, move || {
             let rows = self.note(self.lease.query(sql, params))?;
             Ok(TxCursor {
                 rows,
                 broken: &self.conn_broken,
             })
-        }
+        })
     }
 
     /// Runs a query and maps every row into `T`.
     pub fn query_as<T: FromRow>(&self, sql: &str, params: impl IntoParams) -> Result<Vec<T>> {
         let params = params.into_params();
-        #[cfg(feature = "observability")]
-        {
-            crate::obs::instrument_query(sql, || {
-                self.note(self.lease.query_as(sql, params.clone()))
-            })
-        }
-        #[cfg(not(feature = "observability"))]
-        {
+        crate::obs::instrument_query(sql, move || {
             self.note(self.lease.query_as(sql, params))
-        }
+        })
     }
 
     /// Batch insert within the unit of work.
     pub fn execute_batch(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
-        #[cfg(feature = "observability")]
-        {
-            crate::obs::instrument_execute(sql, || {
-                self.note(self.lease.execute_batch(sql, rows))
-            })
-        }
-        #[cfg(not(feature = "observability"))]
-        {
-            self.note(self.lease.execute_batch(sql, rows))
-        }
+        crate::obs::instrument_execute(sql, || self.note(self.lease.execute_batch(sql, rows)))
     }
 
     /// Flags the unit of work's connection broken if `result` is a

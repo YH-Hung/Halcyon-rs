@@ -143,6 +143,35 @@ fn retries_emit_retried_then_exhausted() {
 }
 
 #[test]
+fn mid_retry_non_retriable_does_not_emit_exhausted() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    let mut deadlock = Error::new(ErrorCode::Deadlock, "deadlock");
+    deadlock.retriable = true;
+    mock.push_execute_error(deadlock);
+    mock.push_execute_error(Error::new(ErrorCode::Syntax, "syntax"));
+    let db = Database::open(mock, params(), config()).unwrap();
+
+    with_obs(|rec, _spans| {
+        let r: Result<Vec<(i64,)>> = db.query_as("SELECT n FROM t", ());
+        assert!(r.is_err());
+        let samples = rec.snapshot();
+        assert_eq!(
+            count(&samples, "halcyon_retries_total", &[("outcome", "retried")]),
+            1
+        );
+        assert_eq!(
+            count(
+                &samples,
+                "halcyon_retries_total",
+                &[("outcome", "exhausted")]
+            ),
+            0
+        );
+    });
+}
+
+#[test]
 fn execute_batch_emits_execute_metrics() {
     let _g = obs_lock();
     let mock = Arc::new(MockCliDriver::new());

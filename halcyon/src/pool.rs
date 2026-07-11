@@ -231,10 +231,17 @@ impl PoolInner {
     /// a release. Mirrors the C++ `ConnectionPool::acquire` loop.
     fn acquire(self: &Arc<Self>) -> Result<PooledConnection> {
         #[cfg(feature = "observability")]
-        let span = tracing::info_span!(
-            "halcyon.acquire",
-            error.sqlstate = tracing::field::Empty,
-        );
+        let span = {
+            use tracing::subscriber::NoSubscriber;
+            if tracing::dispatcher::get_default(|d| d.is::<NoSubscriber>()) {
+                tracing::Span::none()
+            } else {
+                tracing::info_span!(
+                    "halcyon.acquire",
+                    error.sqlstate = tracing::field::Empty,
+                )
+            }
+        };
         #[cfg(feature = "observability")]
         let _span_guard = span.enter();
         #[cfg(feature = "observability")]
@@ -250,8 +257,14 @@ impl PoolInner {
         #[cfg(feature = "observability")]
         {
             pm.acquire_wait_secs = Some(start.elapsed().as_secs_f64());
-            if result.is_err() {
-                tracing::error!("halcyon acquire failed");
+            if let Err(ref e) = result {
+                // C++ `span.setStatusError` on timeout/failure — record the field
+                // so OTel-style exporters see an errored acquire (empty SQLSTATE
+                // is still a recorded failure marker).
+                if !span.is_disabled() {
+                    span.record("error.sqlstate", e.sqlstate.as_str());
+                    tracing::error!(error.sqlstate = %e.sqlstate, "halcyon acquire failed");
+                }
             }
             crate::obs::flush_pool_metrics(&pm);
         }
@@ -424,7 +437,15 @@ impl PoolInner {
                 break;
             }
         }
+        #[cfg(feature = "observability")]
+        let pm = {
+            let mut pm = crate::obs::PendingMetrics::default();
+            pm.set_gauges(guard.idle.len(), guard.leased);
+            pm
+        };
         drop(guard);
+        #[cfg(feature = "observability")]
+        crate::obs::flush_pool_metrics(&pm);
         drop(discarded); // disconnect reaped/leftover connections outside the lock
     }
 }

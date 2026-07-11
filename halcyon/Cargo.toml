@@ -49,7 +49,7 @@ halcyon-derive = { path = "../halcyon-derive", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
 # Observability facades (feature `observability`). MSRV-friendly: tracing 0.1
 # (MSRV 1.65) and metrics 0.24 (MSRV 1.71.1) both build on Halcyon's 1.75.
-tracing = { version = "0.1", optional = true }
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
 tracing-core = { version = "0.1", optional = true }
 metrics = { version = "0.24", optional = true, default-features = false }
 

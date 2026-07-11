@@ -103,13 +103,11 @@ impl StatementCache {
         sql: &str,
     ) -> Result<StmtLease> {
         if self.capacity == 0 {
-            #[cfg(feature = "observability")]
             crate::obs::emit_stmt_cache("overflow", self.entries.len());
             return Ok(StmtLease::transient(driver.prepare(conn, sql)?));
         }
         if let Some(e) = self.entries.get_mut(sql) {
             if e.busy {
-                #[cfg(feature = "observability")]
                 crate::obs::emit_stmt_cache("overflow", self.entries.len());
                 return Ok(StmtLease::transient(driver.prepare(conn, sql)?));
             }
@@ -118,9 +116,7 @@ impl StatementCache {
             e.last_used = self.tick;
             let handle = e.handle;
             let id = e.id;
-            let size = self.entries.len();
-            #[cfg(feature = "observability")]
-            crate::obs::emit_stmt_cache("hit", size);
+            crate::obs::emit_stmt_cache("hit", self.entries.len());
             return Ok(StmtLease::cached(handle, id));
         }
         let handle = driver.prepare(conn, sql)?;
@@ -135,12 +131,10 @@ impl StatementCache {
                 Some(key) => {
                     let e = self.entries.remove(&key).expect("victim key just found");
                     let _ = driver.finalize(e.handle);
-                    #[cfg(feature = "observability")]
                     crate::obs::emit_stmt_cache("evict", self.entries.len());
                 }
                 // Every entry is leased out: don't insert, serve transient.
                 None => {
-                    #[cfg(feature = "observability")]
                     crate::obs::emit_stmt_cache("overflow", self.entries.len());
                     return Ok(StmtLease::transient(handle));
                 }
@@ -157,7 +151,6 @@ impl StatementCache {
                 last_used: self.tick,
             },
         );
-        #[cfg(feature = "observability")]
         crate::obs::emit_stmt_cache("miss", self.entries.len());
         Ok(StmtLease::cached(handle, self.next_id))
     }

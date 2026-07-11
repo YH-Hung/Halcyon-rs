@@ -1,26 +1,34 @@
 //! Observability helpers — C++ `observability/instrument.hpp` + label helpers.
 //!
-//! Enabled only with `--features observability`. Emits the Halcyon metric/span
-//! catalog via process-global [`tracing`] and [`metrics`] facades.
+//! With `--features observability`, emits the Halcyon metric/span catalog via
+//! process-global [`tracing`] and [`metrics`] facades. Without the feature,
+//! thin no-op stubs keep facade/cache call sites as a single body.
 
+#[cfg(feature = "observability")]
 mod instrument;
+#[cfg(feature = "observability")]
 mod labels;
+#[cfg(not(feature = "observability"))]
+mod stubs;
 
+#[cfg(feature = "observability")]
 pub(crate) use instrument::{
     emit_retry, emit_stmt_cache, flush_pool_metrics, instrument_execute, instrument_query,
     instrument_transaction, PendingMetrics,
 };
-#[allow(unused_imports)] // re-export for pool/cache call sites
-pub(crate) use labels::{code_label, op_label};
+#[cfg(not(feature = "observability"))]
+pub(crate) use stubs::{
+    emit_retry, emit_stmt_cache, instrument_execute, instrument_query, instrument_transaction,
+};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observability"))]
 mod record;
-#[cfg(test)]
+#[cfg(all(test, feature = "observability"))]
 pub(crate) use record::*;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observability"))]
 mod tests_facade;
-#[cfg(test)]
+#[cfg(all(test, feature = "observability"))]
 mod tests_pool;
-#[cfg(test)]
+#[cfg(all(test, feature = "observability"))]
 mod tests_cache;

@@ -137,3 +137,63 @@ fn sink_may_reenter_pool_without_deadlock() {
         drop(lease);
     });
 }
+
+#[test]
+fn maintain_flushes_pool_gauges() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    let mut cfg = config();
+    cfg.min = 1;
+    cfg.max = 4;
+    cfg.idle_timeout = Duration::ZERO;
+
+    with_metrics(|rec| {
+        let pool = ConnectionPool::create(mock, params(), cfg).unwrap();
+        let a = pool.acquire().unwrap();
+        let b = pool.acquire().unwrap();
+        let c = pool.acquire().unwrap();
+        drop((a, b, c));
+        assert_eq!(pool.idle_count(), 3);
+        // Clear warmup/acquire gauge samples so we assert the maintain flush.
+        let _ = rec.snapshot();
+        // Snapshot drains? No — RecordingRecorder accumulates. Grab length
+        // before maintain and require a post-maintain idle=1 sample.
+        pool.maintain();
+        assert_eq!(pool.idle_count(), 1);
+        let samples = rec.snapshot();
+        let idle_after = samples
+            .iter()
+            .rev()
+            .find(|s| {
+                s.name == "halcyon_pool_connections"
+                    && s.labels.iter().any(|(k, v)| k == "state" && v == "idle")
+            })
+            .map(|s| s.value);
+        assert_eq!(idle_after, Some(1.0));
+    });
+}
+
+#[test]
+fn acquire_timeout_marks_span_errored() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    let mut cfg = config();
+    cfg.min = 1;
+    cfg.max = 1;
+    cfg.acquire_timeout = Duration::from_millis(30);
+
+    with_obs(|_rec, spans| {
+        let pool = ConnectionPool::create(mock, params(), cfg).unwrap();
+        let _hold = pool.acquire().unwrap();
+        let err = pool.acquire().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Pool);
+        let guard = spans.lock().unwrap();
+        let acquire = guard
+            .iter()
+            .rev()
+            .find(|s| s.name == "halcyon.acquire")
+            .expect("acquire span");
+        assert!(acquire.errored, "timed-out acquire must be marked errored");
+        assert!(acquire.attrs.contains_key("error.sqlstate"));
+    });
+}

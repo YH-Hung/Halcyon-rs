@@ -55,7 +55,9 @@ jobs:
           cargo test -p halcyon --no-default-features --features tokio,derive
           cargo test -p halcyon --no-default-features --features observability
           cargo test -p halcyon --no-default-features --features observability,derive
-          cargo test -p halcyon --no-default-features --features observability,tokio,derive
+          # Single-threaded: concurrent spawn_blocking set_default churns tracing's
+          # callsite-interest cache and flakes execute_async_inherits_caller_context.
+          cargo test -p halcyon --no-default-features --features observability,tokio,derive -- --test-threads=1
           cargo test -p halcyon-derive
 
   # ---------------------------------------------------------------------------

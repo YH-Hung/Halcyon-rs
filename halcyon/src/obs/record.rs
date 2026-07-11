@@ -26,31 +26,20 @@ pub(crate) fn obs_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MetricKind {
-    Counter,
-    Histogram,
-    Gauge,
-}
-
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields read by later task assertions
 pub(crate) struct MetricSample {
     pub name: String,
     pub value: f64,
     pub labels: Vec<(String, String)>,
-    pub kind: MetricKind,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields read by later task assertions
 pub(crate) struct SpanRecord {
     pub name: String,
     pub attrs: HashMap<String, String>,
     pub errored: bool,
     pub id: u64,
     pub parent_id: Option<u64>,
-    #[allow(dead_code)]
     meta: &'static TraceMetadata<'static>,
 }
 
@@ -93,7 +82,6 @@ impl CounterFn for RecCounter {
                 name: self.name.clone(),
                 value: value as f64,
                 labels: self.labels.clone(),
-                kind: MetricKind::Counter,
             });
     }
 
@@ -125,7 +113,6 @@ impl GaugeFn for RecGauge {
                 name: self.name.clone(),
                 value,
                 labels: self.labels.clone(),
-                kind: MetricKind::Gauge,
             });
     }
 }
@@ -145,7 +132,6 @@ impl HistogramFn for RecHistogram {
                 name: self.name.clone(),
                 value,
                 labels: self.labels.clone(),
-                kind: MetricKind::Histogram,
             });
     }
 }
@@ -237,6 +223,16 @@ struct AttrVisitor<'a> {
 }
 
 impl Visit for AttrVisitor<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "error.sqlstate" {
+            // Presence of the field means failure — including empty SQLSTATE on
+            // pool timeouts (C++ setStatusError with "").
+            *self.errored = true;
+        }
+        self.attrs
+            .insert(field.name().to_string(), value.to_string());
+    }
+
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         let s = format!("{value:?}");
         // Strip surrounding quotes from Debug of &str.
@@ -245,18 +241,10 @@ impl Visit for AttrVisitor<'_> {
             .and_then(|t| t.strip_suffix('"'))
             .unwrap_or(&s)
             .to_string();
-        if field.name() == "error.sqlstate" && !cleaned.is_empty() {
+        if field.name() == "error.sqlstate" {
             *self.errored = true;
         }
         self.attrs.insert(field.name().to_string(), cleaned);
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "error.sqlstate" && !value.is_empty() {
-            *self.errored = true;
-        }
-        self.attrs
-            .insert(field.name().to_string(), value.to_string());
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
@@ -372,7 +360,6 @@ pub(crate) fn with_tracing<R>(f: impl FnOnce(Arc<Mutex<Vec<SpanRecord>>>) -> R) 
 }
 
 /// Runs `f` with both a recording metrics recorder and tracing subscriber.
-#[allow(dead_code)] // used by later task tests
 pub(crate) fn with_obs<R>(
     f: impl FnOnce(&RecordingRecorder, Arc<Mutex<Vec<SpanRecord>>>) -> R,
 ) -> R {
@@ -393,7 +380,6 @@ pub(crate) fn count(samples: &[MetricSample], name: &str, labels: &[(&str, &str)
         .count()
 }
 
-#[allow(dead_code)] // used by later task tests
 pub(crate) fn max_value(samples: &[MetricSample], name: &str, labels: &[(&str, &str)]) -> f64 {
     samples
         .iter()
@@ -406,7 +392,6 @@ pub(crate) fn find_span<'a>(spans: &'a [SpanRecord], name: &str) -> Option<&'a S
     spans.iter().find(|s| s.name == name)
 }
 
-#[allow(dead_code)] // used by later task tests
 pub(crate) fn find_child<'a>(
     spans: &'a [SpanRecord],
     name: &str,

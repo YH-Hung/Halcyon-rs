@@ -14,7 +14,9 @@
 //! not cross an await point — a documented C++ non-goal). With the
 //! `observability` feature, the current [`tracing`] span and `Dispatch` are
 //! captured on the async task and entered/set inside the blocking closure so
-//! caller spans parent `halcyon.*` spans across `spawn_blocking`.
+//! caller spans parent `halcyon.*` spans across `spawn_blocking`. (The
+//! `metrics` crate's thread-local recorder does not cross `spawn_blocking`;
+//! install a process-global recorder if you need metrics from async callers.)
 //!
 //! ## Cancellation
 //! Dropping the returned future does **not** cancel in-flight work: a
@@ -201,6 +203,26 @@ where
     run_blocking_with_permit(permit, f).await
 }
 
+/// Propagates the current tracing context onto a blocking-pool thread.
+///
+/// Skips [`tracing::dispatcher::set_default`] when the captured dispatch is the
+/// no-op [`NoSubscriber`]: other concurrent `spawn_blocking` work would otherwise
+/// churn the global callsite-interest cache and flake span-recording tests.
+#[cfg(feature = "observability")]
+fn enter_blocking_trace_context(
+    parent: tracing::Span,
+    dispatch: tracing::Dispatch,
+) -> (Option<tracing::dispatcher::DefaultGuard>, tracing::span::EnteredSpan) {
+    use tracing::subscriber::NoSubscriber;
+    let guard = if dispatch.is::<NoSubscriber>() {
+        None
+    } else {
+        Some(tracing::dispatcher::set_default(&dispatch))
+    };
+    let entered = parent.entered();
+    (guard, entered)
+}
+
 /// Offloads without admission (bootstrap `connect` only).
 #[cfg(feature = "db2")]
 async fn run_blocking_raw<F, T>(f: F) -> Result<T>
@@ -214,8 +236,7 @@ where
         let dispatch = tracing::dispatcher::get_default(|d| d.clone());
         join(
             spawn_blocking_checked(move || {
-                let _dispatch = tracing::dispatcher::set_default(&dispatch);
-                let _span = parent.entered();
+                let (_disp, _span) = enter_blocking_trace_context(parent, dispatch);
                 f()
             })?
             .await,
@@ -239,8 +260,7 @@ where
         join(
             spawn_blocking_checked(move || {
                 let _permit = permit;
-                let _dispatch = tracing::dispatcher::set_default(&dispatch);
-                let _span = parent.entered();
+                let (_disp, _span) = enter_blocking_trace_context(parent, dispatch);
                 f()
             })?
             .await,
@@ -525,6 +545,9 @@ mod tests {
         let sub = RecordingSubscriber::new(Arc::clone(&spans));
         let dispatch = tracing::Dispatch::new(sub);
         let _disp = tracing::dispatcher::set_default(&dispatch);
+        // Rebuild after install: other parallel tests may have registered
+        // `halcyon.*` callsites as disabled under NoSubscriber.
+        tracing_core::callsite::rebuild_interest_cache();
 
         let parent = tracing::info_span!("test.parent");
         let parent_id = {
