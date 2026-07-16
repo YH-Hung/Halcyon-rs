@@ -1,8 +1,8 @@
 # Halcyon-rs — v0.1 Parity Catch-up (C++ v1.1 + Block Fetch) — Design
 
 **Date:** 2026-07-16  
-**Status:** Approved design (rev 2 — review gaps closed); implementation plan
-to follow.  
+**Status:** Approved design (rev 3 — `execute_with_lobs` + begin-failure
+ownership); implementation plan to follow.  
 **Baseline:** Halcyon-rs main (feature-complete vs C++ v1.0-ish; crates.io
 publish pending).  
 **C++ reference:** Halcyon [`v1.1.0`](https://github.com/YH-Hung/Halcyon/releases/tag/v1.1.0)
@@ -77,6 +77,8 @@ crossing `.await`.
 | Begin-after-override failure | If `set_isolation` succeeds but disabling autocommit fails, best-effort restore to the restore target before returning the error |
 | Method names | No overloading: `begin_with_isolation`, `transaction_with_isolation`, `savepoint_named` |
 | LOB params | Separate from `IntoParams` / `Params`; see §4.4 |
+| Sync LOB entry | `execute_with_lobs(sql, Vec<BindParam<'_>>)` — consuming, single-use (rev 3) |
+| Begin-failure ownership | Pooled lease `mark_broken`; standalone `Connection` marked unusable (rev 3) |
 | Transaction surface | Savepoints/isolation on both `Transaction` and `ScopedTransaction`; async is closure-only |
 | Long-column `fetch_block` | Fallback returns **at most one row** per call |
 | `Savepoint` ownership | `Savepoint<'_>` holds `&Transaction` / `&ScopedTransaction`; interior mutability for registry; nested rejects `commit`/`rollback` by types |
@@ -154,12 +156,24 @@ pool config.
 **Begin sequence for `begin_with_isolation(level)`:**
 
 1. `set_isolation(conn, level)`. On failure → return error (autocommit
-   untouched).
+   untouched; connection still usable).
 2. Disable autocommit. On failure → **best-effort**
-   `set_isolation(conn, restore_target)`, then return the autocommit error
-   (connection poisoned / discarded if restore itself fails, same as today).
+   `set_isolation(conn, restore_target)`, then return the autocommit error.
+   Ownership of a failed compensation (restore itself fails, or we cannot
+   trust isolation/autocommit state):
+   - **Pooled** (`Database` / `ScopedTransaction` begin path): mark the
+     lease broken so the pool **discards** it on drop — never returns a
+     wrong-isolation or half-begun connection to the idle list.
+   - **Standalone** (`Connection::begin_with_isolation`): mark the
+     `Connection` **unusable** via an interior flag (new; today’s
+     `Connection` has no broken-state). Subsequent public ops return
+     `ErrorCode::InvalidState` (“connection unusable after failed
+     isolation/autocommit transition”). Drop still disconnects. Do **not**
+     leave the handle silently usable with unknown isolation.
 3. On success → store `restore_target` on the transaction; restore on every
-   exit path (commit, rollback, Drop). Restore failure → **poison**.
+   exit path (commit, rollback, Drop). Restore failure → same ownership
+   rules as above (poison the transaction **and** mark lease broken /
+   standalone connection unusable).
 
 Plain `begin()` (no override) does not touch isolation and does not restore.
 
@@ -312,7 +326,7 @@ with `SYS`. Live-name registry case-insensitive; reuse while live →
     materializing helpers, not covered by the O(chunk) guarantee.
 - Never auto-retried. Mid-stream abandon is safe (cursor close).
 
-#### Write — separate from `IntoParams` (rev 2)
+#### Write — separate from `IntoParams` (rev 2/3)
 
 Ordinary `execute` / `IntoParams` / `Params` stay **Value-only and `Clone`**
 (required for auto-retry). LOB writes do **not** extend those traits.
@@ -357,14 +371,21 @@ pub enum OwnedBindParam {
 ```
 
 Constructors: `lob_file(path)`, `lob_reader(r, hint)`, `lob_callback(f, hint)`,
-each with `.as_clob()`. Packing: a slice/`Vec` of `BindParam` (or a small
-builder). Named parameters + LOB are unsupported (documented).
+each with `.as_clob()`. Packing: build a `Vec<BindParam>` (or a small
+builder that yields one). Named parameters + LOB are unsupported
+(documented).
 
-**Entry points:**
+**Entry points (rev 3):**
 
 | Sync | Async |
 |---|---|
-| `execute_with_lobs(sql, &[BindParam<'_>])` | `execute_with_lobs(sql, Vec<OwnedBindParam>)` |
+| `execute_with_lobs(sql, Vec<BindParam<'_>>)` | `execute_with_lobs(sql, Vec<OwnedBindParam>)` |
+
+Sync takes an **owned** `Vec` (not `&[BindParam]` / not `&mut [BindParam]`):
+`LobSource` holds `&mut dyn Read` and `FnMut` pulls, which require exclusive
+mutation during the NEED_DATA loop, and sources are single-use — consuming
+the vector matches both constraints (an immutable slice fails to compile
+with E0596).
 
 Both always use **once** execution policy (no auto-retry; sources are
 single-use and not `Clone`). Routing: any `Lob` variant →
@@ -424,7 +445,9 @@ TDD throughout. Full suite including live Db2 before any completion claim
 - **Unit (mock):** every new seam method; savepoint SQL emission and name gate
   (including `SYS` and injection attempts); `Savepoint` RAII all exits;
   isolation set/restore/poison; begin-failure restore after successful
-  override; `None`-default restore uses CS; `LobReader` chunk boundaries
+  override; `None`-default restore uses CS; **standalone connection marked
+  unusable** when compensation fails (subsequent ops → `InvalidState`);
+  pooled begin path marks lease broken; `LobReader` chunk boundaries
   (empty, NULL, exact buffer multiple, mid-stream abandon); `execute_streaming`
   NEED_DATA sequencing and source-`Err` cancellation; ascending-column
   enforcement; `fetch_block` empty/short/full; **fallback returns ≤1 row**
@@ -462,7 +485,8 @@ TDD throughout. Full suite including live Db2 before any completion claim
   (`is_null()` after first read).
 - **Statement cache × data-at-exec:** aborted streaming execute must
   `SQLCancel` before cache reuse.
-- **Isolation restore failure** must poison.
+- **Isolation restore failure** must poison the transaction and mark the
+  pooled lease broken / standalone connection unusable (§3.3).
 - **`None` default + override:** restore always sets a concrete level (CS if
   unset). A connection that never had an override keeps whatever the server
   had at connect; after the first override+restore it will be CS (or the
