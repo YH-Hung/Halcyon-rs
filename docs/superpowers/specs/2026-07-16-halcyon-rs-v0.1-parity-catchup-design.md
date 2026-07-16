@@ -1,8 +1,8 @@
 # Halcyon-rs — v0.1 Parity Catch-up (C++ v1.1 + Block Fetch) — Design
 
 **Date:** 2026-07-16  
-**Status:** Approved design (rev 3 — `execute_with_lobs` + begin-failure
-ownership); implementation plan to follow.  
+**Status:** Approved design (rev 5 — SQLCancel same-handle proof, shared
+NEED_DATA pump tests, async IntoParams); implementation plan updated.  
 **Baseline:** Halcyon-rs main (feature-complete vs C++ v1.0-ish; crates.io
 publish pending).  
 **C++ reference:** Halcyon [`v1.1.0`](https://github.com/YH-Hung/Halcyon/releases/tag/v1.1.0)
@@ -79,6 +79,13 @@ crossing `.await`.
 | LOB params | Separate from `IntoParams` / `Params`; see §4.4 |
 | Sync LOB entry | `execute_with_lobs(sql, Vec<BindParam<'_>>)` — consuming, single-use (rev 3) |
 | Begin-failure ownership | Pooled lease `mark_broken`; standalone `Connection` marked unusable (rev 3) |
+| Connect-time isolation | Applied in `Connection::open_with_cache` after `connect`; failure → `disconnect` then return (rev 4) |
+| Streaming cursor types | `StreamingResultSet` / `StreamingQueryResult` / `TxStreamingCursor` — mirror `ResultSet` / `QueryResult` / `TxCursor` (rev 4) |
+| Async streaming closure | `FnOnce(&mut StreamingQueryResult) -> Result<T>` (rev 4) |
+| NEED_DATA safety | Oversized pull / panic / bad size-hint → `SQLCancel`; empty non-NULL → one zero-length `SQLPutData` (rev 4) |
+| NEED_DATA test SoT | Shared pump helper used by `Db2CliDriver`; unit tests drive that helper (not only `MockCliDriver`) (rev 5) |
+| SQLCancel proof | Same persistent `StatementHandle` abort→re-execute; separately assert streaming errors poison stmt leases (rev 5) |
+| Async streaming params | `impl IntoParams` → owned `Params` before `spawn_blocking` (match `execute` / `query_as`) (rev 5) |
 | Transaction surface | Savepoints/isolation on both `Transaction` and `ScopedTransaction`; async is closure-only |
 | Long-column `fetch_block` | Fallback returns **at most one row** per call |
 | `Savepoint` ownership | `Savepoint<'_>` holds `&Transaction` / `&ScopedTransaction`; interior mutability for registry; nested rejects `commit`/`rollback` by types |
@@ -131,10 +138,24 @@ CLI mapping lives only in `driver/db2.rs`:
   connection (including reconnects).
 
 When opening a pooled connection, the pool copies
-`PoolConfig::isolation` into `ConnectionParams::isolation` and the driver
-applies it during `connect` (or immediately after). Standalone
+`PoolConfig::isolation` into `ConnectionParams::isolation`. Standalone
 `Connection::open*` callers set `ConnectionParams` directly — there is no
 second competing knob.
+
+**Uniform apply owner (rev 4):** `Connection::open_with_cache` (and `open`,
+which delegates to it) is the **only** place that applies
+`params.isolation` after a successful `driver.connect`:
+
+1. `handle = driver.connect(params)?`
+2. If `params.isolation` is `Some(level)` → `driver.set_isolation(handle, level)`.
+   On failure → **best-effort** `driver.disconnect(handle)`, then return the
+   isolation error (never leave an open handle or a half-warmed pool slot).
+3. On success → construct `Connection` storing `configured_isolation =
+   params.isolation` for later restore-target computation.
+
+Pool warmup and reconnect both go through `open_with_cache`, so the same
+cleanup applies. Do **not** apply isolation inside `CliDriver::connect` or
+in the pool separately.
 
 **Restore target after a per-transaction override** (matches C++
 `defaultIsolation_.value_or(Isolation::CursorStability)`):
@@ -310,21 +331,37 @@ with `SYS`. Live-name registry case-insensitive; reuse while live →
 
 ### 4.4 W4 — LOB streaming
 
-#### Read
+#### Read — cursor ownership (rev 4)
 
-- `query_streaming` wherever `query` exists (`Connection`, `Transaction`,
-  `ScopedTransaction`, `Database`). Facade form returns an owned cursor that
-  holds the pool lease (like today’s `QueryResult`).
-- Dedicated row-at-a-time path (`fetch_next` + `get_value` /
-  `get_data_chunk`); **no** block binding so `SQLGetData` is legal.
-- Ascending column access enforced above the seam → `InvalidState` on
-  violation.
-- `LobReader`:
-  - **O(chunk):** `read(&mut [u8]) -> Result<usize>` (`Ok(0)` = EOF),
-    `is_null()`, copy-to-file / copy-to-`Write` sinks.
-  - **O(total LOB size):** `to_vec()`, `to_string()` — documented as
-    materializing helpers, not covered by the O(chunk) guarantee.
-- Never auto-retried. Mid-stream abandon is safe (cursor close).
+Mirror today’s non-streaming shapes exactly:
+
+| Entry point | Returns | Ownership / poison |
+|---|---|---|
+| `Connection::query_streaming` | `StreamingResultSet<'_>` | Borrows `Connection` via statement lease (like `ResultSet`). Driver error recorded on the cursor; Drop closes cursor / returns stmt to cache. |
+| `Transaction::query_streaming` | `StreamingResultSet<'_>` | Same borrowed cursor; must drop before `commit`/`rollback`. |
+| `Database::query_streaming` | `StreamingQueryResult` | Owns `PooledConnection` + stmt lease (like `QueryResult`). Drop: poison stmt on any driver error; `mark_broken` on `ErrorCode::Connection`. |
+| `ScopedTransaction::query_streaming` | `TxStreamingCursor<'_>` | Borrows the scoped txn; wraps a `StreamingResultSet` and a `&Cell<bool>` `conn_broken` slot (like `TxCursor`). Drop: if connection-class error, set `conn_broken` so the txn discards the lease. |
+| `AsyncDatabase::query_streaming` | closure only | `query_streaming(sql, params, \|rs: &mut StreamingQueryResult\| { … })` — owned pooled cursor lives only inside one `spawn_blocking` task. |
+
+Supporting types (public):
+
+- `StreamingRow<'_>` — lending row view; `get<T: FromColumn>(col)` for scalars;
+  `lob(col) -> Result<LobReader<'_>>` for LOB cells.
+- `LobReader<'_>` — as below; invalidated by the next `next()` or by moving the
+  parent cursor.
+
+Dedicated row-at-a-time path (`fetch_next` + `get_value` /
+`get_data_chunk`); **no** block binding so `SQLGetData` is legal.
+Ascending column access enforced above the seam → `InvalidState` on
+violation.
+
+`LobReader`:
+- **O(chunk):** `read(&mut [u8]) -> Result<usize>` (`Ok(0)` = EOF),
+  `is_null()`, copy-to-file / copy-to-`Write` sinks.
+- **O(total LOB size):** `to_vec()`, `to_string()` — documented as
+  materializing helpers, not covered by the O(chunk) guarantee.
+
+Never auto-retried. Mid-stream abandon is safe (cursor close / Drop).
 
 #### Write — separate from `IntoParams` (rev 2/3)
 
@@ -393,14 +430,53 @@ single-use and not `Clone`). Routing: any `Lob` variant →
 callers should prefer ordinary `execute` for that case.
 
 Default bind binary (BLOB); `.as_clob()` for CLOB. Driver staging buffer
-~256 KiB. Source `Err` → `SQLCancel` + propagate the source error (or wrap
-with context) so a cached handle never rejoins in `SQL_NEED_DATA`.
-`execute_batch` does not accept LOB types (type system); documenting a clear
-error is unnecessary if LOBs cannot be passed.
+**256 KiB** (`LOB_STAGE_BYTES`). `execute_batch` does not accept LOB types
+(type system).
 
 Seam pull callback: `FnMut(&mut [u8]) -> Result<usize>` — `Ok(0)` EOF,
 `Err` aborts with detail retained (no `npos`).
 
+**NEED_DATA safety protocol (rev 4/5 — match C++ `executeStreaming`):**
+
+Extract a **shared pump helper** inside `driver/db2.rs` (e.g.
+`pump_need_data_chunk` / `validate_lob_size_hint`) that
+`Db2CliDriver::execute_streaming` calls for every `SQL_NEED_DATA` token.
+Unit tests must exercise **that helper** (recording put/cancel callbacks) —
+`MockCliDriver` sequencing alone is insufficient because it cannot prove the
+real FFI path rejects an oversized pull before `SQLPutData`.
+
+For every token / pull:
+
+1. Pull into the staging buffer. On source `Err` → `SQLCancel` + propagate
+   (retain source detail, optionally wrap with context).
+2. If pull returns `n > stage.len()` → `SQLCancel` + `Mapping` (“oversized
+   chunk”) — never pass an oversize length to `SQLPutData` (would FFI
+   over-read).
+3. If the pull callback **panics** → catch at the seam (`catch_unwind`),
+   `SQLCancel`, return `Mapping` (“LOB source pull panicked”). Panics must
+   not escape while the statement is in `SQL_NEED_DATA`.
+4. Validate `size_hint` before bind (shared helper): must fit in the
+   **32-bit** `SQLLEN` / `SQLULEN` used on non-Windows targets; overflow →
+   `InvalidArgument` before execute (no NEED_DATA entered).
+5. Empty non-NULL LOB (pull returns `Ok(0)` with no prior PutData) → issue
+   **one** zero-length `SQLPutData` so the value is present, not omitted.
+6. Any `SQLPutData` / unknown-token failure → `SQLCancel` before returning.
+
+**SQLCancel proof (rev 5 — two separate assertions):**
+
+Cached re-execute of the same SQL is **not** a proof: a failed
+`execute_streaming` must **poison** the statement lease (like ordinary
+`execute` errors), so the next call prepares a **new** handle and can succeed
+even if `SQLCancel` was omitted.
+
+1. **Same-handle seam test** (DSN-gated, talks to `Db2CliDriver` directly):
+   prepare once → keep that `StatementHandle` → `execute_streaming` that
+   emits ≥1 chunk then `Err` → then successfully `execute` /
+   `execute_streaming` again on **that exact handle**. Success proves
+   `SQLCancel` left the CLI statement reusable (not stuck in `NEED_DATA`).
+2. **Lease-poison unit test** (mock): `Connection::execute_with_lobs`
+   failure poisons the `StmtLease` so the cache finalizes it and the next
+   acquire reprepares (mirror `execute_error_poisons_cached_statement_…`).
 ### 4.5 W5 — Tracing log catalog
 
 Under feature `observability`, emit the C++ structured-log event names as
@@ -430,7 +506,7 @@ handle.
 | Isolation + savepoints / `nested` | `transaction_with_isolation(iso, f)` only — `f` receives `&ScopedTransaction` and runs entirely inside one `spawn_blocking` task (may call `savepoint` / `nested` / `execute_with_lobs` sync) |
 | Plain txn (unchanged) | Existing `transaction(f)` |
 | LOB writes | `execute_with_lobs(sql, Vec<OwnedBindParam>)` |
-| Streaming reads | `query_streaming(sql, params, \|rs\| { … })` — cursor lives only inside the blocking task |
+| Streaming reads | `query_streaming(sql, params, f)` — `params: impl IntoParams` converted to owned `Params` **before** `spawn_blocking` (same as `execute` / `query_as`); `f: FnOnce(&mut StreamingQueryResult) -> Result<T>` runs only inside the blocking task |
 | Sync escape hatch | `blocking()` for sync streaming / RAII `begin` |
 
 Admission semaphore and observability context propagation across
@@ -447,20 +523,27 @@ TDD throughout. Full suite including live Db2 before any completion claim
   isolation set/restore/poison; begin-failure restore after successful
   override; `None`-default restore uses CS; **standalone connection marked
   unusable** when compensation fails (subsequent ops → `InvalidState`);
-  pooled begin path marks lease broken; `LobReader` chunk boundaries
-  (empty, NULL, exact buffer multiple, mid-stream abandon); `execute_streaming`
-  NEED_DATA sequencing and source-`Err` cancellation; ascending-column
-  enforcement; `fetch_block` empty/short/full; **fallback returns ≤1 row**
-  when a scripted unbounded column is present; tracing events via recording
-  subscriber; compile-fail or type-level check that `nested` closures cannot
-  call `commit`/`rollback` (optional trybuild, or rely on API shape + review).
+  pooled begin path marks lease broken; **connect-time `set_isolation` failure
+  disconnects** (standalone, pool warmup, reconnect — no leaked handle);
+  `LobReader` chunk boundaries (empty, NULL, exact buffer multiple,
+  mid-stream abandon); `execute_streaming` NEED_DATA sequencing via the
+  **shared Db2 pump helper** (source-`Err`, oversized pull, panicking pull,
+  size-hint overflow, empty non-NULL zero-length PutData) — not solely via
+  `MockCliDriver`; ascending-column enforcement; `fetch_block` empty/short/full;
+  **fallback returns ≤1 row** when a scripted unbounded column is present;
+  tracing events via recording subscriber; compile-fail or type-level check
+  that `nested` closures cannot call `commit`/`rollback` (optional trybuild,
+  or rely on API shape + review); **`execute_with_lobs` failure poisons the
+  statement lease** (next acquire reprepares).
 - **Integration (live Db2):** nested savepoints and name reuse; UR sees an
   in-flight row from a second connection while CS does not (Currently
   Committed — do **not** assume CS blocks); LOB round-trips ≥ 32 MiB both
   directions by checksum (file/reader/callback); bounded block-fetch Values
   match prior row-at-a-time behavior; **ordinary `query` over a LOB column**
   exercises the one-row fallback (memory stays bounded per call; correctness
-  of Values).
+  of Values); **same persistent `StatementHandle`:** abort
+  `execute_streaming` then succeed on that exact handle (proves real
+  `SQLCancel` — not a cache reprepare).
 - **Stress (TSan):** concurrent transactions with savepoints and per-tx
   isolation overrides; pool state always restored or connection discarded.
 - **Async:** mock `#[tokio::test]` for `transaction_with_isolation`,
@@ -484,7 +567,11 @@ TDD throughout. Full suite including live Db2 before any completion claim
   literal or omit the column. Streaming read of a NULL LOB is fine
   (`is_null()` after first read).
 - **Statement cache × data-at-exec:** aborted streaming execute must
-  `SQLCancel` before cache reuse.
+  `SQLCancel` **and** poison the statement lease. Prove cancel with a
+  same-handle seam re-execute (plan Task 8); prove poison with a mock unit
+  test. Cached same-SQL success alone is insufficient.
+- **Connect-time isolation failure** must disconnect the new handle before
+  returning (§3.3); pool warmup/reconnect share `open_with_cache`.
 - **Isolation restore failure** must poison the transaction and mark the
   pooled lease broken / standalone connection unusable (§3.3).
 - **`None` default + override:** restore always sets a concrete level (CS if
@@ -519,8 +606,8 @@ async-native streaming / coroutine layer; pool health-stats accessor; separate
 `Logger` trait if downstream ever needs non-`tracing` sinks; seam getter for
 current isolation (unnecessary given CS-normalized restore).
 
-## 9. Implementation plan (next)
+## 9. Implementation plan
 
-After this revision is reviewed, invoke the writing-plans skill to produce a
-phased implementation plan under `docs/superpowers/plans/` with TDD tasks per
-workstream, aligned to the phase order in §4.
+Phased TDD plan (13 tasks, dependency order from §4):
+[`docs/superpowers/plans/2026-07-16-halcyon-rs-v0.1-parity-catchup.md`](../plans/2026-07-16-halcyon-rs-v0.1-parity-catchup.md)
+(rev aligned with design rev 5).
