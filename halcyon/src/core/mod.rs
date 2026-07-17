@@ -21,6 +21,7 @@ mod derive_tests;
 pub use column::FromColumn;
 pub use connection::{Connection, Statement};
 pub use params::{IntoParams, Named, Params};
+pub(crate) use result_set::FETCH_BLOCK_ROWS;
 pub use result_set::{FromRow, QueryMap, ResultSet, Row};
 pub use savepoint::Savepoint;
 pub use transaction::Transaction;

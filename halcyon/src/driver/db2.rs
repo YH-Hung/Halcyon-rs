@@ -371,6 +371,103 @@ fn get_binary(h: cli::SQLHANDLE, col: cli::SQLUSMALLINT) -> Result<Value> {
     Ok(Value::Bytes(out))
 }
 
+/// Temporary row-at-a-time bridge for `fetch_block`. Task 6 replaces this with
+/// rowset binding below the seam; keeping it private prevents the old protocol
+/// from leaking back above the driver boundary.
+fn read_current_column(h: cli::SQLHANDLE, index: usize) -> Result<Value> {
+    let col = (index + 1) as cli::SQLUSMALLINT;
+    let mut name = [0u8; 1];
+    let mut name_len: cli::SQLSMALLINT = 0;
+    let mut sql_type: cli::SQLSMALLINT = 0;
+    let mut col_size: cli::SQLULEN = 0;
+    let mut scale: cli::SQLSMALLINT = 0;
+    let mut nullable: cli::SQLSMALLINT = 0;
+    let rc = unsafe {
+        cli::SQLDescribeCol(
+            h,
+            col,
+            name.as_mut_ptr(),
+            name.len() as cli::SQLSMALLINT,
+            &mut name_len,
+            &mut sql_type,
+            &mut col_size,
+            &mut scale,
+            &mut nullable,
+        )
+    };
+    if !cli_ok(rc) {
+        return Err(make_error(
+            cli::SQL_HANDLE_STMT,
+            h,
+            ErrorCode::Unknown,
+            "SQLDescribeCol failed",
+        ));
+    }
+
+    match sql_type {
+        cli::SQL_SMALLINT | cli::SQL_INTEGER | cli::SQL_BIGINT => {
+            let mut v: i64 = 0;
+            let mut ind: cli::SQLLEN = 0;
+            let rc = unsafe {
+                cli::SQLGetData(
+                    h,
+                    col,
+                    cli::SQL_C_SBIGINT,
+                    (&mut v as *mut i64).cast(),
+                    std::mem::size_of::<i64>() as cli::SQLLEN,
+                    &mut ind,
+                )
+            };
+            if !cli_ok(rc) {
+                return Err(make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLGetData int failed",
+                ));
+            }
+            if ind == cli::SQL_NULL_DATA {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Int(v))
+            }
+        }
+        cli::SQL_REAL | cli::SQL_FLOAT | cli::SQL_DOUBLE => {
+            let mut v: f64 = 0.0;
+            let mut ind: cli::SQLLEN = 0;
+            let rc = unsafe {
+                cli::SQLGetData(
+                    h,
+                    col,
+                    cli::SQL_C_DOUBLE,
+                    (&mut v as *mut f64).cast(),
+                    std::mem::size_of::<f64>() as cli::SQLLEN,
+                    &mut ind,
+                )
+            };
+            if !cli_ok(rc) {
+                return Err(make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLGetData double failed",
+                ));
+            }
+            if ind == cli::SQL_NULL_DATA {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Double(v))
+            }
+        }
+        // Raw bytes: read as SQL_C_BINARY so embedded NULs survive.
+        cli::SQL_BINARY | cli::SQL_VARBINARY | cli::SQL_LONGVARBINARY | cli::SQL_BLOB => {
+            get_binary(h, col)
+        }
+        // CHAR/VARCHAR/DECIMAL/NUMERIC/TIMESTAMP/DATE/TIME → UTF-8 string.
+        _ => get_string(h, col),
+    }
+}
+
 impl CliDriver for Db2CliDriver {
     fn connect(&self, params: &ConnectionParams) -> Result<ConnectionHandle> {
         // A null env means SQLAllocHandle(SQL_HANDLE_ENV) failed at construction
@@ -905,122 +1002,49 @@ impl CliDriver for Db2CliDriver {
         Ok(String::from_utf8_lossy(&name[..len]).into_owned())
     }
 
-    fn fetch(&self, stmt: StatementHandle) -> Result<bool> {
+    fn fetch_block(&self, stmt: StatementHandle, max_rows: usize) -> Result<Vec<Vec<Value>>> {
         let Some(st) = self.stmt_state(stmt) else {
             return Err(unknown_stmt());
         };
-        let st = st.lock().unwrap_or_else(|p| p.into_inner());
-        let rc = unsafe { cli::SQLFetch(st.handle.0) };
-        if rc == cli::SQL_NO_DATA {
-            return Ok(false);
+        // A zero-sized request is explicitly allowed: it must not advance the
+        // native cursor, and its empty success value is indistinguishable from
+        // EOF only to a caller that chose not to request any rows.
+        if max_rows == 0 {
+            return Ok(Vec::new());
         }
-        if !cli_ok(rc) {
-            return Err(make_error(
-                cli::SQL_HANDLE_STMT,
-                st.handle.0,
-                ErrorCode::Unknown,
-                "SQLFetch failed",
-            ));
-        }
-        Ok(true)
-    }
-
-    fn get_column(&self, stmt: StatementHandle, index: usize) -> Result<Value> {
-        let Some(st) = self.stmt_state(stmt) else {
-            return Err(unknown_stmt());
-        };
         let st = st.lock().unwrap_or_else(|p| p.into_inner());
         let h = st.handle.0;
-        let col = (index + 1) as cli::SQLUSMALLINT;
-        let mut name = [0u8; 1];
-        let mut name_len: cli::SQLSMALLINT = 0;
-        let mut sql_type: cli::SQLSMALLINT = 0;
-        let mut col_size: cli::SQLULEN = 0;
-        let mut scale: cli::SQLSMALLINT = 0;
-        let mut nullable: cli::SQLSMALLINT = 0;
-        let rc = unsafe {
-            cli::SQLDescribeCol(
-                h,
-                col,
-                name.as_mut_ptr(),
-                name.len() as cli::SQLSMALLINT,
-                &mut name_len,
-                &mut sql_type,
-                &mut col_size,
-                &mut scale,
-                &mut nullable,
-            )
-        };
+        let mut columns: cli::SQLSMALLINT = 0;
+        let rc = unsafe { cli::SQLNumResultCols(h, &mut columns) };
         if !cli_ok(rc) {
             return Err(make_error(
                 cli::SQL_HANDLE_STMT,
                 h,
                 ErrorCode::Unknown,
-                "SQLDescribeCol failed",
+                "SQLNumResultCols failed",
             ));
         }
-
-        match sql_type {
-            cli::SQL_SMALLINT | cli::SQL_INTEGER | cli::SQL_BIGINT => {
-                let mut v: i64 = 0;
-                let mut ind: cli::SQLLEN = 0;
-                let rc = unsafe {
-                    cli::SQLGetData(
-                        h,
-                        col,
-                        cli::SQL_C_SBIGINT,
-                        (&mut v as *mut i64).cast(),
-                        std::mem::size_of::<i64>() as cli::SQLLEN,
-                        &mut ind,
-                    )
-                };
-                if !cli_ok(rc) {
-                    return Err(make_error(
-                        cli::SQL_HANDLE_STMT,
-                        h,
-                        ErrorCode::Unknown,
-                        "SQLGetData int failed",
-                    ));
-                }
-                if ind == cli::SQL_NULL_DATA {
-                    return Ok(Value::Null);
-                }
-                Ok(Value::Int(v))
+        let mut block = Vec::new();
+        while block.len() < max_rows {
+            let rc = unsafe { cli::SQLFetch(h) };
+            if rc == cli::SQL_NO_DATA {
+                break;
             }
-            cli::SQL_REAL | cli::SQL_FLOAT | cli::SQL_DOUBLE => {
-                let mut v: f64 = 0.0;
-                let mut ind: cli::SQLLEN = 0;
-                let rc = unsafe {
-                    cli::SQLGetData(
-                        h,
-                        col,
-                        cli::SQL_C_DOUBLE,
-                        (&mut v as *mut f64).cast(),
-                        std::mem::size_of::<f64>() as cli::SQLLEN,
-                        &mut ind,
-                    )
-                };
-                if !cli_ok(rc) {
-                    return Err(make_error(
-                        cli::SQL_HANDLE_STMT,
-                        h,
-                        ErrorCode::Unknown,
-                        "SQLGetData double failed",
-                    ));
-                }
-                if ind == cli::SQL_NULL_DATA {
-                    return Ok(Value::Null);
-                }
-                Ok(Value::Double(v))
+            if !cli_ok(rc) {
+                return Err(make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLFetch failed",
+                ));
             }
-            // Raw bytes: read as SQL_C_BINARY so embedded NULs survive (a
-            // SQL_C_CHAR read would truncate at the first 0x00).
-            cli::SQL_BINARY | cli::SQL_VARBINARY | cli::SQL_LONGVARBINARY | cli::SQL_BLOB => {
-                get_binary(h, col)
+            let mut row = Vec::with_capacity(columns.max(0) as usize);
+            for index in 0..columns.max(0) as usize {
+                row.push(read_current_column(h, index)?);
             }
-            // CHAR/VARCHAR/DECIMAL/NUMERIC/TIMESTAMP/DATE/TIME → UTF-8 string.
-            _ => get_string(h, col),
+            block.push(row);
         }
+        Ok(block)
     }
 
     fn finalize(&self, stmt: StatementHandle) -> Result<()> {
@@ -1171,7 +1195,7 @@ mod tests {
             ErrorCode::Unknown
         );
         assert_eq!(d.execute(stmt).unwrap_err().code, ErrorCode::Unknown);
-        assert_eq!(d.fetch(stmt).unwrap_err().code, ErrorCode::Unknown);
+        assert_eq!(d.fetch_block(stmt, 1).unwrap_err().code, ErrorCode::Unknown);
         assert_eq!(d.column_count(stmt).unwrap_err().code, ErrorCode::Unknown);
     }
 

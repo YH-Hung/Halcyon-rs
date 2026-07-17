@@ -96,11 +96,11 @@ pub trait CliDriver: Send + Sync {
     /// Name of the 0-based column (may be empty for unnamed expressions).
     fn column_name(&self, stmt: StatementHandle, index: usize) -> Result<String>;
 
-    /// Advances the cursor. `true` => a row is available; `false` => end.
-    fn fetch(&self, stmt: StatementHandle) -> Result<bool>;
-
-    /// Reads the current row's 0-based column as a neutral [`Value`].
-    fn get_column(&self, stmt: StatementHandle, index: usize) -> Result<Value>;
+    /// Fetches up to `max_rows` rows from the open cursor as row-major neutral
+    /// [`Value`]s. A non-empty (including short) block is success; an empty
+    /// block means the cursor is exhausted. Driver failures are classified and
+    /// returned as errors.
+    fn fetch_block(&self, stmt: StatementHandle, max_rows: usize) -> Result<Vec<Vec<Value>>>;
 
     /// Releases a statement handle. Idempotent for already-finalized handles.
     fn finalize(&self, stmt: StatementHandle) -> Result<()>;

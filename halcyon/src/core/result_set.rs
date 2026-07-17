@@ -1,92 +1,52 @@
 //! The streaming result cursor and its row view.
 //!
-//! [`ResultSet`] is a forward-only cursor over an executed statement, ported
-//! from the C++ `ResultSet`. It is driven one row at a time by [`ResultSet::next`]
-//! (a lending cursor — each [`Row`] borrows the set, so only one row is live at a
-//! time and no per-row allocation is forced). A driver-side failure mid-scan —
-//! whether a `fetch` or a column read — is surfaced, never collapsed into
-//! end-of-cursor: the failing call returns the error and [`ResultSet::error`]
-//! retains it, the signal the pool layer uses to discard a dropped connection.
-//! A client-side mapping error (wrong target type, NULL into a non-`Option`) is
-//! *not* recorded — it doesn't mean the connection is bad.
-//!
-//! For idiomatic iteration, [`ResultSet::query_map`] adapts the cursor into an
-//! `Iterator` of owned `Result<T>` (sidestepping the lending borrow), and
-//! [`ResultSet::collect_rows`] materializes all rows via [`FromRow`].
+//! [`ResultSet`] is a forward-only lending cursor over an executed statement,
+//! ported from the C++ `ResultSet`. It requests row-major [`Value`] blocks from
+//! the portable driver seam and retains one block at a time. An empty block is
+//! clean EOF; a driver failure is retained so the owning statement/connection
+//! is poisoned on drop. Mapping a buffered value is client-side and never
+//! poisons the connection.
 
-use std::cell::RefCell;
 use std::fmt;
 use std::marker::PhantomData;
 
 use crate::core::column::FromColumn;
 use crate::core::connection::Statement;
 use crate::core::mapping;
-use crate::driver::{CliDriver, StatementHandle};
 use crate::error::{Error, Result};
+use crate::value::Value;
 
-/// Non-owning view of the cursor's current row. Read one column with
+/// Rows requested on each portable driver call. Drivers may return a smaller
+/// block for byte-budget or transport reasons; only an empty block is EOF.
+pub(crate) const FETCH_BLOCK_ROWS: usize = 4096;
+
+/// Non-owning view of one materialized cursor row. Read a column with
 /// [`Row::column`], or map the whole row to a tuple with [`Row::get`]. Valid
 /// only while it is the live row of its [`ResultSet`].
 pub struct Row<'a> {
-    driver: &'a dyn CliDriver,
-    stmt: StatementHandle,
-    columns: usize,
-    // The owning cursor's error slot, so a driver-side read failure is recorded
-    // there (mirrors the C++ `Row::record_read_error` -> `note_column_error`).
-    errors: &'a RefCell<Option<Error>>,
+    cells: &'a [Value],
 }
 
 impl<'a> Row<'a> {
-    /// Builds a row view over the cursor's current row. Used by [`ResultSet`] and
-    /// by the facade's owned pooled cursor, both of which drive the same
-    /// lending-cursor protocol; `errors` is the owning cursor's poison slot.
-    pub(crate) fn new(
-        driver: &'a dyn CliDriver,
-        stmt: StatementHandle,
-        columns: usize,
-        errors: &'a RefCell<Option<Error>>,
-    ) -> Self {
-        Row {
-            driver,
-            stmt,
-            columns,
-            errors,
-        }
+    /// Builds a view over already-materialized row values. Used by the core and
+    /// pooled cursor implementations after successful `fetch_block` calls.
+    pub(crate) fn new(cells: &'a [Value]) -> Self {
+        Row { cells }
     }
-}
 
-impl Row<'_> {
     pub fn column_count(&self) -> usize {
-        self.columns
+        self.cells.len()
     }
 
-    /// Reads the 0-based `index` column as `T`. `Mapping` error on a bad index,
-    /// a type mismatch, or NULL into a non-`Option` target.
-    ///
-    /// A driver-side read failure (e.g. a connection drop during `SQLGetData`) is
-    /// recorded on the owning [`ResultSet`] — see [`ResultSet::error`] — as well
-    /// as returned; a client-side mapping error is only returned.
+    /// Reads the 0-based `index` column as `T`. Mapping errors are local to the
+    /// caller: the driver already returned the entire block successfully.
     pub fn column<T: FromColumn>(&self, index: usize) -> Result<T> {
-        if index >= self.columns {
-            // Client-side misuse, not a driver failure: return but don't record.
-            return Err(mapping(format!(
+        let value = self.cells.get(index).cloned().ok_or_else(|| {
+            mapping(format!(
                 "column index {index} out of range (row has {} columns)",
-                self.columns
-            )));
-        }
-        let value = match self.driver.get_column(self.stmt, index) {
-            Ok(v) => v,
-            Err(e) => {
-                // Driver-side read failure: poison the cursor so the pool can
-                // discard the connection. A `from_column` mapping error below is
-                // client-side and deliberately left unrecorded (as in C++).
-                let mut slot = self.errors.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(e.clone());
-                }
-                return Err(e);
-            }
-        };
+                self.cells.len()
+            ))
+        })?;
         T::from_column(value)
     }
 
@@ -100,8 +60,7 @@ impl Row<'_> {
 impl fmt::Debug for Row<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Row")
-            .field("stmt", &self.stmt)
-            .field("columns", &self.columns)
+            .field("columns", &self.cells.len())
             .finish_non_exhaustive()
     }
 }
@@ -147,9 +106,9 @@ impl_from_row_tuple!(12; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10,
 pub struct ResultSet<'c> {
     stmt: Statement<'c>,
     columns: usize,
-    // `RefCell` so a `Row` (which holds only a shared `&self`) can record a
-    // driver-side read failure here without the cursor being borrowed mutably.
-    error: RefCell<Option<Error>>,
+    block: Vec<Vec<Value>>,
+    position: usize,
+    error: Option<Error>,
     done: bool,
 }
 
@@ -160,7 +119,9 @@ impl<'c> ResultSet<'c> {
         ResultSet {
             stmt,
             columns,
-            error: RefCell::new(None),
+            block: Vec::new(),
+            position: 0,
+            error: None,
             done: false,
         }
     }
@@ -169,61 +130,58 @@ impl<'c> ResultSet<'c> {
         self.columns
     }
 
-    /// The driver-side failure that spoiled the scan, if any: empty after a clean
-    /// end, set after a mid-stream `fetch` or column-read error. Distinguishes a
-    /// clean end-of-cursor from a Db2 error, and is the signal the pool uses to
-    /// discard the connection. Client-side mapping errors are not recorded here.
+    /// The driver-side failure that spoiled the scan, if any: empty after a
+    /// clean end, set after a mid-stream block-fetch failure. Client-side
+    /// mapping errors are not recorded here.
     pub fn error(&self) -> Option<Error> {
-        self.error.borrow().clone()
+        self.error.clone()
     }
 
     /// Records a driver-side failure, keeping the first one seen.
-    fn poison(&self, e: &Error) {
-        let mut slot = self.error.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(e.clone());
+    fn poison(&mut self, e: Error) {
+        if self.error.is_none() {
+            self.error = Some(e);
         }
     }
 
-    /// Advances to the next row. `Ok(Some(row))` while rows remain, `Ok(None)` at
-    /// a clean end, `Err` on a mid-stream fetch failure (also retained in
+    /// Advances to the next row. `Ok(Some(row))` while rows remain, `Ok(None)`
+    /// at a clean end, `Err` on a block-fetch failure (also retained in
     /// [`error`](ResultSet::error)). Once it yields `None`/`Err` it stays done.
     ///
-    /// (See the `Drop` impl below: a recorded driver-side failure also poisons
-    /// the statement so a cached prepared statement is dropped, not reused.)
-    ///
     /// Not an [`Iterator`]: the yielded [`Row`] borrows the cursor (a lending
-    /// iterator), which `std::iter::Iterator` can't express — use `while let` here
-    /// or [`query_map`](ResultSet::query_map) for owned-item iteration.
+    /// iterator), which `std::iter::Iterator` can't express — use `while let` or
+    /// [`query_map`](ResultSet::query_map) for owned-item iteration.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Row<'_>>> {
         if self.done {
             return Ok(None);
         }
-        let handle = self.stmt.handle();
-        match self.stmt.driver_ref().fetch(handle) {
-            Ok(true) => Ok(Some(Row {
-                driver: self.stmt.driver_ref(),
-                stmt: handle,
-                columns: self.columns,
-                errors: &self.error,
-            })),
-            Ok(false) => {
-                self.done = true;
-                Ok(None)
-            }
-            Err(e) => {
-                self.done = true;
-                self.poison(&e);
-                Err(e)
+        if self.position == self.block.len() {
+            let handle = self.stmt.handle();
+            match self.stmt.driver_ref().fetch_block(handle, FETCH_BLOCK_ROWS) {
+                Ok(block) if block.is_empty() => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                Ok(block) => {
+                    self.block = block;
+                    self.position = 0;
+                }
+                Err(e) => {
+                    self.done = true;
+                    self.poison(e.clone());
+                    return Err(e);
+                }
             }
         }
+
+        let row = Row::new(&self.block[self.position]);
+        self.position += 1;
+        Ok(Some(row))
     }
 
-    /// Adapts the cursor into an `Iterator` of owned `Result<T>`, mapping each row
-    /// with `f`. Because each item is owned, this composes with `for`/`.collect()`
-    /// despite the lending cursor underneath. A mid-stream error appears as a
-    /// final `Err` item, after which the iterator ends.
+    /// Adapts the cursor into an `Iterator` of owned `Result<T>`, mapping each
+    /// row with `f`. A mid-stream error appears as a final `Err` item.
     pub fn query_map<T, F>(self, f: F) -> QueryMap<'c, T, F>
     where
         F: FnMut(&Row<'_>) -> Result<T>,
@@ -235,8 +193,8 @@ impl<'c> ResultSet<'c> {
         }
     }
 
-    /// Materializes all remaining rows via [`FromRow`]. A mid-stream error (fetch
-    /// or mapping) short-circuits to `Err`.
+    /// Materializes all remaining rows via [`FromRow`]. A mid-stream driver
+    /// error or client-side mapping error short-circuits to `Err`.
     pub fn collect_rows<T: FromRow>(&mut self) -> Result<Vec<T>> {
         let mut out = Vec::new();
         while let Some(row) = self.next()? {
@@ -248,12 +206,9 @@ impl<'c> ResultSet<'c> {
 
 impl Drop for ResultSet<'_> {
     fn drop(&mut self) {
-        // A driver-side scan failure (fetch or column read) may leave the
-        // handle mid-cursor in a bad state: poison the statement so a cached
-        // entry is finalized and dropped on release, not reused (C++ spec §5).
-        // Client-side mapping errors are never recorded here, so they don't
-        // poison.
-        if self.error.borrow().is_some() {
+        // A driver-side block-fetch failure may leave the handle mid-cursor:
+        // poison the statement so a cached entry is finalized, not reused.
+        if self.error.is_some() {
             self.stmt.poison();
         }
     }

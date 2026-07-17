@@ -159,10 +159,6 @@ fn stale() -> Error {
     e.retriable = true;
     e
 }
-fn mapping() -> Error {
-    Error::new(ErrorCode::Mapping, "column index out of range")
-}
-
 fn sleep_us(us: i64) {
     if us > 0 {
         std::thread::sleep(std::time::Duration::from_micros(us as u64));
@@ -279,7 +275,7 @@ impl CliDriver for ConcurrentFakeDriver {
         Ok("c0".into())
     }
 
-    fn fetch(&self, stmt: StatementHandle) -> Result<bool> {
+    fn fetch_block(&self, stmt: StatementHandle, max_rows: usize) -> Result<Vec<Vec<Value>>> {
         let mut g = self.state.lock().unwrap();
         let conn = match g.stmts.get(&stmt.0) {
             Some(s) => s.conn,
@@ -289,16 +285,11 @@ impl CliDriver for ConcurrentFakeDriver {
             return Err(stale());
         }
         let s = g.stmts.get_mut(&stmt.0).unwrap();
-        s.position += 1;
-        Ok(s.position < 1) // exactly one row
-    }
-
-    fn get_column(&self, stmt: StatementHandle, index: usize) -> Result<Value> {
-        let g = self.state.lock().unwrap();
-        match g.stmts.get(&stmt.0) {
-            Some(s) if s.position == 0 && index == 0 => Ok(Value::Int(encoded_value(&s.sql))),
-            _ => Err(mapping()),
+        if max_rows == 0 || s.position >= 0 {
+            return Ok(Vec::new()); // empty is clean EOF
         }
+        s.position = 0;
+        Ok(vec![vec![Value::Int(encoded_value(&s.sql))]]) // exactly one row
     }
 
     fn finalize(&self, stmt: StatementHandle) -> Result<()> {
@@ -361,9 +352,8 @@ mod tests {
         d.bind_params(s, &[]).unwrap();
         assert_eq!(d.execute(s).unwrap(), 0); // SELECT reports 0 affected
         assert_eq!(d.column_count(s).unwrap(), 1);
-        assert!(d.fetch(s).unwrap()); // one row
-        assert_eq!(d.get_column(s, 0).unwrap(), Value::Int(7));
-        assert!(!d.fetch(s).unwrap()); // end of cursor
+        assert_eq!(d.fetch_block(s, 4096).unwrap(), vec![vec![Value::Int(7)]]);
+        assert!(d.fetch_block(s, 4096).unwrap().is_empty()); // end of cursor
     }
 
     #[test]
@@ -375,8 +365,7 @@ mod tests {
         let c = d.connect(&params()).unwrap();
         let s = d.prepare(c, "SELECT 5 FROM SYSIBM.SYSDUMMY1").unwrap();
         assert_eq!(d.execute(s).unwrap(), 0);
-        assert!(d.fetch(s).unwrap());
-        assert_eq!(d.get_column(s, 0).unwrap(), Value::Int(5));
+        assert_eq!(d.fetch_block(s, 4096).unwrap(), vec![vec![Value::Int(5)]]);
     }
 
     #[test]

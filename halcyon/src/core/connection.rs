@@ -514,8 +514,10 @@ mod tests {
     fn mid_stream_fetch_error_is_surfaced_not_dropped() {
         let mock = Arc::new(MockCliDriver::new());
         mock.push_result_set(users_grid());
-        // First row fetches OK; the second fetch errors.
-        mock.fail_fetch_on_call(2, {
+        // Force one row per block so the second block fetch fails before the
+        // second row can be handed to the caller.
+        mock.set_fetch_block_size(1);
+        mock.fail_fetch_block_on_call(2, {
             let mut e = Error::new(ErrorCode::Connection, "boom");
             e.retriable = true;
             e
@@ -536,24 +538,50 @@ mod tests {
     }
 
     #[test]
-    fn mid_stream_column_read_error_poisons_the_cursor() {
+    fn midstream_fetch_block_error_poisons_cursor() {
         let mock = Arc::new(MockCliDriver::new());
         mock.push_result_set(users_grid());
-        // The first get_column (column 0 of the first row) fails as a driver
-        // error, e.g. a connection drop during SQLGetData.
-        mock.fail_get_column_on_call(1, Error::new(ErrorCode::Connection, "dropped mid-read"));
+        mock.set_fetch_block_size(1);
+        mock.fail_fetch_block_on_call(
+            2,
+            Error::new(ErrorCode::Connection, "dropped mid-fetch-block"),
+        );
         let conn = connect(&mock);
         let mut rs = conn.query("SELECT id, name FROM u", ()).unwrap();
 
-        // The read propagates the driver error to the caller...
-        let code = {
-            let row = rs.next().unwrap().unwrap();
-            row.column::<i64>(0).unwrap_err().code
-        };
-        assert_eq!(code, ErrorCode::Connection);
-        // ...and, unlike a plain mapping error, it is retained on the cursor so
-        // the pool can discard the connection (mirrors C++ note_column_error).
+        assert!(rs.next().unwrap().is_some());
+        let error = rs.next().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Connection);
+        // A block-fetch failure is retained so the pool can discard the
+        // connection. Mapping rows from buffered Values never poisons it.
         assert_eq!(rs.error().map(|e| e.code), Some(ErrorCode::Connection));
+    }
+
+    #[test]
+    fn fetch_block_empty_means_eof() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(["id"], vec![]));
+        let conn = connect(&mock);
+        let mut rs = conn.query("SELECT id FROM u", ()).unwrap();
+
+        assert!(rs.next().unwrap().is_none());
+        assert!(rs.error().is_none());
+        assert_eq!(mock.fetch_block_calls(), 1);
+    }
+
+    #[test]
+    fn fetch_block_short_block_then_empty() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(users_grid());
+        // The portable cursor asks for 4096; a smaller successful block is not
+        // EOF and it must make one more call to observe the empty EOF block.
+        mock.set_fetch_block_size(2);
+        let conn = connect(&mock);
+        let mut rs = conn.query("SELECT id, name FROM u", ()).unwrap();
+
+        let rows = rs.collect_rows::<(i64, String)>().unwrap();
+        assert_eq!(rows, vec![(1, "ada".into()), (2, "bob".into())]);
+        assert_eq!(mock.fetch_block_requests(), vec![4096, 4096]);
     }
 
     #[test]
@@ -759,7 +787,7 @@ mod tests {
         let mock = Arc::new(MockCliDriver::new());
         mock.push_result_set(users_grid());
         mock.push_result_set(users_grid());
-        mock.fail_fetch_on_call(1, Error::new(ErrorCode::Connection, "boom"));
+        mock.fail_fetch_block_on_call(1, Error::new(ErrorCode::Connection, "boom"));
         let conn = connect_cached(&mock, 8);
         {
             let mut rs = conn.query("SELECT id, name FROM u", ()).unwrap();

@@ -19,7 +19,7 @@
 //! Because a lease holds an `Arc` on the pool internals, either wrapper may
 //! safely outlive every `Database` handle.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use std::thread;
 use crate::core::{
     auto_savepoint, named_savepoint, nested_savepoint, start_with_isolation, terminate, Connection,
     FromRow, IntoParams, IsolationBegin, Params, ResultSet, Row, Savepoint, SavepointOwner,
-    SavepointState, StmtLease,
+    SavepointState, StmtLease, FETCH_BLOCK_ROWS,
 };
 use crate::driver::{CliDriver, ConnectionParams, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
@@ -357,9 +357,11 @@ pub struct QueryResult {
     /// Copied handle for fetch/read calls (infallible access).
     stmt: StatementHandle,
     columns: usize,
-    // The cursor's poison slot: a driver-side read failure is recorded here (as
-    // in `ResultSet`), and it decides whether the lease is discarded on drop.
-    error: RefCell<Option<Error>>,
+    // A driver-side block-fetch failure is recorded here and decides whether
+    // the statement/lease is discarded on drop.
+    error: Option<Error>,
+    block: Vec<Vec<Value>>,
+    position: usize,
     done: bool,
 }
 
@@ -371,7 +373,9 @@ impl QueryResult {
             stmt_lease: Some(stmt_lease),
             stmt,
             columns,
-            error: RefCell::new(None),
+            error: None,
+            block: Vec::new(),
+            position: 0,
             done: false,
         }
     }
@@ -383,39 +387,43 @@ impl QueryResult {
     /// The driver-side failure that spoiled the scan, if any — the signal used to
     /// discard the leased connection on drop. Empty after a clean end.
     pub fn error(&self) -> Option<Error> {
-        self.error.borrow().clone()
+        self.error.clone()
     }
 
     /// Advances to the next row. `Ok(Some(row))` while rows remain, `Ok(None)` at
-    /// a clean end, `Err` on a mid-stream fetch failure (also retained in
+    /// a clean end, `Err` on a mid-stream block-fetch failure (also retained in
     /// [`error`](Self::error)). Once it yields `None`/`Err` it stays done.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Row<'_>>> {
         if self.done {
             return Ok(None);
         }
-        let stmt = self.stmt;
-        match self.lease.driver_ref().fetch(stmt) {
-            Ok(true) => Ok(Some(Row::new(
-                self.lease.driver_ref(),
-                stmt,
-                self.columns,
-                &self.error,
-            ))),
-            Ok(false) => {
-                self.done = true;
-                Ok(None)
-            }
-            Err(e) => {
-                self.done = true;
-                let mut slot = self.error.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(e.clone());
+        if self.position == self.block.len() {
+            match self
+                .lease
+                .driver_ref()
+                .fetch_block(self.stmt, FETCH_BLOCK_ROWS)
+            {
+                Ok(block) if block.is_empty() => {
+                    self.done = true;
+                    return Ok(None);
                 }
-                drop(slot);
-                Err(e)
+                Ok(block) => {
+                    self.block = block;
+                    self.position = 0;
+                }
+                Err(e) => {
+                    self.done = true;
+                    if self.error.is_none() {
+                        self.error = Some(e.clone());
+                    }
+                    return Err(e);
+                }
             }
         }
+        let row = Row::new(&self.block[self.position]);
+        self.position += 1;
+        Ok(Some(row))
     }
 
     /// Materializes all remaining rows via [`FromRow`]. A mid-stream error (fetch
@@ -438,14 +446,13 @@ impl Drop for QueryResult {
             // Any driver-side scan failure poisons the statement so its cache
             // entry is dropped; a connection-class one additionally discards
             // the whole connection below.
-            if self.error.borrow().is_some() {
+            if self.error.is_some() {
                 stmt_lease.poison();
             }
             self.lease.release_stmt(stmt_lease);
         }
         let broken = self
             .error
-            .borrow()
             .as_ref()
             .is_some_and(|e| e.code == ErrorCode::Connection);
         if broken {
@@ -1116,13 +1123,14 @@ mod tests {
             ["id"],
             vec![vec![Value::Int(1)], vec![Value::Int(2)]],
         ));
-        // The second fetch drops the connection.
-        mock.fail_fetch_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-scan"));
+        // The second block fetch drops the connection.
+        mock.set_fetch_block_size(1);
+        mock.fail_fetch_block_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-scan"));
         let db = open(&mock);
         {
             let mut rs = db.query("SELECT id FROM t", ()).unwrap();
             assert!(rs.next().unwrap().is_some()); // row 1
-            let err = rs.next().unwrap_err(); // fetch 2 fails
+            let err = rs.next().unwrap_err(); // block fetch 2 fails
             assert_eq!(err.code, ErrorCode::Connection);
             assert_eq!(rs.error().map(|e| e.code), Some(ErrorCode::Connection));
         } // cursor drops → lease discarded (not returned)
@@ -1138,8 +1146,9 @@ mod tests {
             ["id"],
             vec![vec![Value::Int(1)], vec![Value::Int(2)]],
         ));
-        // The second fetch inside the transaction drops the connection.
-        mock.fail_fetch_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-scan"));
+        // The second block fetch inside the transaction drops the connection.
+        mock.set_fetch_block_size(1);
+        mock.fail_fetch_block_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-scan"));
         let db = open(&mock);
         let out: Result<()> = db.transaction(|tx| {
             let mut rs = tx.query("SELECT id FROM t", ())?;
@@ -1161,7 +1170,7 @@ mod tests {
         let mock = Arc::new(MockCliDriver::new());
         mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(1)]]));
         // The materializing read fails with a connection-class error.
-        mock.fail_fetch_on_call(1, Error::new(ErrorCode::Connection, "dropped"));
+        mock.fail_fetch_block_on_call(1, Error::new(ErrorCode::Connection, "dropped"));
         let db = open(&mock);
         let out: Result<Vec<(i64,)>> = db.transaction(|tx| tx.query_as("SELECT id FROM t", ()));
         assert_eq!(out.unwrap_err().code, ErrorCode::Connection);
@@ -1197,7 +1206,8 @@ mod tests {
             ["id"],
             vec![vec![Value::Int(1)], vec![Value::Int(2)]],
         ));
-        mock.fail_fetch_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-scan"));
+        mock.set_fetch_block_size(1);
+        mock.fail_fetch_block_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-scan"));
         let db = open(&mock);
         let out = db.transaction(|tx| {
             tx.query("SELECT id FROM t", ())?

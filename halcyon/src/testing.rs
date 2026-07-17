@@ -25,7 +25,7 @@ use crate::value::Value;
 use crate::Isolation;
 
 /// A scripted result grid that [`execute`](CliDriver::execute) attaches to a
-/// statement's cursor; `fetch`/`get_column` then walk it row by row.
+/// statement's cursor; `fetch_block` then returns it as row-major blocks.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptedRows {
     pub columns: Vec<String>,
@@ -56,7 +56,7 @@ pub enum TxnEvent {
 }
 
 /// Per-statement record: the SQL it was prepared with, the last bound params,
-/// the attached cursor, and the fetch position (`-1` before the first fetch).
+/// the attached cursor, and the next unread row (`-1` before the first block).
 #[derive(Debug, Default)]
 struct StmtState {
     #[allow(dead_code)] // recorded for tests that assert on prepared SQL per handle
@@ -91,13 +91,12 @@ struct State {
     execute_batch_calls: u32,
     last_batch_rows: Vec<Vec<Value>>,
 
-    // --- fetch / get_column error injection ---
-    fetch_error: Option<Error>,
-    fail_fetch_on_call: u32, // 1-based fetch() index to fail at; 0 = never
-    fetch_calls: u32,
-    get_column_error: Option<Error>,
-    fail_get_column_on_call: u32, // 1-based get_column() index; 0 = never
-    get_column_calls: u32,
+    // --- block-fetch scripting ---
+    fetch_block_error: Option<Error>,
+    fail_fetch_block_on_call: u32, // 1-based fetch_block() index; 0 = never
+    fetch_block_calls: u32,
+    fetch_block_size: usize, // 0 => caller's max_rows; >0 => cap per call
+    fetch_block_requests: Vec<usize>,
 
     // --- finalize / close_cursor ---
     finalize_calls: u32,
@@ -232,22 +231,19 @@ impl MockCliDriver {
         self
     }
 
-    /// Makes the `call_index`-th (1-based) `fetch` fail with `e`.
-    pub fn fail_fetch_on_call(&self, call_index: u32, e: Error) -> &Self {
+    /// Makes the `call_index`-th (1-based) `fetch_block` fail with `e`.
+    pub fn fail_fetch_block_on_call(&self, call_index: u32, e: Error) -> &Self {
         let mut s = self.lock();
-        s.fail_fetch_on_call = call_index;
-        s.fetch_error = Some(e);
+        s.fail_fetch_block_on_call = call_index;
+        s.fetch_block_error = Some(e);
         drop(s);
         self
     }
 
-    /// Makes the `call_index`-th (1-based) `get_column` fail with `e` — e.g. a
-    /// connection drop mid-`SQLGetData`.
-    pub fn fail_get_column_on_call(&self, call_index: u32, e: Error) -> &Self {
-        let mut s = self.lock();
-        s.fail_get_column_on_call = call_index;
-        s.get_column_error = Some(e);
-        drop(s);
+    /// Caps successful blocks to `rows`, allowing portable-layer tests to make
+    /// multiple block requests without fabricating driver behavior.
+    pub fn set_fetch_block_size(&self, rows: usize) -> &Self {
+        self.lock().fetch_block_size = rows;
         self
     }
 
@@ -310,11 +306,11 @@ impl MockCliDriver {
     pub fn transaction_events(&self) -> Vec<TxnEvent> {
         self.lock().transaction_events.clone()
     }
-    pub fn fetch_calls(&self) -> u32 {
-        self.lock().fetch_calls
+    pub fn fetch_block_calls(&self) -> u32 {
+        self.lock().fetch_block_calls
     }
-    pub fn get_column_calls(&self) -> u32 {
-        self.lock().get_column_calls
+    pub fn fetch_block_requests(&self) -> Vec<usize> {
+        self.lock().fetch_block_requests.clone()
     }
 }
 
@@ -421,35 +417,25 @@ impl CliDriver for MockCliDriver {
             .ok_or_else(range_error)
     }
 
-    fn fetch(&self, stmt: StatementHandle) -> Result<bool> {
+    fn fetch_block(&self, stmt: StatementHandle, max_rows: usize) -> Result<Vec<Vec<Value>>> {
         let mut s = self.lock();
-        s.fetch_calls += 1;
-        if s.fail_fetch_on_call != 0 && s.fetch_calls == s.fail_fetch_on_call {
-            return Err(s
-                .fetch_error
-                .clone()
-                .unwrap_or_else(|| Error::new(ErrorCode::Unknown, "scripted fetch failure")));
+        s.fetch_block_calls += 1;
+        s.fetch_block_requests.push(max_rows);
+        if s.fail_fetch_block_on_call != 0 && s.fetch_block_calls == s.fail_fetch_block_on_call {
+            return Err(s.fetch_block_error.clone().unwrap_or_else(|| {
+                Error::new(ErrorCode::Unknown, "scripted fetch_block failure")
+            }));
         }
+        let limit = match s.fetch_block_size {
+            0 => max_rows,
+            cap => cap.min(max_rows),
+        };
         let st = s.statements.get_mut(&stmt.0).ok_or_else(unknown_stmt)?;
-        st.position += 1;
-        Ok(st.position < st.cursor.rows.len() as i64)
-    }
-
-    fn get_column(&self, stmt: StatementHandle, index: usize) -> Result<Value> {
-        let mut s = self.lock();
-        s.get_column_calls += 1;
-        if s.fail_get_column_on_call != 0 && s.get_column_calls == s.fail_get_column_on_call {
-            return Err(s
-                .get_column_error
-                .clone()
-                .unwrap_or_else(|| Error::new(ErrorCode::Unknown, "scripted get_column failure")));
-        }
-        let st = s.statements.get(&stmt.0).ok_or_else(unknown_stmt)?;
-        if st.position < 0 || st.position >= st.cursor.rows.len() as i64 {
-            return Err(range_error());
-        }
-        let row = &st.cursor.rows[st.position as usize];
-        row.get(index).cloned().ok_or_else(range_error)
+        let start = (st.position + 1) as usize;
+        let end = start.saturating_add(limit).min(st.cursor.rows.len());
+        let block = st.cursor.rows[start..end].to_vec();
+        st.position = end as i64 - 1;
+        Ok(block)
     }
 
     fn finalize(&self, stmt: StatementHandle) -> Result<()> {
@@ -582,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_attaches_result_set_and_cursor_walks_rows() {
+    fn fetch_block_returns_rows_then_empty_eof() {
         let m = MockCliDriver::new();
         let c = m.connect(&conn_params()).unwrap();
         let s = m.prepare(c, "SELECT id, name FROM t").unwrap();
@@ -597,25 +583,37 @@ mod tests {
         assert_eq!(m.column_count(s).unwrap(), 2);
         assert_eq!(m.column_name(s, 1).unwrap(), "name");
 
-        assert!(m.fetch(s).unwrap());
-        assert_eq!(m.get_column(s, 0).unwrap(), Value::Int(1));
-        assert_eq!(m.get_column(s, 1).unwrap(), Value::Text("a".into()));
-        assert!(m.fetch(s).unwrap());
-        assert_eq!(m.get_column(s, 0).unwrap(), Value::Int(2));
-        assert!(!m.fetch(s).unwrap()); // exhausted
+        let block = m.fetch_block(s, 100).unwrap();
+        assert_eq!(
+            block,
+            vec![
+                vec![Value::Int(1), Value::Text("a".into())],
+                vec![Value::Int(2), Value::Text("b".into())],
+            ]
+        );
+        assert!(m.fetch_block(s, 100).unwrap().is_empty()); // exhausted
     }
 
     #[test]
-    fn get_column_before_fetch_or_out_of_range_is_mapping_error() {
+    fn fetch_block_honors_max_rows_and_resumes() {
         let m = MockCliDriver::new();
         let c = m.connect(&conn_params()).unwrap();
         let s = m.prepare(c, "SELECT id FROM t").unwrap();
-        m.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(7)]]));
+        m.push_result_set(ScriptedRows::new(
+            ["id"],
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+            ],
+        ));
         m.execute(s).unwrap();
-        // Before the first fetch, position is -1.
-        assert_eq!(m.get_column(s, 0).unwrap_err().code, ErrorCode::Mapping);
-        assert!(m.fetch(s).unwrap());
-        assert_eq!(m.get_column(s, 5).unwrap_err().code, ErrorCode::Mapping);
+        assert_eq!(
+            m.fetch_block(s, 2).unwrap(),
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+        );
+        assert_eq!(m.fetch_block(s, 2).unwrap(), vec![vec![Value::Int(3)]]);
+        assert!(m.fetch_block(s, 2).unwrap().is_empty());
     }
 
     #[test]
@@ -631,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_error_injection_fires_on_the_nth_call() {
+    fn fetch_block_error_injection_fires_on_the_nth_call() {
         let m = MockCliDriver::new();
         let c = m.connect(&conn_params()).unwrap();
         let s = m.prepare(c, "SELECT id FROM t").unwrap();
@@ -640,9 +638,13 @@ mod tests {
             vec![vec![Value::Int(1)], vec![Value::Int(2)]],
         ));
         m.execute(s).unwrap();
-        m.fail_fetch_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-scan"));
-        assert!(m.fetch(s).unwrap()); // call 1 ok
-        assert_eq!(m.fetch(s).unwrap_err().code, ErrorCode::Connection); // call 2 fails
+        m.set_fetch_block_size(1);
+        m.fail_fetch_block_on_call(2, Error::new(ErrorCode::Connection, "dropped mid-scan"));
+        assert_eq!(m.fetch_block(s, 100).unwrap(), vec![vec![Value::Int(1)]]); // call 1 ok
+        assert_eq!(
+            m.fetch_block(s, 100).unwrap_err().code,
+            ErrorCode::Connection
+        ); // call 2 fails
     }
 
     #[test]
@@ -671,11 +673,11 @@ mod tests {
         let s = m.prepare(c, "SELECT id FROM t").unwrap();
         m.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(1)]]));
         m.execute(s).unwrap();
-        assert!(m.fetch(s).unwrap());
+        assert_eq!(m.fetch_block(s, 1).unwrap(), vec![vec![Value::Int(1)]]);
         m.close_cursor(s).unwrap();
         assert_eq!(m.close_cursor_calls(), 1);
-        // After reset, fetch starts over from the top.
-        assert!(m.fetch(s).unwrap());
+        // After reset, block fetch starts over from the top.
+        assert_eq!(m.fetch_block(s, 1).unwrap(), vec![vec![Value::Int(1)]]);
 
         m.push_close_cursor_error(Error::new(ErrorCode::Connection, "reset failed"));
         assert_eq!(m.close_cursor(s).unwrap_err().code, ErrorCode::Connection);
@@ -742,24 +744,15 @@ mod tests {
     }
 
     #[test]
-    fn get_column_error_injection_fires_on_the_nth_call() {
+    fn fetch_block_records_requested_sizes() {
         let m = MockCliDriver::new();
         let c = m.connect(&conn_params()).unwrap();
-        let s = m.prepare(c, "SELECT a, b FROM t").unwrap();
-        m.push_result_set(ScriptedRows::new(
-            ["a", "b"],
-            vec![vec![Value::Int(1), Value::Int(2)]],
-        ));
+        let s = m.prepare(c, "SELECT a FROM t").unwrap();
+        m.push_result_set(ScriptedRows::new(["a"], vec![vec![Value::Int(1)]]));
         m.execute(s).unwrap();
-        assert!(m.fetch(s).unwrap());
-        m.fail_get_column_on_call(
-            2,
-            Error::new(ErrorCode::Connection, "dropped mid-SQLGetData"),
-        );
-        assert_eq!(m.get_column(s, 0).unwrap(), Value::Int(1)); // call 1 ok
-        assert_eq!(m.get_column(s, 1).unwrap_err().code, ErrorCode::Connection); // call 2 fails
-        assert_eq!(m.get_column_calls(), 2);
-        assert_eq!(m.fetch_calls(), 1);
+        assert_eq!(m.fetch_block(s, 7).unwrap(), vec![vec![Value::Int(1)]]);
+        assert!(m.fetch_block(s, 9).unwrap().is_empty());
+        assert_eq!(m.fetch_block_requests(), vec![7, 9]);
     }
 
     #[test]

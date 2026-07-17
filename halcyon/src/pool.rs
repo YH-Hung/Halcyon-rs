@@ -1205,11 +1205,8 @@ mod loom_tests {
         fn column_name(&self, _s: StatementHandle, _i: usize) -> Result<String> {
             Ok(String::new())
         }
-        fn fetch(&self, _s: StatementHandle) -> Result<bool> {
-            Ok(false)
-        }
-        fn get_column(&self, _s: StatementHandle, _i: usize) -> Result<Value> {
-            Err(Error::new(ErrorCode::Mapping, "none"))
+        fn fetch_block(&self, _s: StatementHandle, _max_rows: usize) -> Result<Vec<Vec<Value>>> {
+            Ok(Vec::new())
         }
         fn finalize(&self, _s: StatementHandle) -> Result<()> {
             Ok(())
