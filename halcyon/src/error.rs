@@ -11,6 +11,8 @@ pub enum ErrorCode {
     Transient,
     Mapping,
     Pool,
+    InvalidArgument,
+    InvalidState,
     Unknown,
 }
 
@@ -25,6 +27,8 @@ impl ErrorCode {
             ErrorCode::Transient => "Transient",
             ErrorCode::Mapping => "Mapping",
             ErrorCode::Pool => "Pool",
+            ErrorCode::InvalidArgument => "InvalidArgument",
+            ErrorCode::InvalidState => "InvalidState",
             ErrorCode::Unknown => "Unknown",
         }
     }
@@ -107,5 +111,15 @@ mod tests {
     fn display_is_minimal_for_non_driver_errors() {
         let e = Error::new(ErrorCode::Pool, "acquire timed out");
         assert_eq!(e.to_string(), "Pool: acquire timed out");
+    }
+
+    #[test]
+    fn invalid_argument_and_invalid_state_display() {
+        assert_eq!(ErrorCode::InvalidArgument.as_str(), "InvalidArgument");
+        assert_eq!(ErrorCode::InvalidState.as_str(), "InvalidState");
+        assert_eq!(
+            Error::new(ErrorCode::InvalidArgument, "bad name").to_string(),
+            "InvalidArgument: bad name"
+        );
     }
 }

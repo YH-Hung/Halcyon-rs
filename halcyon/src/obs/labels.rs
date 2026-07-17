@@ -28,6 +28,8 @@ pub(crate) fn code_label(code: ErrorCode) -> &'static str {
         ErrorCode::Transient => "transient",
         ErrorCode::Mapping => "mapping",
         ErrorCode::Pool => "pool",
+        ErrorCode::InvalidArgument => "invalid_argument",
+        ErrorCode::InvalidState => "invalid_state",
         ErrorCode::Unknown => "unknown",
     }
 }
@@ -65,5 +67,11 @@ mod tests {
     fn code_label_is_lowercase() {
         assert_eq!(code_label(ErrorCode::Syntax), "syntax");
         assert_eq!(code_label(ErrorCode::Deadlock), "deadlock");
+    }
+
+    #[test]
+    fn code_label_covers_programming_errors() {
+        assert_eq!(code_label(ErrorCode::InvalidArgument), "invalid_argument");
+        assert_eq!(code_label(ErrorCode::InvalidState), "invalid_state");
     }
 }
