@@ -116,6 +116,11 @@ impl Connection {
         self.unusable.set(true);
     }
 
+    /// Whether a failed session transition left this connection unsafe to pool.
+    pub(crate) fn is_unusable(&self) -> bool {
+        self.unusable.get()
+    }
+
     /// Prepares `sql` (or leases it from the statement cache), returning a
     /// reusable [`Statement`].
     pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {

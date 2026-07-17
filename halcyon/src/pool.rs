@@ -671,7 +671,8 @@ impl Deref for PooledConnection {
 impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            self.inner.release(conn, self.created_at, self.broken);
+            let broken = self.broken || conn.is_unusable();
+            self.inner.release(conn, self.created_at, broken);
         }
     }
 }
@@ -910,6 +911,51 @@ mod tests {
             let mut lease = p.acquire().unwrap();
             lease.mark_broken();
         }
+        assert_eq!(p.total_count(), 0);
+        assert_eq!(p.idle_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn direct_lease_failed_isolation_begin_discards_unusable_connection() {
+        let mock = Arc::new(MockCliDriver::new());
+        let p = pool(&mock, cfg(1, 1));
+        let lease = p.acquire().unwrap();
+        mock.push_txn_error(Error::new(
+            ErrorCode::Connection,
+            "autocommit disabled failed",
+        ));
+
+        let error = lease
+            .begin_with_isolation(Isolation::UncommittedRead)
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Connection);
+        drop(lease);
+        assert_eq!(p.total_count(), 0);
+        assert_eq!(p.idle_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn direct_lease_restore_failure_discards_unusable_connection() {
+        let mock = Arc::new(MockCliDriver::new());
+        let p = pool(&mock, cfg(1, 1));
+        let lease = p.acquire().unwrap();
+        mock.fail_isolation_on_call(
+            2,
+            Error::new(ErrorCode::Connection, "isolation restore failed"),
+        );
+
+        let mut tx = lease
+            .begin_with_isolation(Isolation::UncommittedRead)
+            .unwrap();
+        let error = tx.commit().unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Connection);
+        assert!(tx.poisoned());
+        drop(tx);
+        drop(lease);
         assert_eq!(p.total_count(), 0);
         assert_eq!(p.idle_count(), 0);
         assert_eq!(mock.disconnect_calls(), 1);
