@@ -32,6 +32,7 @@ fn db(statement_cache_size: usize) -> Database {
         Arc::new(ConcurrentFakeDriver::new()),
         ConnectionParams {
             connection_string: "dsn".into(),
+            isolation: None,
         },
         cfg,
     )

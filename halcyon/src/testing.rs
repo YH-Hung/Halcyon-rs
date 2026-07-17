@@ -22,6 +22,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
+use crate::Isolation;
 
 /// A scripted result grid that [`execute`](CliDriver::execute) attaches to a
 /// statement's cursor; `fetch`/`get_column` then walk it row by row.
@@ -101,6 +102,7 @@ struct State {
     // --- transaction scripting ---
     txn_errors: VecDeque<Error>,
     auto_commit_calls: Vec<bool>,
+    isolation_calls: Vec<Isolation>,
     commit_calls: u32,
     rollback_calls: u32,
 
@@ -278,6 +280,9 @@ impl MockCliDriver {
     pub fn auto_commit_calls(&self) -> Vec<bool> {
         self.lock().auto_commit_calls.clone()
     }
+    pub fn isolation_calls(&self) -> Vec<Isolation> {
+        self.lock().isolation_calls.clone()
+    }
     pub fn fetch_calls(&self) -> u32 {
         self.lock().fetch_calls
     }
@@ -448,6 +453,11 @@ impl CliDriver for MockCliDriver {
         s.next_txn_result()
     }
 
+    fn set_isolation(&self, _conn: ConnectionHandle, level: Isolation) -> Result<()> {
+        self.lock().isolation_calls.push(level);
+        Ok(())
+    }
+
     fn commit(&self, _conn: ConnectionHandle) -> Result<()> {
         let mut s = self.lock();
         s.commit_calls += 1;
@@ -464,11 +474,24 @@ impl CliDriver for MockCliDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::{Connection, Isolation};
 
     fn conn_params() -> ConnectionParams {
         ConnectionParams {
             connection_string: "DSN=mock".into(),
+            isolation: None,
         }
+    }
+
+    #[test]
+    fn mock_records_set_isolation_calls() {
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = Connection::open(mock.clone(), &conn_params()).unwrap();
+        mock.set_isolation(conn.handle(), Isolation::UncommittedRead)
+            .unwrap();
+        assert_eq!(mock.isolation_calls(), vec![Isolation::UncommittedRead]);
     }
 
     #[test]

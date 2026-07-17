@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
+use crate::Isolation;
 
 struct StmtState {
     conn: u64,
@@ -324,6 +325,10 @@ impl CliDriver for ConcurrentFakeDriver {
         Ok(())
     }
 
+    fn set_isolation(&self, _conn: ConnectionHandle, _level: Isolation) -> Result<()> {
+        Ok(())
+    }
+
     fn commit(&self, _conn: ConnectionHandle) -> Result<()> {
         self.commit_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -344,6 +349,7 @@ mod tests {
     fn params() -> ConnectionParams {
         ConnectionParams {
             connection_string: "dsn".into(),
+            isolation: None,
         }
     }
 

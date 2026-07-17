@@ -22,6 +22,7 @@ fn connect(mock: &Arc<MockCliDriver>) -> Connection {
         mock.clone(),
         &ConnectionParams {
             connection_string: "x".into(),
+            isolation: None,
         },
     )
     .unwrap()

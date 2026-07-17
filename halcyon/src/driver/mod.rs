@@ -22,6 +22,7 @@ pub use db2::Db2CliDriver;
 
 use crate::error::Result;
 use crate::value::Value;
+use crate::Isolation;
 
 /// Opaque token for a driver-owned connection. `0` is never a live handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,6 +51,8 @@ impl StatementHandle {
 #[derive(Debug, Clone)]
 pub struct ConnectionParams {
     pub connection_string: String,
+    /// Session isolation level; `None` preserves the server default.
+    pub isolation: Option<Isolation>,
 }
 
 /// The mockable seam over the IBM Db2 CLI.
@@ -112,6 +115,9 @@ pub trait CliDriver: Send + Sync {
     /// Enables/disables autocommit on the connection. A transaction begins by
     /// disabling it and ends (commit/rollback) by re-enabling it.
     fn set_auto_commit(&self, conn: ConnectionHandle, enabled: bool) -> Result<()>;
+
+    /// Sets the connection's transaction isolation attribute.
+    fn set_isolation(&self, conn: ConnectionHandle, level: Isolation) -> Result<()>;
 
     fn commit(&self, conn: ConnectionHandle) -> Result<()>;
     fn rollback(&self, conn: ConnectionHandle) -> Result<()>;

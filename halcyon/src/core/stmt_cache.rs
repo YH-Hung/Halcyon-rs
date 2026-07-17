@@ -223,6 +223,7 @@ mod tests {
         let conn = mock
             .connect(&ConnectionParams {
                 connection_string: "DSN=mock".into(),
+                isolation: None,
             })
             .unwrap();
         (mock, conn)

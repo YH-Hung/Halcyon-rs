@@ -685,6 +685,7 @@ mod tests {
     fn params() -> ConnectionParams {
         ConnectionParams {
             connection_string: "DSN=mock".into(),
+            isolation: None,
         }
     }
 
@@ -1060,6 +1061,7 @@ mod loom_tests {
     use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
     use crate::error::{Error, ErrorCode, Result};
     use crate::value::Value;
+    use crate::Isolation;
     use loom::sync::Arc as LoomArc; // for spawning; pool internals use std::sync::Arc
 
     // Minimal stateless fake: everything trivially succeeds. `max = 1` plus the
@@ -1111,6 +1113,9 @@ mod loom_tests {
         fn set_auto_commit(&self, _c: ConnectionHandle, _e: bool) -> Result<()> {
             Ok(())
         }
+        fn set_isolation(&self, _c: ConnectionHandle, _level: Isolation) -> Result<()> {
+            Ok(())
+        }
         fn commit(&self, _c: ConnectionHandle) -> Result<()> {
             Ok(())
         }
@@ -1122,6 +1127,7 @@ mod loom_tests {
     fn params() -> ConnectionParams {
         ConnectionParams {
             connection_string: "loom".into(),
+            isolation: None,
         }
     }
 

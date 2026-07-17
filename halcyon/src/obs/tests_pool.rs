@@ -18,6 +18,7 @@ use metrics::{
 fn params() -> ConnectionParams {
     ConnectionParams {
         connection_string: "DSN=mock".into(),
+        isolation: None,
     }
 }
 

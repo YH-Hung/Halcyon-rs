@@ -19,6 +19,7 @@ fn open(fake: Arc<ConcurrentFakeDriver>, scenario: Scenario, pool_max: usize) ->
         fake,
         ConnectionParams {
             connection_string: "dsn".into(),
+            isolation: None,
         },
         config_for(scenario, pool_max),
     )

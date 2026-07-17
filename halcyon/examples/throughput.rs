@@ -24,6 +24,7 @@ fn main() {
             fake,
             ConnectionParams {
                 connection_string: "dsn".into(),
+                isolation: None,
             },
             config_for(Scenario::Pool, pool_max),
         )

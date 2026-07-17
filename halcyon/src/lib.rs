@@ -33,6 +33,7 @@
 //! let driver = Arc::new(Db2CliDriver::new());
 //! let conn = Connection::open(driver, &ConnectionParams {
 //!     connection_string: "DATABASE=sample;HOSTNAME=localhost;...".into(),
+//!     isolation: None,
 //! })?;
 //!
 //! let mut rows = conn.query("SELECT id, name FROM users WHERE id > ?", (10,))?;
@@ -56,6 +57,7 @@ mod core;
 pub mod driver;
 mod error;
 mod facade;
+mod isolation;
 // Feature-gated async facade (tokio spawn_blocking). See async_db.rs.
 #[cfg(feature = "tokio")]
 mod async_db;
@@ -87,6 +89,7 @@ pub use core::{
 };
 pub use error::{Error, ErrorCode, Result};
 pub use facade::{Database, QueryResult, ScopedTransaction, TxCursor, TxQueryMap};
+pub use isolation::Isolation;
 pub use pool::{ConnectionPool, PoolConfig, PooledConnection};
 pub use retry::{BackoffPolicy, ExecPolicy};
 pub use value::Value;

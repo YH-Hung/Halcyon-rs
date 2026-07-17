@@ -18,6 +18,7 @@ use crate::driver::sqlstate::classify_sqlstate;
 use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
+use crate::Isolation;
 
 /// Raw CLI handle that may cross threads. The IBM CLI is thread-safe for
 /// distinct handles used from distinct threads, and Halcyon guarantees a
@@ -88,6 +89,15 @@ fn unknown_stmt() -> Error {
 /// SQLPOINTER argument, per the CLI convention.
 fn attr_value(v: cli::SQLULEN) -> cli::SQLPOINTER {
     v as usize as cli::SQLPOINTER
+}
+
+fn isolation_attr_value(level: Isolation) -> cli::SQLULEN {
+    match level {
+        Isolation::UncommittedRead => cli::SQL_TXN_READ_UNCOMMITTED,
+        Isolation::CursorStability => cli::SQL_TXN_READ_COMMITTED,
+        Isolation::ReadStability => cli::SQL_TXN_REPEATABLE_READ,
+        Isolation::RepeatableRead => cli::SQL_TXN_SERIALIZABLE,
+    }
 }
 
 /// A parameter bound for a scalar execute. The CLI stores pointers into this
@@ -1070,6 +1080,29 @@ impl CliDriver for Db2CliDriver {
         Ok(())
     }
 
+    fn set_isolation(&self, conn: ConnectionHandle, level: Isolation) -> Result<()> {
+        let Some(dbc) = self.conn_handle(conn) else {
+            return Err(unknown_conn());
+        };
+        let rc = unsafe {
+            cli::SQLSetConnectAttr(
+                dbc.0,
+                cli::SQL_ATTR_TXN_ISOLATION,
+                attr_value(isolation_attr_value(level)),
+                0,
+            )
+        };
+        if !cli_ok(rc) {
+            return Err(make_error(
+                cli::SQL_HANDLE_DBC,
+                dbc.0,
+                ErrorCode::Connection,
+                "SQLSetConnectAttr(SQL_ATTR_TXN_ISOLATION) failed",
+            ));
+        }
+        Ok(())
+    }
+
     fn commit(&self, conn: ConnectionHandle) -> Result<()> {
         self.end_tran(conn, cli::SQL_COMMIT, "SQLEndTran(COMMIT) failed")
     }
@@ -1084,6 +1117,26 @@ impl CliDriver for Db2CliDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolation_levels_map_to_db2_cli_values() {
+        assert_eq!(
+            isolation_attr_value(Isolation::UncommittedRead),
+            cli::SQL_TXN_READ_UNCOMMITTED
+        );
+        assert_eq!(
+            isolation_attr_value(Isolation::CursorStability),
+            cli::SQL_TXN_READ_COMMITTED
+        );
+        assert_eq!(
+            isolation_attr_value(Isolation::ReadStability),
+            cli::SQL_TXN_REPEATABLE_READ
+        );
+        assert_eq!(
+            isolation_attr_value(Isolation::RepeatableRead),
+            cli::SQL_TXN_SERIALIZABLE
+        );
+    }
 
     #[test]
     fn driver_is_send_and_sync() {
@@ -1131,6 +1184,7 @@ mod tests {
         let d = Db2CliDriver::new();
         let params = ConnectionParams {
             connection_string: "A".repeat(40_000),
+            isolation: None,
         };
         let err = d.connect(&params).unwrap_err();
         assert_eq!(err.code, ErrorCode::Connection);

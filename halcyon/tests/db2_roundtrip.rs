@@ -42,6 +42,7 @@ fn open(dsn: &str) -> (Arc<Db2CliDriver>, Connection) {
         driver.clone(),
         &ConnectionParams {
             connection_string: dsn.to_string(),
+            isolation: None,
         },
     )
     .expect("open live connection");
