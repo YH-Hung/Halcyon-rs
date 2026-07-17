@@ -25,12 +25,16 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::thread;
 
-use crate::core::{terminate, Connection, FromRow, IntoParams, Params, ResultSet, Row, StmtLease};
+use crate::core::{
+    start_with_isolation, terminate, Connection, FromRow, IntoParams, IsolationBegin, Params,
+    ResultSet, Row, StmtLease,
+};
 use crate::driver::{CliDriver, ConnectionParams, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
 use crate::pool::{ConnectionPool, PoolConfig, PooledConnection};
 use crate::retry::{is_read_only, ExecPolicy};
 use crate::value::Value;
+use crate::Isolation;
 
 /// The ergonomic, pooled Db2 database handle. Cloneable and thread-safe: clones
 /// share one underlying [`ConnectionPool`].
@@ -126,8 +130,30 @@ impl Database {
             lease,
             active: true,
             poisoned: false,
+            restore_isolation: None,
             conn_broken: Cell::new(false),
         })
+    }
+
+    /// Begins a transaction at `level` on a freshly leased connection. Its
+    /// configured session isolation is restored when the transaction ends.
+    pub fn begin_with_isolation(&self, level: Isolation) -> Result<ScopedTransaction> {
+        let mut lease = self.pool.acquire()?;
+        let restore_target = lease.isolation_restore_target();
+        match start_with_isolation(lease.driver_ref(), lease.handle(), level, restore_target) {
+            IsolationBegin::Started => Ok(ScopedTransaction {
+                lease,
+                active: true,
+                poisoned: false,
+                restore_isolation: Some(restore_target),
+                conn_broken: Cell::new(false),
+            }),
+            IsolationBegin::OverrideFailed(e) => Err(e),
+            IsolationBegin::AutoCommitFailed(e) => {
+                lease.mark_broken();
+                Err(e)
+            }
+        }
     }
 
     /// Runs `f` inside a transaction: commits if it returns `Ok` (propagating a
@@ -155,6 +181,32 @@ impl Database {
             Err(e) => {
                 // Best-effort rollback; surface the caller's original error (as
                 // C++ does). The drop guard is the panic path's safety net.
+                let _ = tx.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Runs `f` in a transaction at `level`, committing on `Ok` and rolling
+    /// back on `Err` or an unwinding panic.
+    pub fn transaction_with_isolation<T, F>(&self, level: Isolation, f: F) -> Result<T>
+    where
+        F: FnOnce(&ScopedTransaction) -> Result<T>,
+    {
+        crate::obs::instrument_transaction(|| self.transaction_with_isolation_inner(level, f))
+    }
+
+    fn transaction_with_isolation_inner<T, F>(&self, level: Isolation, f: F) -> Result<T>
+    where
+        F: FnOnce(&ScopedTransaction) -> Result<T>,
+    {
+        let mut tx = self.begin_with_isolation(level)?;
+        match f(&tx) {
+            Ok(value) => {
+                tx.commit()?;
+                Ok(value)
+            }
+            Err(e) => {
                 let _ = tx.rollback();
                 Err(e)
             }
@@ -419,6 +471,7 @@ pub struct ScopedTransaction {
     lease: PooledConnection,
     active: bool,
     poisoned: bool,
+    restore_isolation: Option<Isolation>,
     // Set when a statement run *inside* the unit of work dies on a
     // connection-class error — from a materializing call here or from a streaming
     // [`TxCursor`] that spoiled mid-scan. The terminal op's own poison
@@ -507,7 +560,12 @@ impl ScopedTransaction {
         if !self.active {
             return Ok(());
         }
-        let (result, poisoned) = terminate(self.lease.driver_ref(), self.lease.handle(), commit);
+        let (result, poisoned) = terminate(
+            self.lease.driver_ref(),
+            self.lease.handle(),
+            commit,
+            self.restore_isolation,
+        );
         self.active = false;
         if poisoned {
             self.poisoned = true;
@@ -688,6 +746,7 @@ mod tests {
             maintenance_interval: Duration::from_secs(3600),
             start_maintenance_thread: false,
             statement_cache_size: 0,
+            isolation: None,
         }
     }
 
@@ -900,6 +959,52 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!(mock.commit_calls(), 1);
         assert_eq!(mock.auto_commit_calls(), vec![false, true]);
+    }
+
+    #[test]
+    fn transaction_with_isolation_restores_after_commit() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+
+        let result = db.transaction_with_isolation(crate::Isolation::UncommittedRead, |_tx| {
+            Ok::<_, Error>(42)
+        });
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            mock.isolation_calls(),
+            vec![
+                crate::Isolation::UncommittedRead,
+                crate::Isolation::CursorStability
+            ]
+        );
+        assert_eq!(mock.auto_commit_calls(), vec![false, true]);
+        assert_eq!(mock.commit_calls(), 1);
+        assert_eq!(db.pool().idle_count(), 1);
+    }
+
+    #[test]
+    fn pooled_begin_compensation_failure_marks_lease_broken() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+        mock.push_txn_error(Error::new(
+            ErrorCode::Connection,
+            "autocommit disabled failed",
+        ));
+        mock.fail_isolation_on_call(
+            2,
+            Error::new(ErrorCode::Connection, "isolation restore failed"),
+        );
+
+        let error = db
+            .begin_with_isolation(crate::Isolation::UncommittedRead)
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Connection);
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(db.pool().idle_count(), 0);
+        assert_eq!(db.pool().active_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
     }
 
     #[test]

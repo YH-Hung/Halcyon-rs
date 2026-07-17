@@ -28,6 +28,7 @@ use crate::core::Connection;
 use crate::driver::{CliDriver, ConnectionParams};
 use crate::error::{Error, ErrorCode, Result};
 use crate::retry::BackoffPolicy;
+use crate::Isolation;
 // The `thread` module alias is only used off-loom (the maintenance thread and the
 // std-based unit tests); under `--cfg loom` only `JoinHandle` — the field type — is.
 #[cfg(not(loom))]
@@ -68,6 +69,9 @@ pub struct PoolConfig {
     /// Every pooled connection (including transparent reconnects) gets its own
     /// cache of this size, cleared when the physical connection is dropped.
     pub statement_cache_size: usize,
+    /// Session isolation applied to every pooled connection at open time.
+    /// `None` preserves the server default.
+    pub isolation: Option<Isolation>,
 }
 
 impl Default for PoolConfig {
@@ -83,6 +87,7 @@ impl Default for PoolConfig {
             maintenance_interval: Duration::from_millis(1000),
             start_maintenance_thread: true,
             statement_cache_size: 64,
+            isolation: None,
         }
     }
 }
@@ -487,7 +492,10 @@ impl ConnectionPool {
 
         let inner = Arc::new(PoolInner {
             driver,
-            params,
+            params: ConnectionParams {
+                isolation: config.isolation,
+                ..params
+            },
             config: config.clone(),
             state: Mutex::new(PoolState {
                 idle: VecDeque::new(),
@@ -707,6 +715,7 @@ mod tests {
             maintenance_interval: Duration::from_millis(1000),
             start_maintenance_thread: false,
             statement_cache_size: 0,
+            isolation: None,
         }
     }
 
@@ -723,6 +732,21 @@ mod tests {
     #[test]
     fn default_config_enables_the_statement_cache() {
         assert_eq!(PoolConfig::default().statement_cache_size, 64);
+    }
+
+    #[test]
+    fn pool_config_isolation_copied_into_params_at_connect() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(1, 1);
+        config.isolation = Some(Isolation::ReadStability);
+
+        let _pool = ConnectionPool::create(mock.clone(), params(), config).unwrap();
+
+        assert_eq!(
+            mock.connect_params()[0].isolation,
+            Some(Isolation::ReadStability)
+        );
+        assert_eq!(mock.isolation_calls(), vec![Isolation::ReadStability]);
     }
 
     #[test]
@@ -755,6 +779,21 @@ mod tests {
         mock.push_connect_error(Error::new(ErrorCode::Connection, "refused"));
         let err = ConnectionPool::create(mock.clone(), params(), cfg(1, 4)).unwrap_err();
         assert_eq!(err.code, ErrorCode::Connection);
+    }
+
+    #[test]
+    fn pool_warmup_isolation_failure_does_not_leak_capacity() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_isolation_error(Error::new(ErrorCode::Connection, "set isolation failed"));
+        let mut config = cfg(1, 1);
+        config.isolation = Some(Isolation::UncommittedRead);
+
+        let error = ConnectionPool::create(mock.clone(), params(), config).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Connection);
+        assert_eq!(mock.connect_calls(), 1);
+        assert_eq!(mock.disconnect_calls(), 1);
+        assert_eq!(mock.isolation_calls(), vec![Isolation::UncommittedRead]);
     }
 
     #[test]
@@ -915,6 +954,28 @@ mod tests {
         // The dead connection is gone and the slot was freed.
         assert_eq!(p.total_count(), 0);
         assert_eq!(p.idle_count(), 0);
+    }
+
+    #[test]
+    fn pool_reconnect_isolation_failure_disconnects() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut config = cfg(1, 1);
+        config.validate_on_acquire = true;
+        config.isolation = Some(Isolation::ReadStability);
+        let p = pool(&mock, config);
+        mock.push_alive_result(false);
+        mock.push_isolation_error(Error::new(ErrorCode::Connection, "set isolation failed"));
+
+        let error = p.acquire().unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Connection);
+        assert_eq!(mock.isolation_calls(), vec![Isolation::ReadStability; 2]);
+        // The dead original and the failed replacement are both disconnected;
+        // the leased slot was released rather than returning to idle.
+        assert_eq!(mock.disconnect_calls(), 2);
+        assert_eq!(p.total_count(), 0);
+        assert_eq!(p.idle_count(), 0);
+        assert_eq!(p.active_count(), 0);
     }
 
     #[test]
@@ -1148,6 +1209,7 @@ mod loom_tests {
             maintenance_interval: Duration::from_secs(3600),
             start_maintenance_thread: false,
             statement_cache_size: 0,
+            isolation: None,
         }
     }
 

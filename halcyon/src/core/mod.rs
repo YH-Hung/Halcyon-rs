@@ -24,7 +24,7 @@ pub use result_set::{FromRow, QueryMap, ResultSet, Row};
 pub use transaction::Transaction;
 // Shared with the facade's owned pooled cursor / RAII transaction, which live
 // outside `core` and so can't reach these through the private submodules.
-pub(crate) use transaction::terminate;
+pub(crate) use transaction::{start_with_isolation, terminate, IsolationBegin};
 // The statement cache and its lease token cross into `connection.rs` and the
 // facade's owned cursors, which live outside this module tree.
 pub(crate) use stmt_cache::{StatementCache, StmtLease};

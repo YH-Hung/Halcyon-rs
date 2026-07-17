@@ -14,8 +14,9 @@ use crate::core::connection::Connection;
 use crate::core::params::IntoParams;
 use crate::core::result_set::{FromRow, ResultSet};
 use crate::driver::{CliDriver, ConnectionHandle};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::value::Value;
+use crate::Isolation;
 
 /// A scoped unit of work over one [`Connection`]. Autocommit is off for its
 /// lifetime; see the module docs for the commit/rollback and drop semantics.
@@ -23,6 +24,7 @@ pub struct Transaction<'c> {
     conn: &'c Connection,
     active: bool,
     poisoned: bool,
+    restore_isolation: Option<Isolation>,
 }
 
 /// Whether [`Transaction::finish`] should commit or roll back.
@@ -34,11 +36,12 @@ enum Outcome {
 impl<'c> Transaction<'c> {
     /// Constructed only by [`Connection::begin`], which has already flipped
     /// autocommit off on `conn`.
-    fn new(conn: &'c Connection) -> Self {
+    fn new(conn: &'c Connection, restore_isolation: Option<Isolation>) -> Self {
         Transaction {
             conn,
             active: true,
             poisoned: false,
+            restore_isolation,
         }
     }
 
@@ -105,10 +108,12 @@ impl<'c> Transaction<'c> {
             self.conn.driver_ref(),
             self.conn.handle(),
             matches!(outcome, Outcome::Commit),
+            self.restore_isolation,
         );
         self.active = false;
         if poisoned {
             self.poisoned = true; // dead connection or autocommit lost
+            self.conn.mark_unusable();
         }
         result
     }
@@ -125,6 +130,7 @@ pub(crate) fn terminate(
     driver: &dyn CliDriver,
     handle: ConnectionHandle,
     commit: bool,
+    restore_isolation: Option<Isolation>,
 ) -> (Result<()>, bool) {
     let ended = if commit {
         driver.commit(handle)
@@ -132,8 +138,39 @@ pub(crate) fn terminate(
         driver.rollback(handle)
     };
     let restored = driver.set_auto_commit(handle, true);
-    let poisoned = ended.is_err() || restored.is_err();
-    (ended.and(restored), poisoned)
+    let isolation_restored = match restore_isolation {
+        Some(level) => driver.set_isolation(handle, level),
+        None => Ok(()),
+    };
+    let poisoned = ended.is_err() || restored.is_err() || isolation_restored.is_err();
+    (ended.and(restored).and(isolation_restored), poisoned)
+}
+
+/// Outcome of setting a temporary isolation level before disabling autocommit.
+/// The caller owns the physical connection and decides whether an uncertain
+/// transition poisons a standalone connection or breaks a pooled lease.
+pub(crate) enum IsolationBegin {
+    Started,
+    OverrideFailed(Error),
+    AutoCommitFailed(Error),
+}
+
+pub(crate) fn start_with_isolation(
+    driver: &dyn CliDriver,
+    handle: ConnectionHandle,
+    level: Isolation,
+    restore_target: Isolation,
+) -> IsolationBegin {
+    if let Err(e) = driver.set_isolation(handle, level) {
+        return IsolationBegin::OverrideFailed(e);
+    }
+    if let Err(e) = driver.set_auto_commit(handle, false) {
+        // The original autocommit error remains observable. Even a successful
+        // compensation cannot prove the session transition was reliable.
+        let _ = driver.set_isolation(handle, restore_target);
+        return IsolationBegin::AutoCommitFailed(e);
+    }
+    IsolationBegin::Started
 }
 
 impl Drop for Transaction<'_> {
@@ -159,8 +196,24 @@ impl Connection {
     /// bound to this connection. If enabling manual commit fails, no transaction
     /// is created and the error is returned. Ported from C++ `Connection::begin`.
     pub fn begin(&self) -> Result<Transaction<'_>> {
+        self.ensure_usable()?;
         self.driver_ref().set_auto_commit(self.handle(), false)?;
-        Ok(Transaction::new(self))
+        Ok(Transaction::new(self, None))
+    }
+
+    /// Begins a transaction at `level`, restoring this connection's configured
+    /// default (or Cursor Stability when none was configured) when it ends.
+    pub fn begin_with_isolation(&self, level: Isolation) -> Result<Transaction<'_>> {
+        self.ensure_usable()?;
+        let restore_target = self.isolation_restore_target();
+        match start_with_isolation(self.driver_ref(), self.handle(), level, restore_target) {
+            IsolationBegin::Started => Ok(Transaction::new(self, Some(restore_target))),
+            IsolationBegin::OverrideFailed(e) => Err(e),
+            IsolationBegin::AutoCommitFailed(e) => {
+                self.mark_unusable();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -198,6 +251,149 @@ mod tests {
         assert_eq!(mock.auto_commit_calls(), vec![false, true]);
         assert_eq!(mock.commit_calls(), 1);
         assert_eq!(mock.rollback_calls(), 0);
+    }
+
+    #[test]
+    fn begin_with_isolation_sets_then_restores_on_commit() {
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = connect(&mock);
+
+        let mut tx = conn
+            .begin_with_isolation(crate::Isolation::UncommittedRead)
+            .unwrap();
+        tx.commit().unwrap();
+
+        // No configured default normalizes to CursorStability on restore.
+        assert_eq!(
+            mock.isolation_calls(),
+            vec![
+                crate::Isolation::UncommittedRead,
+                crate::Isolation::CursorStability
+            ]
+        );
+        assert_eq!(mock.auto_commit_calls(), vec![false, true]);
+        assert_eq!(mock.commit_calls(), 1);
+        assert_eq!(
+            mock.transaction_events(),
+            vec![
+                crate::testing::TxnEvent::SetIsolation(crate::Isolation::UncommittedRead),
+                crate::testing::TxnEvent::SetAutoCommit(false),
+                crate::testing::TxnEvent::Commit,
+                crate::testing::TxnEvent::SetAutoCommit(true),
+                crate::testing::TxnEvent::SetIsolation(crate::Isolation::CursorStability),
+            ]
+        );
+    }
+
+    #[test]
+    fn begin_with_isolation_restores_configured_default() {
+        let mock = Arc::new(MockCliDriver::new());
+        let params = ConnectionParams {
+            connection_string: "DSN=mock".into(),
+            isolation: Some(crate::Isolation::ReadStability),
+        };
+        let conn = Connection::open(mock.clone(), &params).unwrap();
+
+        let mut tx = conn
+            .begin_with_isolation(crate::Isolation::UncommittedRead)
+            .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            mock.isolation_calls(),
+            vec![
+                crate::Isolation::ReadStability,
+                crate::Isolation::UncommittedRead,
+                crate::Isolation::ReadStability
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_isolation_transaction_restores_default_after_rollback() {
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = connect(&mock);
+
+        {
+            let _tx = conn
+                .begin_with_isolation(crate::Isolation::UncommittedRead)
+                .unwrap();
+        }
+
+        assert_eq!(mock.rollback_calls(), 1);
+        assert_eq!(mock.auto_commit_calls(), vec![false, true]);
+        assert_eq!(
+            mock.isolation_calls(),
+            vec![
+                crate::Isolation::UncommittedRead,
+                crate::Isolation::CursorStability
+            ]
+        );
+    }
+
+    #[test]
+    fn isolation_restore_failure_poisons_standalone_connection() {
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = connect(&mock);
+        mock.fail_isolation_on_call(
+            2,
+            Error::new(ErrorCode::Connection, "isolation restore failed"),
+        );
+
+        let mut tx = conn
+            .begin_with_isolation(crate::Isolation::UncommittedRead)
+            .unwrap();
+        let error = tx.commit().unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Connection);
+        assert!(tx.poisoned());
+        assert_eq!(
+            conn.execute("UPDATE t SET x = 1", ()).unwrap_err().code,
+            ErrorCode::InvalidState
+        );
+    }
+
+    #[test]
+    fn begin_autocommit_fail_restores_and_marks_standalone_unusable() {
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = connect(&mock);
+        mock.push_txn_error(Error::new(
+            ErrorCode::Connection,
+            "autocommit disabled failed",
+        ));
+
+        let error = conn
+            .begin_with_isolation(crate::Isolation::UncommittedRead)
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Connection);
+        assert_eq!(
+            mock.isolation_calls(),
+            vec![
+                crate::Isolation::UncommittedRead,
+                crate::Isolation::CursorStability
+            ]
+        );
+        assert_eq!(mock.auto_commit_calls(), vec![false]);
+        assert_eq!(
+            conn.execute("UPDATE t SET x = 1", ()).unwrap_err().code,
+            ErrorCode::InvalidState
+        );
+    }
+
+    #[test]
+    fn failed_isolation_override_leaves_standalone_connection_usable() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_isolation_error(Error::new(ErrorCode::Connection, "override failed"));
+        let conn = connect(&mock);
+
+        let error = conn
+            .begin_with_isolation(crate::Isolation::UncommittedRead)
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Connection);
+        assert_eq!(mock.auto_commit_calls(), Vec::<bool>::new());
+        assert_eq!(conn.execute("UPDATE t SET x = 1", ()).unwrap(), 0);
     }
 
     #[test]

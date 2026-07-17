@@ -25,8 +25,9 @@ use crate::core::result_set::{FromRow, ResultSet};
 use crate::core::{StatementCache, StmtLease};
 use crate::driver::batch::validate_batch_rows;
 use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
-use crate::error::Result;
+use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
+use crate::Isolation;
 
 /// A single logical Db2 connection over the CLI seam.
 ///
@@ -45,6 +46,10 @@ pub struct Connection {
     /// Per-connection prepared-statement LRU (Phase 5). `RefCell`, not a lock:
     /// `Connection` is `Send + !Sync`, one owner at a time.
     cache: RefCell<StatementCache>,
+    /// Configured session default, retained for per-transaction restore.
+    configured_isolation: Option<Isolation>,
+    /// A standalone connection whose session transition became untrustworthy.
+    unusable: Cell<bool>,
     // `Cell<()>` is `Send + !Sync`, which propagates to `Connection` without a
     // runtime cost or any borrowed data. It carries no value.
     _not_sync: PhantomData<Cell<()>>,
@@ -66,10 +71,18 @@ impl Connection {
         cache_capacity: usize,
     ) -> Result<Self> {
         let handle = driver.connect(params)?;
+        if let Some(level) = params.isolation {
+            if let Err(e) = driver.set_isolation(handle, level) {
+                let _ = driver.disconnect(handle);
+                return Err(e);
+            }
+        }
         Ok(Connection {
             driver,
             handle,
             cache: RefCell::new(StatementCache::new(cache_capacity)),
+            configured_isolation: params.isolation,
+            unusable: Cell::new(false),
             _not_sync: PhantomData,
         })
     }
@@ -84,9 +97,29 @@ impl Connection {
         self.driver.as_ref()
     }
 
+    pub(crate) fn ensure_usable(&self) -> Result<()> {
+        if self.unusable.get() {
+            return Err(Error::new(
+                ErrorCode::InvalidState,
+                "connection unusable after failed isolation/autocommit transition",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn isolation_restore_target(&self) -> Isolation {
+        self.configured_isolation
+            .unwrap_or(Isolation::CursorStability)
+    }
+
+    pub(crate) fn mark_unusable(&self) {
+        self.unusable.set(true);
+    }
+
     /// Prepares `sql` (or leases it from the statement cache), returning a
     /// reusable [`Statement`].
     pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
+        self.ensure_usable()?;
         let lease = self
             .cache
             .borrow_mut()
@@ -101,6 +134,7 @@ impl Connection {
     /// Prepares, binds, and executes a non-query statement, returning rows
     /// affected. Accepts positional (`?`) or named (`:name`) parameters.
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<i64> {
+        self.ensure_usable()?;
         let stmt = self.prepare_and_bind(sql, params.into_params())?;
         let result = self.driver.execute(stmt.handle());
         if result.is_err() {
@@ -112,6 +146,7 @@ impl Connection {
     /// Prepares, binds, executes, and returns a streaming [`ResultSet`] cursor.
     /// Accepts positional (`?`) or named (`:name`) parameters.
     pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<ResultSet<'_>> {
+        self.ensure_usable()?;
         let stmt = self.prepare_and_bind(sql, params.into_params())?;
         let columns = match self
             .driver
@@ -131,6 +166,7 @@ impl Connection {
     /// `Vec`. The convenience form of `query(..)?.collect_rows()`; with
     /// `#[derive(FromRow)]` this is the struct-mapping analog of the C++ `queryAs`.
     pub fn query_as<T: FromRow>(&self, sql: &str, params: impl IntoParams) -> Result<Vec<T>> {
+        self.ensure_usable()?;
         self.query(sql, params)?.collect_rows()
     }
 
@@ -138,6 +174,7 @@ impl Connection {
     /// it through the driver's array-binding path. Returns total rows affected;
     /// an empty batch is a no-op returning 0. Mirrors C++ `Connection::executeBatch`.
     pub fn execute_batch(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
+        self.ensure_usable()?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -195,6 +232,7 @@ impl Connection {
         sql: &str,
         params: Params,
     ) -> Result<(StmtLease, usize)> {
+        self.ensure_usable()?;
         let lease = self.prepare_and_bind_raw(sql, params)?;
         match self
             .driver
@@ -270,6 +308,7 @@ impl<'c> Statement<'c> {
     /// params are rejected here: they rewrite the SQL, which is fixed at prepare
     /// time — use [`Connection::execute`] for those.
     pub fn execute(&mut self, params: impl IntoParams) -> Result<i64> {
+        self.conn.ensure_usable()?;
         let values = positional_only(params.into_params())?;
         let result = self
             .conn
@@ -284,6 +323,7 @@ impl<'c> Statement<'c> {
 
     /// Consumes this prepared statement into a streaming query cursor.
     pub fn into_query(self, params: impl IntoParams) -> Result<ResultSet<'c>> {
+        self.conn.ensure_usable()?;
         let values = positional_only(params.into_params())?;
         let columns = match self
             .conn
@@ -365,6 +405,37 @@ mod tests {
         mock.push_connect_error(Error::new(ErrorCode::Connection, "refused"));
         let e = Connection::open(mock.clone(), &params()).unwrap_err();
         assert_eq!(e.code, ErrorCode::Connection);
+    }
+
+    #[test]
+    fn open_applies_isolation_from_params() {
+        let mock = Arc::new(MockCliDriver::new());
+        let params = ConnectionParams {
+            connection_string: "DSN=mock".into(),
+            isolation: Some(crate::Isolation::ReadStability),
+        };
+
+        let _conn = Connection::open(mock.clone(), &params).unwrap();
+
+        assert_eq!(
+            mock.isolation_calls(),
+            vec![crate::Isolation::ReadStability]
+        );
+    }
+
+    #[test]
+    fn open_set_isolation_failure_disconnects_handle() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_isolation_error(Error::new(ErrorCode::Connection, "set isolation failed"));
+        let params = ConnectionParams {
+            connection_string: "DSN=mock".into(),
+            isolation: Some(crate::Isolation::ReadStability),
+        };
+
+        let error = Connection::open(mock.clone(), &params).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Connection);
+        assert_eq!(mock.disconnect_calls(), 1);
     }
 
     #[test]

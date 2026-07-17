@@ -46,6 +46,15 @@ impl ScriptedRows {
     }
 }
 
+/// Ordered transaction-control calls recorded by [`MockCliDriver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnEvent {
+    SetAutoCommit(bool),
+    SetIsolation(Isolation),
+    Commit,
+    Rollback,
+}
+
 /// Per-statement record: the SQL it was prepared with, the last bound params,
 /// the attached cursor, and the fetch position (`-1` before the first fetch).
 #[derive(Debug, Default)]
@@ -101,10 +110,13 @@ struct State {
 
     // --- transaction scripting ---
     txn_errors: VecDeque<Error>,
+    isolation_errors: VecDeque<Error>,
+    fail_isolation_on_call: Option<(u32, Error)>,
     auto_commit_calls: Vec<bool>,
     isolation_calls: Vec<Isolation>,
     commit_calls: u32,
     rollback_calls: u32,
+    transaction_events: Vec<TxnEvent>,
 
     next_conn: u64,
     next_stmt: u64,
@@ -208,6 +220,18 @@ impl MockCliDriver {
         self
     }
 
+    /// The next `set_isolation` fails with `e`.
+    pub fn push_isolation_error(&self, e: Error) -> &Self {
+        self.lock().isolation_errors.push_back(e);
+        self
+    }
+
+    /// Makes the `call_index`-th (1-based) `set_isolation` fail with `e`.
+    pub fn fail_isolation_on_call(&self, call_index: u32, e: Error) -> &Self {
+        self.lock().fail_isolation_on_call = Some((call_index, e));
+        self
+    }
+
     /// Makes the `call_index`-th (1-based) `fetch` fail with `e`.
     pub fn fail_fetch_on_call(&self, call_index: u32, e: Error) -> &Self {
         let mut s = self.lock();
@@ -282,6 +306,9 @@ impl MockCliDriver {
     }
     pub fn isolation_calls(&self) -> Vec<Isolation> {
         self.lock().isolation_calls.clone()
+    }
+    pub fn transaction_events(&self) -> Vec<TxnEvent> {
+        self.lock().transaction_events.clone()
     }
     pub fn fetch_calls(&self) -> u32 {
         self.lock().fetch_calls
@@ -450,23 +477,39 @@ impl CliDriver for MockCliDriver {
     fn set_auto_commit(&self, _conn: ConnectionHandle, enabled: bool) -> Result<()> {
         let mut s = self.lock();
         s.auto_commit_calls.push(enabled);
+        s.transaction_events.push(TxnEvent::SetAutoCommit(enabled));
         s.next_txn_result()
     }
 
     fn set_isolation(&self, _conn: ConnectionHandle, level: Isolation) -> Result<()> {
-        self.lock().isolation_calls.push(level);
+        let mut s = self.lock();
+        s.isolation_calls.push(level);
+        s.transaction_events.push(TxnEvent::SetIsolation(level));
+        if let Some(e) = s.isolation_errors.pop_front() {
+            return Err(e);
+        }
+        if s.fail_isolation_on_call
+            .as_ref()
+            .is_some_and(|(call_index, _)| *call_index == s.isolation_calls.len() as u32)
+        {
+            if let Some((_, e)) = s.fail_isolation_on_call.take() {
+                return Err(e);
+            }
+        }
         Ok(())
     }
 
     fn commit(&self, _conn: ConnectionHandle) -> Result<()> {
         let mut s = self.lock();
         s.commit_calls += 1;
+        s.transaction_events.push(TxnEvent::Commit);
         s.next_txn_result()
     }
 
     fn rollback(&self, _conn: ConnectionHandle) -> Result<()> {
         let mut s = self.lock();
         s.rollback_calls += 1;
+        s.transaction_events.push(TxnEvent::Rollback);
         s.next_txn_result()
     }
 }

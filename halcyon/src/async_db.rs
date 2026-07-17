@@ -333,6 +333,7 @@ mod tests {
             maintenance_interval: Duration::from_secs(3600),
             start_maintenance_thread: false,
             statement_cache_size: 0,
+            isolation: None,
         }
     }
 

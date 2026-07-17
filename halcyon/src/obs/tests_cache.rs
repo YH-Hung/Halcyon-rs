@@ -34,6 +34,7 @@ fn cached_config() -> PoolConfig {
         maintenance_interval: Duration::from_secs(3600),
         start_maintenance_thread: false,
         statement_cache_size: 8,
+        isolation: None,
     }
 }
 

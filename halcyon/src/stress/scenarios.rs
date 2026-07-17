@@ -44,6 +44,7 @@ pub fn config_for(id: Scenario, pool_max: usize) -> PoolConfig {
         // Production default: the stress scenarios (and the TSan job) exercise
         // the per-connection statement cache path.
         statement_cache_size: 64,
+        isolation: None,
     };
     match id {
         Scenario::Pool => {
