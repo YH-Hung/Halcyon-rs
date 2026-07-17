@@ -70,6 +70,7 @@ pub const SQL_FLOAT: SQLSMALLINT = 6;
 pub const SQL_REAL: SQLSMALLINT = 7;
 pub const SQL_DOUBLE: SQLSMALLINT = 8;
 pub const SQL_VARCHAR: SQLSMALLINT = 12;
+pub const SQL_LONGVARCHAR: SQLSMALLINT = -1;
 pub const SQL_BINARY: SQLSMALLINT = -2;
 pub const SQL_VARBINARY: SQLSMALLINT = -3;
 pub const SQL_LONGVARBINARY: SQLSMALLINT = -4;
@@ -77,6 +78,8 @@ pub const SQL_BIGINT: SQLSMALLINT = -5;
 pub const SQL_BIT: SQLSMALLINT = -7;
 /// IBM extension (sqlcli.h), not the ODBC value.
 pub const SQL_BLOB: SQLSMALLINT = -98;
+pub const SQL_CLOB: SQLSMALLINT = -99;
+pub const SQL_DBCLOB: SQLSMALLINT = -350;
 
 // --- C data types (sqlext.h) ---
 
@@ -95,11 +98,20 @@ pub const SQL_DRIVER_NOPROMPT: SQLUSMALLINT = 0;
 
 pub const SQL_PARAM_INPUT: SQLSMALLINT = 1;
 
-// --- Statement attributes (array binding) ---
+// --- Statement attributes (array binding / rowset fetch) ---
 
+pub const SQL_ATTR_ROW_BIND_TYPE: SQLINTEGER = 5;
 pub const SQL_ATTR_PARAM_BIND_TYPE: SQLINTEGER = 18;
 pub const SQL_ATTR_PARAMSET_SIZE: SQLINTEGER = 22;
+pub const SQL_ATTR_ROW_STATUS_PTR: SQLINTEGER = 25;
+pub const SQL_ATTR_ROWS_FETCHED_PTR: SQLINTEGER = 26;
+pub const SQL_ATTR_ROW_ARRAY_SIZE: SQLINTEGER = 27;
+pub const SQL_BIND_BY_COLUMN: SQLULEN = 0;
 pub const SQL_PARAM_BIND_BY_COLUMN: SQLULEN = 0;
+
+// --- SQLColAttribute descriptor fields ---
+
+pub const SQL_DESC_OCTET_LENGTH: SQLUSMALLINT = 1013;
 
 // --- Connection attributes ---
 
@@ -121,6 +133,7 @@ pub const SQL_ROLLBACK: SQLSMALLINT = 1;
 // --- SQLFreeStmt ---
 
 pub const SQL_CLOSE: SQLUSMALLINT = 0;
+pub const SQL_UNBIND: SQLUSMALLINT = 2;
 
 extern "C" {
     pub fn SQLAllocHandle(
@@ -169,6 +182,15 @@ extern "C" {
         str_len_or_ind: *mut SQLLEN,
     ) -> SQLRETURN;
 
+    pub fn SQLBindCol(
+        hstmt: SQLHSTMT,
+        column_number: SQLUSMALLINT,
+        target_type: SQLSMALLINT,
+        target_value: SQLPOINTER,
+        buffer_length: SQLLEN,
+        str_len_or_ind: *mut SQLLEN,
+    ) -> SQLRETURN;
+
     pub fn SQLExecute(hstmt: SQLHSTMT) -> SQLRETURN;
 
     pub fn SQLRowCount(hstmt: SQLHSTMT, row_count: *mut SQLLEN) -> SQLRETURN;
@@ -185,6 +207,16 @@ extern "C" {
         column_size: *mut SQLULEN,
         decimal_digits: *mut SQLSMALLINT,
         nullable: *mut SQLSMALLINT,
+    ) -> SQLRETURN;
+
+    pub fn SQLColAttribute(
+        hstmt: SQLHSTMT,
+        column_number: SQLUSMALLINT,
+        field_identifier: SQLUSMALLINT,
+        character_attribute: SQLPOINTER,
+        buffer_length: SQLSMALLINT,
+        string_length: *mut SQLSMALLINT,
+        numeric_attribute: SQLPOINTER,
     ) -> SQLRETURN;
 
     pub fn SQLFetch(hstmt: SQLHSTMT) -> SQLRETURN;

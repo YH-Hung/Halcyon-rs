@@ -265,3 +265,73 @@ fn live_statement_cache_reuse() {
     db.execute("DROP TABLE halcyon_stmt_cache", ())
         .expect("drop table");
 }
+
+/// Exercises the seam directly so the fast-path block shape and the intentional
+/// one-row CLOB fallback are observable (the public collectors deliberately
+/// hide driver block boundaries).
+#[test]
+fn live_rowset_fetch_and_long_column_fallback() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("HALCYON_TEST_DSN not set; skipping live Db2 rowset round-trip");
+        return;
+    };
+    let (driver, conn) = open(&dsn);
+    let _ = conn.execute("DROP TABLE halcyon_rowset_rs", ());
+    conn.execute(
+        "CREATE TABLE halcyon_rowset_rs(id BIGINT NOT NULL, name VARCHAR(32), body CLOB)",
+        (),
+    )
+    .expect("create rowset table");
+    for id in 1..=5i64 {
+        conn.execute(
+            "INSERT INTO halcyon_rowset_rs VALUES (?, ?, ?)",
+            (
+                id,
+                format!("name-{id}"),
+                format!("lob-{id}-{}", "z".repeat(5000)),
+            ),
+        )
+        .expect("insert rowset row");
+    }
+
+    let bounded = driver
+        .prepare(
+            conn.handle(),
+            "SELECT id, name FROM halcyon_rowset_rs ORDER BY id",
+        )
+        .expect("prepare bounded projection");
+    driver.bind_params(bounded, &[]).expect("bind bounded");
+    driver.execute(bounded).expect("execute bounded");
+    let block = driver.fetch_block(bounded, 10).expect("fetch rowset block");
+    assert_eq!(block.len(), 5, "bounded projection should use one rowset");
+    assert_eq!(block[0], vec![Value::Int(1), Value::Text("name-1".into())]);
+    assert!(driver.fetch_block(bounded, 10).unwrap().is_empty());
+    driver.close_cursor(bounded).expect("close bounded cursor");
+    driver
+        .finalize(bounded)
+        .expect("finalize bounded statement");
+
+    let long = driver
+        .prepare(
+            conn.handle(),
+            "SELECT id, body FROM halcyon_rowset_rs ORDER BY id",
+        )
+        .expect("prepare CLOB projection");
+    driver.bind_params(long, &[]).expect("bind CLOB projection");
+    driver.execute(long).expect("execute CLOB projection");
+    for id in 1..=5i64 {
+        let block = driver.fetch_block(long, 10).expect("fetch CLOB fallback");
+        assert_eq!(block.len(), 1, "CLOB fallback must return at most one row");
+        assert_eq!(block[0][0], Value::Int(id));
+        assert_eq!(
+            block[0][1],
+            Value::Text(format!("lob-{id}-{}", "z".repeat(5000)))
+        );
+    }
+    assert!(driver.fetch_block(long, 10).unwrap().is_empty());
+    driver.close_cursor(long).expect("close CLOB cursor");
+    driver.finalize(long).expect("finalize CLOB statement");
+
+    conn.execute("DROP TABLE halcyon_rowset_rs", ())
+        .expect("drop rowset table");
+}

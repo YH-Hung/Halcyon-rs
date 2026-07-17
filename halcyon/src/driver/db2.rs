@@ -20,6 +20,10 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
 use crate::Isolation;
 
+const FETCH_BLOCK_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BLOCK_ROWS: usize = 4096;
+const MAX_BOUND_COL_BYTES: usize = 64 * 1024;
+
 /// Raw CLI handle that may cross threads. The IBM CLI is thread-safe for
 /// distinct handles used from distinct threads, and Halcyon guarantees a
 /// single owner per leased connection/statement, so moving/sharing the token
@@ -115,6 +119,25 @@ struct BoundParam {
     f64_val: f64,
 }
 
+#[derive(Clone, Copy)]
+struct ColMeta {
+    sql_type: cli::SQLSMALLINT,
+    c_type: cli::SQLSMALLINT,
+    bind_width: usize,
+    bounded: bool,
+}
+
+/// Heap-pinned because the CLI retains pointers into every field until all
+/// rowset bindings and pointer attributes have been cleared (or the statement
+/// handle is freed). On cleanup failure the box moves into `StmtState` without
+/// moving the allocation, preventing dangling native pointers.
+struct RowsetStorage {
+    buffers: Vec<Vec<i64>>,
+    indicators: Vec<Vec<cli::SQLLEN>>,
+    rows_fetched: cli::SQLULEN,
+    row_status: Vec<cli::SQLUSMALLINT>,
+}
+
 impl BoundParam {
     fn from_value(v: &Value) -> BoundParam {
         let mut bp = BoundParam {
@@ -164,6 +187,11 @@ struct StmtState {
     /// Kept alive (and address-stable) between bind_params and execute — the
     /// CLI holds pointers into these until the statement is executed or rebound.
     bound: Vec<BoundParam>,
+    /// Described once per successfully executed cursor, then cleared on close
+    /// or re-execute so cached statements never retain stale result metadata.
+    cols: Option<Vec<ColMeta>>,
+    block_fallback: bool,
+    pending_rowset: Option<Box<RowsetStorage>>,
 }
 
 /// A live statement plus the connection it was prepared on, so disconnecting
@@ -371,39 +399,10 @@ fn get_binary(h: cli::SQLHANDLE, col: cli::SQLUSMALLINT) -> Result<Value> {
     Ok(Value::Bytes(out))
 }
 
-/// Temporary row-at-a-time bridge for `fetch_block`. Task 6 replaces this with
-/// rowset binding below the seam; keeping it private prevents the old protocol
-/// from leaking back above the driver boundary.
-fn read_current_column(h: cli::SQLHANDLE, index: usize) -> Result<Value> {
+/// Reads one current-row cell using already-cached SQL type metadata. The
+/// unbounded fallback calls this at most once per `fetch_block` invocation.
+fn read_column_typed(h: cli::SQLHANDLE, index: usize, sql_type: cli::SQLSMALLINT) -> Result<Value> {
     let col = (index + 1) as cli::SQLUSMALLINT;
-    let mut name = [0u8; 1];
-    let mut name_len: cli::SQLSMALLINT = 0;
-    let mut sql_type: cli::SQLSMALLINT = 0;
-    let mut col_size: cli::SQLULEN = 0;
-    let mut scale: cli::SQLSMALLINT = 0;
-    let mut nullable: cli::SQLSMALLINT = 0;
-    let rc = unsafe {
-        cli::SQLDescribeCol(
-            h,
-            col,
-            name.as_mut_ptr(),
-            name.len() as cli::SQLSMALLINT,
-            &mut name_len,
-            &mut sql_type,
-            &mut col_size,
-            &mut scale,
-            &mut nullable,
-        )
-    };
-    if !cli_ok(rc) {
-        return Err(make_error(
-            cli::SQL_HANDLE_STMT,
-            h,
-            ErrorCode::Unknown,
-            "SQLDescribeCol failed",
-        ));
-    }
-
     match sql_type {
         cli::SQL_SMALLINT | cli::SQL_INTEGER | cli::SQL_BIGINT => {
             let mut v: i64 = 0;
@@ -459,6 +458,33 @@ fn read_current_column(h: cli::SQLHANDLE, index: usize) -> Result<Value> {
                 Ok(Value::Double(v))
             }
         }
+        cli::SQL_BIT => {
+            let mut v = 0u8;
+            let mut ind: cli::SQLLEN = 0;
+            let rc = unsafe {
+                cli::SQLGetData(
+                    h,
+                    col,
+                    cli::SQL_C_BIT,
+                    (&mut v as *mut u8).cast(),
+                    1,
+                    &mut ind,
+                )
+            };
+            if !cli_ok(rc) {
+                return Err(make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLGetData bit failed",
+                ));
+            }
+            if ind == cli::SQL_NULL_DATA {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Int(i64::from(v != 0)))
+            }
+        }
         // Raw bytes: read as SQL_C_BINARY so embedded NULs survive.
         cli::SQL_BINARY | cli::SQL_VARBINARY | cli::SQL_LONGVARBINARY | cli::SQL_BLOB => {
             get_binary(h, col)
@@ -466,6 +492,352 @@ fn read_current_column(h: cli::SQLHANDLE, index: usize) -> Result<Value> {
         // CHAR/VARCHAR/DECIMAL/NUMERIC/TIMESTAMP/DATE/TIME → UTF-8 string.
         _ => get_string(h, col),
     }
+}
+
+fn describe_columns(st: &mut StmtState) -> Result<()> {
+    let h = st.handle.0;
+    let mut count: cli::SQLSMALLINT = 0;
+    let rc = unsafe { cli::SQLNumResultCols(h, &mut count) };
+    if !cli_ok(rc) {
+        return Err(make_error(
+            cli::SQL_HANDLE_STMT,
+            h,
+            ErrorCode::Unknown,
+            "SQLNumResultCols failed",
+        ));
+    }
+
+    let mut cols = Vec::with_capacity(count.max(0) as usize);
+    let mut any_unbounded = false;
+    for index in 0..count.max(0) as usize {
+        let mut name = [0u8; 1];
+        let mut name_len: cli::SQLSMALLINT = 0;
+        let mut sql_type: cli::SQLSMALLINT = 0;
+        let mut col_size: cli::SQLULEN = 0;
+        let mut scale: cli::SQLSMALLINT = 0;
+        let mut nullable: cli::SQLSMALLINT = 0;
+        let rc = unsafe {
+            cli::SQLDescribeCol(
+                h,
+                (index + 1) as cli::SQLUSMALLINT,
+                name.as_mut_ptr(),
+                name.len() as cli::SQLSMALLINT,
+                &mut name_len,
+                &mut sql_type,
+                &mut col_size,
+                &mut scale,
+                &mut nullable,
+            )
+        };
+        if !cli_ok(rc) {
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                "SQLDescribeCol failed",
+            ));
+        }
+
+        // Character declarations count code units; rowset buffers require byte
+        // capacity. SQL_DESC_OCTET_LENGTH supplies that capacity for multibyte
+        // data. Text-rendered scalar types may have a wider display size, so use
+        // the larger of the two just as the C++ driver does.
+        let mut octet: cli::SQLLEN = 0;
+        unsafe {
+            cli::SQLColAttribute(
+                h,
+                (index + 1) as cli::SQLUSMALLINT,
+                cli::SQL_DESC_OCTET_LENGTH,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                (&mut octet as *mut cli::SQLLEN).cast(),
+            );
+        }
+        let data_width = (col_size as usize).max(octet.max(0) as usize);
+
+        let mut meta = ColMeta {
+            sql_type,
+            c_type: cli::SQL_C_CHAR,
+            bind_width: 0,
+            bounded: true,
+        };
+        match sql_type {
+            cli::SQL_SMALLINT | cli::SQL_INTEGER | cli::SQL_BIGINT => {
+                meta.c_type = cli::SQL_C_SBIGINT;
+                meta.bind_width = std::mem::size_of::<i64>();
+            }
+            cli::SQL_REAL | cli::SQL_FLOAT | cli::SQL_DOUBLE => {
+                meta.c_type = cli::SQL_C_DOUBLE;
+                meta.bind_width = std::mem::size_of::<f64>();
+            }
+            cli::SQL_BIT => {
+                meta.c_type = cli::SQL_C_BIT;
+                meta.bind_width = 1;
+            }
+            cli::SQL_BINARY | cli::SQL_VARBINARY => {
+                meta.c_type = cli::SQL_C_BINARY;
+                meta.bind_width = data_width;
+            }
+            cli::SQL_LONGVARBINARY
+            | cli::SQL_BLOB
+            | cli::SQL_CLOB
+            | cli::SQL_DBCLOB
+            | cli::SQL_LONGVARCHAR => {
+                meta.bounded = false;
+            }
+            _ => {
+                meta.c_type = cli::SQL_C_CHAR;
+                meta.bind_width = data_width.saturating_add(1);
+            }
+        }
+        if meta.bounded && (meta.bind_width == 0 || meta.bind_width > MAX_BOUND_COL_BYTES) {
+            meta.bounded = false;
+        }
+        any_unbounded |= !meta.bounded;
+        cols.push(meta);
+    }
+    st.cols = Some(cols);
+    st.block_fallback = any_unbounded;
+    Ok(())
+}
+
+/// Best-effort restoration of the default single-row statement state. The
+/// first failure is converted to an Error immediately, before later cleanup
+/// calls can replace its diagnostic record; all remaining cleanup still runs.
+fn reset_rowset(h: cli::SQLHANDLE) -> Option<Error> {
+    fn remember(first: &mut Option<Error>, h: cli::SQLHANDLE, rc: cli::SQLRETURN, context: &str) {
+        if first.is_none() && !cli_ok(rc) {
+            *first = Some(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                context,
+            ));
+        }
+    }
+
+    let mut first = None;
+    let rc = unsafe { cli::SQLFreeStmt(h, cli::SQL_UNBIND) };
+    remember(&mut first, h, rc, "SQLFreeStmt(SQL_UNBIND) failed");
+    let rc = unsafe { cli::SQLSetStmtAttr(h, cli::SQL_ATTR_ROW_ARRAY_SIZE, attr_value(1), 0) };
+    remember(&mut first, h, rc, "reset SQL_ATTR_ROW_ARRAY_SIZE failed");
+    let rc = unsafe { cli::SQLSetStmtAttr(h, cli::SQL_ATTR_ROW_STATUS_PTR, ptr::null_mut(), 0) };
+    remember(&mut first, h, rc, "reset SQL_ATTR_ROW_STATUS_PTR failed");
+    let rc = unsafe { cli::SQLSetStmtAttr(h, cli::SQL_ATTR_ROWS_FETCHED_PTR, ptr::null_mut(), 0) };
+    remember(&mut first, h, rc, "reset SQL_ATTR_ROWS_FETCHED_PTR failed");
+    first
+}
+
+fn ensure_rowset_reset(st: &mut StmtState) -> Result<()> {
+    if st.pending_rowset.is_none() {
+        return Ok(());
+    }
+    if let Some(error) = reset_rowset(st.handle.0) {
+        return Err(error);
+    }
+    st.pending_rowset = None;
+    Ok(())
+}
+
+fn finish_rowset(
+    st: &mut StmtState,
+    storage: Box<RowsetStorage>,
+    outcome: Result<Vec<Vec<Value>>>,
+    reset_error: Option<Error>,
+) -> Result<Vec<Vec<Value>>> {
+    if let Some(reset_error) = reset_error {
+        // Even when the fetch itself already failed, retain every address the
+        // CLI may still hold. A later operation retries cleanup first; finalize
+        // and driver drop free the native handle before this box is dropped.
+        st.pending_rowset = Some(storage);
+        return match outcome {
+            Ok(_) => Err(reset_error),
+            Err(operation_error) => Err(operation_error),
+        };
+    }
+    outcome
+}
+
+fn fetch_block_fallback(st: &StmtState) -> Result<Vec<Vec<Value>>> {
+    let h = st.handle.0;
+    let rc = unsafe { cli::SQLFetch(h) };
+    if rc == cli::SQL_NO_DATA {
+        return Ok(Vec::new());
+    }
+    if !cli_ok(rc) {
+        return Err(make_error(
+            cli::SQL_HANDLE_STMT,
+            h,
+            ErrorCode::Unknown,
+            "SQLFetch failed",
+        ));
+    }
+
+    let cols = st.cols.as_deref().unwrap_or_default();
+    let mut row = Vec::with_capacity(cols.len());
+    for (index, meta) in cols.iter().enumerate() {
+        row.push(read_column_typed(h, index, meta.sql_type)?);
+    }
+    Ok(vec![row])
+}
+
+fn fetch_block_rowset(st: &mut StmtState, max_rows: usize) -> Result<Vec<Vec<Value>>> {
+    let h = st.handle.0;
+    let cols = st.cols.clone().unwrap_or_default();
+    let per_row = cols
+        .iter()
+        .try_fold(0usize, |total, meta| total.checked_add(meta.bind_width))
+        .ok_or_else(|| Error::new(ErrorCode::Mapping, "rowset width overflow"))?;
+    let mut row_count = FETCH_BLOCK_BYTES
+        .checked_div(per_row)
+        .unwrap_or(MAX_BLOCK_ROWS)
+        .max(1);
+    row_count = row_count.min(MAX_BLOCK_ROWS).min(max_rows);
+
+    // The entire storage object is heap-pinned before any address is handed to
+    // the CLI. Its data buffers are i64-backed for 8-byte numeric alignment.
+    let mut storage = Box::new(RowsetStorage {
+        buffers: Vec::with_capacity(cols.len()),
+        indicators: Vec::with_capacity(cols.len()),
+        rows_fetched: 0,
+        row_status: vec![0; row_count],
+    });
+    for meta in &cols {
+        let bytes = meta
+            .bind_width
+            .checked_mul(row_count)
+            .ok_or_else(|| Error::new(ErrorCode::Mapping, "rowset buffer size overflow"))?;
+        storage
+            .buffers
+            .push(vec![0i64; bytes.div_ceil(std::mem::size_of::<i64>())]);
+        storage.indicators.push(vec![0; row_count]);
+    }
+
+    let outcome = (|| -> Result<Vec<Vec<Value>>> {
+        for (attribute, value) in [
+            (
+                cli::SQL_ATTR_ROW_BIND_TYPE,
+                attr_value(cli::SQL_BIND_BY_COLUMN),
+            ),
+            (
+                cli::SQL_ATTR_ROW_ARRAY_SIZE,
+                attr_value(row_count as cli::SQLULEN),
+            ),
+            (
+                cli::SQL_ATTR_ROW_STATUS_PTR,
+                storage.row_status.as_mut_ptr().cast(),
+            ),
+            (
+                cli::SQL_ATTR_ROWS_FETCHED_PTR,
+                (&mut storage.rows_fetched as *mut cli::SQLULEN).cast(),
+            ),
+        ] {
+            let rc = unsafe { cli::SQLSetStmtAttr(h, attribute, value, 0) };
+            if !cli_ok(rc) {
+                return Err(make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLSetStmtAttr (rowset) failed",
+                ));
+            }
+        }
+
+        for (index, meta) in cols.iter().enumerate() {
+            let rc = unsafe {
+                cli::SQLBindCol(
+                    h,
+                    (index + 1) as cli::SQLUSMALLINT,
+                    meta.c_type,
+                    storage.buffers[index].as_mut_ptr().cast(),
+                    meta.bind_width as cli::SQLLEN,
+                    storage.indicators[index].as_mut_ptr(),
+                )
+            };
+            if !cli_ok(rc) {
+                return Err(make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLBindCol (rowset) failed",
+                ));
+            }
+        }
+
+        // Db2 can report SQL_NO_DATA together with a non-zero partial final
+        // rowset. Only zero rows fetched is the true end-of-cursor signal.
+        let rc = unsafe { cli::SQLFetch(h) };
+        if rc == cli::SQL_NO_DATA && storage.rows_fetched == 0 {
+            return Ok(Vec::new());
+        }
+        if !cli_ok(rc) && rc != cli::SQL_NO_DATA {
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                "SQLFetch (rowset) failed",
+            ));
+        }
+
+        let fetched = storage.rows_fetched as usize;
+        if fetched > row_count {
+            return Err(Error::new(
+                ErrorCode::Mapping,
+                "Db2 reported more rowset rows than the bound capacity",
+            ));
+        }
+        let mut block: Vec<Vec<Value>> = (0..fetched)
+            .map(|_| Vec::with_capacity(cols.len()))
+            .collect();
+        for (col_index, meta) in cols.iter().enumerate() {
+            for (row_index, (row, &indicator)) in block
+                .iter_mut()
+                .zip(storage.indicators[col_index].iter())
+                .enumerate()
+            {
+                if indicator == cli::SQL_NULL_DATA {
+                    row.push(Value::Null);
+                    continue;
+                }
+                let offset = meta.bind_width * row_index;
+                let base = storage.buffers[col_index].as_ptr().cast::<u8>();
+                // Safety: offset and bind_width were used to size this column's
+                // backing allocation, and row_index is bounded by row_count.
+                let slot = unsafe { std::slice::from_raw_parts(base.add(offset), meta.bind_width) };
+                match meta.c_type {
+                    cli::SQL_C_SBIGINT => {
+                        let mut bytes = [0u8; std::mem::size_of::<i64>()];
+                        bytes.copy_from_slice(&slot[..std::mem::size_of::<i64>()]);
+                        row.push(Value::Int(i64::from_ne_bytes(bytes)));
+                    }
+                    cli::SQL_C_DOUBLE => {
+                        let mut bytes = [0u8; std::mem::size_of::<f64>()];
+                        bytes.copy_from_slice(&slot[..std::mem::size_of::<f64>()]);
+                        row.push(Value::Double(f64::from_ne_bytes(bytes)));
+                    }
+                    cli::SQL_C_BIT => row.push(Value::Int(i64::from(slot[0] != 0))),
+                    cli::SQL_C_BINARY => {
+                        let len = usize::try_from(indicator)
+                            .unwrap_or(meta.bind_width)
+                            .min(meta.bind_width);
+                        row.push(Value::Bytes(slot[..len].to_vec()));
+                    }
+                    _ => {
+                        let capacity = meta.bind_width.saturating_sub(1);
+                        let len = usize::try_from(indicator).unwrap_or(capacity).min(capacity);
+                        row.push(Value::Text(
+                            String::from_utf8_lossy(&slot[..len]).into_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(block)
+    })();
+
+    let reset_error = reset_rowset(h);
+    finish_rowset(st, storage, outcome, reset_error)
 }
 
 impl CliDriver for Db2CliDriver {
@@ -632,6 +1004,9 @@ impl CliDriver for Db2CliDriver {
                 state: Arc::new(Mutex::new(StmtState {
                     handle: RawHandle(s),
                     bound: Vec::new(),
+                    cols: None,
+                    block_fallback: false,
+                    pending_rowset: None,
                 })),
             },
         );
@@ -643,6 +1018,7 @@ impl CliDriver for Db2CliDriver {
             return Err(unknown_stmt());
         };
         let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
         // Build every BoundParam first so the Vec reaches its final size, then
         // bind — the addresses handed to the CLI must not move afterwards.
         st.bound = params.iter().map(BoundParam::from_value).collect();
@@ -697,7 +1073,8 @@ impl CliDriver for Db2CliDriver {
         let Some(st) = self.stmt_state(stmt) else {
             return Err(unknown_stmt());
         };
-        let st = st.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
         let h = st.handle.0;
         let rc = unsafe { cli::SQLExecute(h) };
         if !cli_ok(rc) && rc != cli::SQL_NO_DATA {
@@ -708,6 +1085,8 @@ impl CliDriver for Db2CliDriver {
                 "SQLExecute failed",
             ));
         }
+        st.cols = None;
+        st.block_fallback = false;
         let mut rows: cli::SQLLEN = 0;
         unsafe { cli::SQLRowCount(h, &mut rows) };
         Ok(i64::from(rows.max(0)))
@@ -720,7 +1099,10 @@ impl CliDriver for Db2CliDriver {
         let Some(st) = self.stmt_state(stmt) else {
             return Err(unknown_stmt());
         };
-        let st = st.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
+        st.cols = None;
+        st.block_fallback = false;
         let h = st.handle.0;
         let n_rows = rows.len();
         if n_rows == 0 {
@@ -950,7 +1332,8 @@ impl CliDriver for Db2CliDriver {
         let Some(st) = self.stmt_state(stmt) else {
             return Err(unknown_stmt());
         };
-        let st = st.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
         let h = st.handle.0;
         let mut n: cli::SQLSMALLINT = 0;
         let rc = unsafe { cli::SQLNumResultCols(h, &mut n) };
@@ -969,7 +1352,8 @@ impl CliDriver for Db2CliDriver {
         let Some(st) = self.stmt_state(stmt) else {
             return Err(unknown_stmt());
         };
-        let st = st.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
         let h = st.handle.0;
         let mut name = [0u8; 256];
         let mut name_len: cli::SQLSMALLINT = 0;
@@ -1012,39 +1396,16 @@ impl CliDriver for Db2CliDriver {
         if max_rows == 0 {
             return Ok(Vec::new());
         }
-        let st = st.lock().unwrap_or_else(|p| p.into_inner());
-        let h = st.handle.0;
-        let mut columns: cli::SQLSMALLINT = 0;
-        let rc = unsafe { cli::SQLNumResultCols(h, &mut columns) };
-        if !cli_ok(rc) {
-            return Err(make_error(
-                cli::SQL_HANDLE_STMT,
-                h,
-                ErrorCode::Unknown,
-                "SQLNumResultCols failed",
-            ));
+        let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
+        if st.cols.is_none() {
+            describe_columns(&mut st)?;
         }
-        let mut block = Vec::new();
-        while block.len() < max_rows {
-            let rc = unsafe { cli::SQLFetch(h) };
-            if rc == cli::SQL_NO_DATA {
-                break;
-            }
-            if !cli_ok(rc) {
-                return Err(make_error(
-                    cli::SQL_HANDLE_STMT,
-                    h,
-                    ErrorCode::Unknown,
-                    "SQLFetch failed",
-                ));
-            }
-            let mut row = Vec::with_capacity(columns.max(0) as usize);
-            for index in 0..columns.max(0) as usize {
-                row.push(read_current_column(h, index)?);
-            }
-            block.push(row);
+        if st.block_fallback {
+            fetch_block_fallback(&st)
+        } else {
+            fetch_block_rowset(&mut st, max_rows)
         }
-        Ok(block)
     }
 
     fn finalize(&self, stmt: StatementHandle) -> Result<()> {
@@ -1066,7 +1427,8 @@ impl CliDriver for Db2CliDriver {
         let Some(st) = self.stmt_state(stmt) else {
             return Ok(());
         };
-        let st = st.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
         let rc = unsafe { cli::SQLFreeStmt(st.handle.0, cli::SQL_CLOSE) };
         // SQL_SUCCESS_WITH_INFO / "no cursor open" are benign; only a hard
         // error is reported.
@@ -1078,6 +1440,8 @@ impl CliDriver for Db2CliDriver {
                 "SQLFreeStmt(SQL_CLOSE) failed",
             ));
         }
+        st.cols = None;
+        st.block_fallback = false;
         Ok(())
     }
 
@@ -1166,6 +1530,37 @@ mod tests {
     fn driver_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Db2CliDriver>();
+    }
+
+    #[test]
+    fn reset_failure_retains_native_rowset_pointer_storage() {
+        let mut storage = Box::new(RowsetStorage {
+            buffers: vec![vec![0]],
+            indicators: vec![vec![0]],
+            rows_fetched: 0,
+            row_status: vec![0],
+        });
+        let fetched_ptr = std::ptr::addr_of_mut!(storage.rows_fetched);
+        let status_ptr = storage.row_status.as_mut_ptr();
+        let mut st = StmtState {
+            handle: RawHandle(ptr::null_mut()),
+            bound: Vec::new(),
+            cols: None,
+            block_fallback: false,
+            pending_rowset: None,
+        };
+
+        let err = finish_rowset(
+            &mut st,
+            storage,
+            Ok(Vec::new()),
+            Some(Error::new(ErrorCode::Unknown, "reset failed")),
+        )
+        .unwrap_err();
+        assert_eq!(err.message, "reset failed");
+        let retained = st.pending_rowset.as_mut().unwrap();
+        assert_eq!(std::ptr::addr_of_mut!(retained.rows_fetched), fetched_ptr);
+        assert_eq!(retained.row_status.as_mut_ptr(), status_ptr);
     }
 
     #[test]

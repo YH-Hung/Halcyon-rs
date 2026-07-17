@@ -96,6 +96,7 @@ struct State {
     fail_fetch_block_on_call: u32, // 1-based fetch_block() index; 0 = never
     fetch_block_calls: u32,
     fetch_block_size: usize, // 0 => caller's max_rows; >0 => cap per call
+    unbounded_columns: bool, // long/LOB mode caps each successful block at one row
     fetch_block_requests: Vec<usize>,
 
     // --- finalize / close_cursor ---
@@ -244,6 +245,13 @@ impl MockCliDriver {
     /// multiple block requests without fabricating driver behavior.
     pub fn set_fetch_block_size(&self, rows: usize) -> &Self {
         self.lock().fetch_block_size = rows;
+        self
+    }
+
+    /// Models a result set containing a long/LOB column: the real Db2 driver
+    /// intentionally uses the portable one-row fallback for such statements.
+    pub fn set_unbounded_columns(&self, enabled: bool) -> &Self {
+        self.lock().unbounded_columns = enabled;
         self
     }
 
@@ -426,10 +434,13 @@ impl CliDriver for MockCliDriver {
                 Error::new(ErrorCode::Unknown, "scripted fetch_block failure")
             }));
         }
-        let limit = match s.fetch_block_size {
+        let mut limit = match s.fetch_block_size {
             0 => max_rows,
             cap => cap.min(max_rows),
         };
+        if s.unbounded_columns {
+            limit = limit.min(1);
+        }
         let st = s.statements.get_mut(&stmt.0).ok_or_else(unknown_stmt)?;
         let start = (st.position + 1) as usize;
         let end = start.saturating_add(limit).min(st.cursor.rows.len());
@@ -614,6 +625,29 @@ mod tests {
         );
         assert_eq!(m.fetch_block(s, 2).unwrap(), vec![vec![Value::Int(3)]]);
         assert!(m.fetch_block(s, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mock_unbounded_fallback_returns_at_most_one_row() {
+        let m = MockCliDriver::new();
+        let c = m.connect(&conn_params()).unwrap();
+        let s = m.prepare(c, "SELECT id, body FROM t").unwrap();
+        m.push_result_set(ScriptedRows::new(
+            ["id", "body"],
+            (1..=5)
+                .map(|id| vec![Value::Int(id), Value::Text(format!("lob-{id}"))])
+                .collect(),
+        ));
+        m.set_unbounded_columns(true);
+        m.execute(s).unwrap();
+
+        for id in 1..=5 {
+            assert_eq!(
+                m.fetch_block(s, 10).unwrap(),
+                vec![vec![Value::Int(id), Value::Text(format!("lob-{id}")),]]
+            );
+        }
+        assert!(m.fetch_block(s, 10).unwrap().is_empty());
     }
 
     #[test]
