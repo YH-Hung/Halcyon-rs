@@ -11,6 +11,7 @@ mod column;
 mod connection;
 mod params;
 mod result_set;
+mod savepoint;
 mod stmt_cache;
 mod transaction;
 
@@ -21,9 +22,13 @@ pub use column::FromColumn;
 pub use connection::{Connection, Statement};
 pub use params::{IntoParams, Named, Params};
 pub use result_set::{FromRow, QueryMap, ResultSet, Row};
+pub use savepoint::Savepoint;
 pub use transaction::Transaction;
 // Shared with the facade's owned pooled cursor / RAII transaction, which live
 // outside `core` and so can't reach these through the private submodules.
+pub(crate) use savepoint::{
+    auto_savepoint, named_savepoint, nested_savepoint, SavepointOwner, SavepointState,
+};
 pub(crate) use transaction::{start_with_isolation, terminate, IsolationBegin};
 // The statement cache and its lease token cross into `connection.rs` and the
 // facade's owned cursors, which live outside this module tree.

@@ -85,7 +85,7 @@ pub mod stress;
 pub use async_db::AsyncDatabase;
 pub use core::{
     Connection, FromColumn, FromRow, IntoParams, Named, Params, QueryMap, ResultSet, Row,
-    Statement, Transaction,
+    Savepoint, Statement, Transaction,
 };
 pub use error::{Error, ErrorCode, Result};
 pub use facade::{Database, QueryResult, ScopedTransaction, TxCursor, TxQueryMap};

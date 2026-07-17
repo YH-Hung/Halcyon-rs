@@ -8,11 +8,15 @@
 //! unwinds through it. Move-only (it borrows its connection) and never
 //! auto-retried: the caller re-drives the whole transaction on failure.
 
+use std::cell::Cell;
 use std::fmt;
 
 use crate::core::connection::Connection;
 use crate::core::params::IntoParams;
 use crate::core::result_set::{FromRow, ResultSet};
+use crate::core::{
+    auto_savepoint, named_savepoint, nested_savepoint, Savepoint, SavepointOwner, SavepointState,
+};
 use crate::driver::{CliDriver, ConnectionHandle};
 use crate::error::{Error, Result};
 use crate::value::Value;
@@ -22,9 +26,10 @@ use crate::Isolation;
 /// lifetime; see the module docs for the commit/rollback and drop semantics.
 pub struct Transaction<'c> {
     conn: &'c Connection,
-    active: bool,
-    poisoned: bool,
+    active: Cell<bool>,
+    poisoned: Cell<bool>,
     restore_isolation: Option<Isolation>,
+    savepoints: SavepointState,
 }
 
 /// Whether [`Transaction::finish`] should commit or roll back.
@@ -39,16 +44,17 @@ impl<'c> Transaction<'c> {
     fn new(conn: &'c Connection, restore_isolation: Option<Isolation>) -> Self {
         Transaction {
             conn,
-            active: true,
-            poisoned: false,
+            active: Cell::new(true),
+            poisoned: Cell::new(false),
             restore_isolation,
+            savepoints: SavepointState::new(),
         }
     }
 
     /// True until the transaction is committed or rolled back (including the
     /// implicit rollback on drop).
     pub fn active(&self) -> bool {
-        self.active
+        self.active.get()
     }
 
     /// True if a commit/rollback (or the implicit rollback on drop) failed,
@@ -56,7 +62,7 @@ impl<'c> Transaction<'c> {
     /// (Phase 4) discards such a connection rather than reusing it; mirrors the
     /// C++ `Transaction::poisoned`.
     pub fn poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned.get()
     }
 
     /// Executes a non-query statement within the unit of work. See
@@ -82,6 +88,25 @@ impl<'c> Transaction<'c> {
         self.conn.execute_batch(sql, rows)
     }
 
+    /// Creates a savepoint with an auto-generated `halcyon_sp_<n>` name.
+    pub fn savepoint(&self) -> Result<Savepoint<'_>> {
+        auto_savepoint(self)
+    }
+
+    /// Creates a savepoint named by the validated, unquoted identifier `name`.
+    pub fn savepoint_named(&self, name: &str) -> Result<Savepoint<'_>> {
+        named_savepoint(self, name)
+    }
+
+    /// Runs `f` in a savepoint scope. Successful work is released; a returned
+    /// error is rolled back while preserving that original error.
+    pub fn nested<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Self) -> Result<T>,
+    {
+        nested_savepoint(self, || f(self))
+    }
+
     /// Commits the unit of work and restores autocommit. A no-op (`Ok`) if the
     /// transaction has already ended. On failure the transaction is
     /// [`poisoned`](Transaction::poisoned) and the error is returned.
@@ -101,7 +126,7 @@ impl<'c> Transaction<'c> {
     /// C++ `Transaction::commit`/`rollback`. Returns the terminal op's error if it
     /// failed, otherwise the autocommit-restore result.
     fn finish(&mut self, outcome: Outcome) -> Result<()> {
-        if !self.active {
+        if !self.active.get() {
             return Ok(());
         }
         let (result, poisoned) = terminate(
@@ -110,12 +135,33 @@ impl<'c> Transaction<'c> {
             matches!(outcome, Outcome::Commit),
             self.restore_isolation,
         );
-        self.active = false;
+        self.active.set(false);
         if poisoned {
-            self.poisoned = true; // dead connection or autocommit lost
+            self.poisoned.set(true); // dead connection or autocommit lost
             self.conn.mark_unusable();
         }
         result
+    }
+}
+
+impl SavepointOwner for Transaction<'_> {
+    fn execute_savepoint(&self, sql: &str) -> Result<i64> {
+        self.execute(sql, ())
+    }
+
+    fn savepoint_active(&self) -> bool {
+        self.active.get()
+    }
+
+    fn poison_from_savepoint(&self) {
+        // This mirrors C++ `Transaction::poison`: a failed savepoint terminal
+        // operation makes the transaction untrustworthy, but does not itself
+        // claim the standalone connection's session transition was lost.
+        self.poisoned.set(true);
+    }
+
+    fn savepoint_state(&self) -> &SavepointState {
+        &self.savepoints
     }
 }
 
@@ -185,8 +231,8 @@ impl Drop for Transaction<'_> {
 impl fmt::Debug for Transaction<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Transaction")
-            .field("active", &self.active)
-            .field("poisoned", &self.poisoned)
+            .field("active", &self.active.get())
+            .field("poisoned", &self.poisoned.get())
             .finish_non_exhaustive()
     }
 }

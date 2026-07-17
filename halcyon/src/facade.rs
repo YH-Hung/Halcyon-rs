@@ -26,8 +26,9 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::core::{
-    start_with_isolation, terminate, Connection, FromRow, IntoParams, IsolationBegin, Params,
-    ResultSet, Row, StmtLease,
+    auto_savepoint, named_savepoint, nested_savepoint, start_with_isolation, terminate, Connection,
+    FromRow, IntoParams, IsolationBegin, Params, ResultSet, Row, Savepoint, SavepointOwner,
+    SavepointState, StmtLease,
 };
 use crate::driver::{CliDriver, ConnectionParams, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
@@ -128,9 +129,10 @@ impl Database {
         }
         Ok(ScopedTransaction {
             lease,
-            active: true,
-            poisoned: false,
+            active: Cell::new(true),
+            poisoned: Cell::new(false),
             restore_isolation: None,
+            savepoints: SavepointState::new(),
             conn_broken: Cell::new(false),
         })
     }
@@ -143,9 +145,10 @@ impl Database {
         match start_with_isolation(lease.driver_ref(), lease.handle(), level, restore_target) {
             IsolationBegin::Started => Ok(ScopedTransaction {
                 lease,
-                active: true,
-                poisoned: false,
+                active: Cell::new(true),
+                poisoned: Cell::new(false),
                 restore_isolation: Some(restore_target),
+                savepoints: SavepointState::new(),
                 conn_broken: Cell::new(false),
             }),
             IsolationBegin::OverrideFailed(e) => Err(e),
@@ -469,9 +472,10 @@ impl fmt::Debug for QueryResult {
 /// `ScopedTransaction`.
 pub struct ScopedTransaction {
     lease: PooledConnection,
-    active: bool,
-    poisoned: bool,
+    active: Cell<bool>,
+    poisoned: Cell<bool>,
     restore_isolation: Option<Isolation>,
+    savepoints: SavepointState,
     // Set when a statement run *inside* the unit of work dies on a
     // connection-class error — from a materializing call here or from a streaming
     // [`TxCursor`] that spoiled mid-scan. The terminal op's own poison
@@ -489,13 +493,13 @@ impl ScopedTransaction {
     /// True until committed or rolled back (including the implicit rollback on
     /// drop).
     pub fn active(&self) -> bool {
-        self.active
+        self.active.get()
     }
 
     /// True if a terminal op (or the drop rollback) failed, leaving the
     /// connection dead or autocommit unknown — the lease is then discarded.
     pub fn poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned.get()
     }
 
     /// Executes a non-query statement within the unit of work.
@@ -531,6 +535,25 @@ impl ScopedTransaction {
         crate::obs::instrument_execute(sql, || self.note(self.lease.execute_batch(sql, rows)))
     }
 
+    /// Creates a savepoint with an auto-generated `halcyon_sp_<n>` name.
+    pub fn savepoint(&self) -> Result<Savepoint<'_>> {
+        auto_savepoint(self)
+    }
+
+    /// Creates a savepoint named by the validated, unquoted identifier `name`.
+    pub fn savepoint_named(&self, name: &str) -> Result<Savepoint<'_>> {
+        named_savepoint(self, name)
+    }
+
+    /// Runs `f` in a savepoint scope. Successful work is released; a returned
+    /// error is rolled back while preserving that original error.
+    pub fn nested<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Self) -> Result<T>,
+    {
+        nested_savepoint(self, || f(self))
+    }
+
     /// Flags the unit of work's connection broken if `result` is a
     /// connection-class error, then passes the result through unchanged. Applied to
     /// every materializing call so a dead connection surfaced inside the
@@ -557,7 +580,7 @@ impl ScopedTransaction {
     }
 
     fn finish(&mut self, commit: bool) -> Result<()> {
-        if !self.active {
+        if !self.active.get() {
             return Ok(());
         }
         let (result, poisoned) = terminate(
@@ -566,11 +589,29 @@ impl ScopedTransaction {
             commit,
             self.restore_isolation,
         );
-        self.active = false;
+        self.active.set(false);
         if poisoned {
-            self.poisoned = true;
+            self.poisoned.set(true);
         }
         result
+    }
+}
+
+impl SavepointOwner for ScopedTransaction {
+    fn execute_savepoint(&self, sql: &str) -> Result<i64> {
+        self.execute(sql, ())
+    }
+
+    fn savepoint_active(&self) -> bool {
+        self.active.get()
+    }
+
+    fn poison_from_savepoint(&self) {
+        self.poisoned.set(true);
+    }
+
+    fn savepoint_state(&self) -> &SavepointState {
+        &self.savepoints
     }
 }
 
@@ -580,10 +621,10 @@ impl Drop for ScopedTransaction {
         // lease is returned: a poisoned terminal op *or* a connection-class failure
         // recorded inside the unit of work (see `conn_broken`) discards the
         // connection.
-        if self.active {
+        if self.active.get() {
             let _ = self.finish(false);
         }
-        if self.poisoned || self.conn_broken.get() {
+        if self.poisoned.get() || self.conn_broken.get() {
             self.lease.mark_broken();
         }
     }
@@ -592,8 +633,8 @@ impl Drop for ScopedTransaction {
 impl fmt::Debug for ScopedTransaction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScopedTransaction")
-            .field("active", &self.active)
-            .field("poisoned", &self.poisoned)
+            .field("active", &self.active.get())
+            .field("poisoned", &self.poisoned.get())
             .field("conn_broken", &self.conn_broken.get())
             .finish_non_exhaustive()
     }
@@ -959,6 +1000,26 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!(mock.commit_calls(), 1);
         assert_eq!(mock.auto_commit_calls(), vec![false, true]);
+    }
+
+    #[test]
+    fn scoped_transaction_savepoint_matches_connection_local() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+        let tx = db.begin().unwrap();
+
+        tx.savepoint_named("pooled_stage")
+            .unwrap()
+            .release()
+            .unwrap();
+
+        assert_eq!(
+            mock.prepared_sql(),
+            vec![
+                "SAVEPOINT pooled_stage ON ROLLBACK RETAIN CURSORS",
+                "RELEASE SAVEPOINT pooled_stage",
+            ]
+        );
     }
 
     #[test]
