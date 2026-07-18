@@ -7,13 +7,17 @@ use std::path::PathBuf;
 /// 1. `DB2_CLIDRIVER_ROOT` environment variable
 /// 2. `third_party/clidriver` at the workspace root
 fn main() {
+    // Always emit cache invalidation directives, including on docs.rs. Without
+    // this, Cargo can reuse the docs.rs build-script result (which has no link
+    // flags) when DOCS_RS is later unset for a normal Db2 build.
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    println!("cargo:rerun-if-env-changed=DB2_CLIDRIVER_ROOT");
+
     // docs.rs has no clidriver and never runs the resulting rlib; skip locating
     // and linking libdb2 so the published docs build succeeds.
     if env::var("DOCS_RS").is_ok() {
         return;
     }
-
-    println!("cargo:rerun-if-env-changed=DB2_CLIDRIVER_ROOT");
 
     let root = env::var("DB2_CLIDRIVER_ROOT")
         .ok()
