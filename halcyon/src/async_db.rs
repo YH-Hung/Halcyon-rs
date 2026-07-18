@@ -9,9 +9,12 @@
 //! reused verbatim, so read/write auto-retry, connection pooling, the
 //! per-connection statement cache, and broken-connection discard all carry over.
 //!
-//! Only `execute`, materialized `query_as`, `execute_batch`, and closure
-//! `transaction` are async; streaming `query` stays sync-only (a pool lease must
-//! not cross an await point — a documented C++ non-goal). With the
+//! The facade provides `execute`, materialized `query_as`, `execute_batch`,
+//! owned-LOB `execute_with_lobs`, and closure-scoped `query_streaming`,
+//! `transaction`, and `transaction_with_isolation`. Streaming cursors and
+//! transactions remain wholly inside their synchronous closure on one blocking
+//! thread; no pool lease, lending row, or transaction guard crosses an await
+//! point. There are deliberately no async `begin` methods. With the
 //! `observability` feature, the current [`tracing`] span and `Dispatch` are
 //! captured on the async task and entered/set inside the blocking closure so
 //! caller spans parent `halcyon.*` spans across `spawn_blocking`. (The
@@ -46,9 +49,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::core::{FromRow, IntoParams};
 use crate::error::{Error, ErrorCode, Result};
-use crate::facade::{Database, ScopedTransaction};
+use crate::facade::{Database, ScopedTransaction, StreamingQueryResult};
+use crate::lob::OwnedBindParam;
 use crate::pool::ConnectionPool;
 use crate::value::Value;
+use crate::Isolation;
 
 /// Async, pooled Db2 handle: a feature-gated `tokio` wrapper over [`Database`].
 /// Cloneable and thread-safe — clones share one underlying [`ConnectionPool`]
@@ -121,6 +126,29 @@ impl AsyncDatabase {
         run_blocking(&self.admit, move || db.query_as::<T>(&sql, params)).await
     }
 
+    /// Runs a row-at-a-time query and gives `f` exclusive access to its cursor
+    /// on one blocking thread. The cursor and pooled lease are dropped before
+    /// the blocking closure completes; no lending row crosses `.await`.
+    pub async fn query_streaming<T, F>(
+        &self,
+        sql: impl Into<String>,
+        params: impl IntoParams,
+        f: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&mut StreamingQueryResult) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let db = self.inner.clone();
+        let sql = sql.into();
+        let params = params.into_params();
+        run_blocking(&self.admit, move || {
+            let mut cursor = db.query_streaming(&sql, params)?;
+            f(&mut cursor)
+        })
+        .await
+    }
+
     /// Validates and runs a column-wise batch (rectangular + type-homogeneous)
     /// through the driver's array-binding path on a blocking thread. Takes owned
     /// `rows` (they move into the blocking closure). No auto-retry — the caller
@@ -133,6 +161,26 @@ impl AsyncDatabase {
         let db = self.inner.clone();
         let sql = sql.into();
         run_blocking(&self.admit, move || db.execute_batch(&sql, &rows)).await
+    }
+
+    /// Executes owned positional values and LOB sources exactly once on one
+    /// blocking thread. Source callbacks and the pooled lease remain inside the
+    /// blocking closure for the full operation.
+    pub async fn execute_with_lobs(
+        &self,
+        sql: impl Into<String>,
+        params: Vec<OwnedBindParam>,
+    ) -> Result<i64> {
+        let db = self.inner.clone();
+        let sql = sql.into();
+        run_blocking(&self.admit, move || {
+            let params = params
+                .into_iter()
+                .map(OwnedBindParam::into_borrowed)
+                .collect();
+            db.execute_with_lobs(&sql, params)
+        })
+        .await
     }
 
     /// Runs `f` inside a transaction on a single blocking thread: commits if it
@@ -148,6 +196,17 @@ impl AsyncDatabase {
     {
         let db = self.inner.clone();
         run_blocking(&self.admit, move || db.transaction(f)).await
+    }
+
+    /// Runs `f` in a transaction at `iso` on one blocking thread, restoring the
+    /// pooled connection's configured isolation when the closure completes.
+    pub async fn transaction_with_isolation<T, F>(&self, iso: Isolation, f: F) -> Result<T>
+    where
+        F: FnOnce(&ScopedTransaction) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let db = self.inner.clone();
+        run_blocking(&self.admit, move || db.transaction_with_isolation(iso, f)).await
     }
 }
 
@@ -399,6 +458,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_streaming_consumes_scalar_and_lob_inside_closure() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.set_lob_chunk_cap(2).push_result_set(ScriptedRows::new(
+            ["id", "doc"],
+            vec![vec![Value::Int(7), Value::Bytes(b"hello".to_vec())]],
+        ));
+        let db = open(&mock);
+
+        let result = db
+            .query_streaming("SELECT id, doc FROM docs", (), |cursor| {
+                let (id, doc) = {
+                    let mut row = cursor.next()?.expect("row");
+                    let id: i64 = row.get(0)?;
+                    let doc = row.lob(1)?.to_vec()?;
+                    (id, doc)
+                };
+                assert!(cursor.next()?.is_none());
+                Ok((id, doc))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, (7, b"hello".to_vec()));
+        assert_eq!(db.pool().idle_count(), 1);
+        assert_eq!(db.pool().active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_streaming_closure_error_returns_lease() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(1)]]));
+        let db = open(&mock);
+
+        let result: Result<()> = db
+            .query_streaming("SELECT id FROM t", (), |_cursor| {
+                Err(Error::new(ErrorCode::Mapping, "consumer failed"))
+            })
+            .await;
+
+        assert_eq!(result.unwrap_err().code, ErrorCode::Mapping);
+        assert_eq!(db.pool().idle_count(), 1);
+        assert_eq!(db.pool().active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_streaming_connection_error_discards_lease() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(1)]]));
+        mock.fail_fetch_next_on_call(1, Error::new(ErrorCode::Connection, "stream dropped"));
+        let db = open(&mock);
+
+        let result: Result<()> = db
+            .query_streaming("SELECT id FROM t", (), |cursor| {
+                cursor.next()?;
+                Ok(())
+            })
+            .await;
+
+        assert_eq!(result.unwrap_err().code, ErrorCode::Connection);
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_streaming_accepts_non_static_borrowed_params() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(9)]]));
+        let db = open(&mock);
+        let local = String::from("borrowed");
+
+        let id = db
+            .query_streaming("SELECT id FROM t WHERE name = ?", (&local[..],), |cursor| {
+                let mut row = cursor.next()?.expect("row");
+                row.get::<i64>(0)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(id, 9);
+        assert_eq!(db.pool().idle_count(), 1);
+    }
+
+    #[tokio::test]
     async fn execute_batch_delegates_to_connection() {
         let mock = Arc::new(MockCliDriver::new());
         let db = open(&mock);
@@ -413,6 +555,67 @@ mod tests {
         assert_eq!(affected, 2);
         assert_eq!(mock.execute_batch_calls(), 1);
         assert_eq!(mock.last_batch_rows(), rows);
+    }
+
+    #[tokio::test]
+    async fn execute_with_lobs_consumes_owned_callback_once() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.set_stream_pull_cap(2).push_stream_row_count(1);
+        let db = open(&mock);
+        let payload = b"owned-lob".to_vec();
+        let mut offset = 0_usize;
+        let source = crate::owned_lob_callback(
+            move |buffer| {
+                let count = buffer.len().min(payload.len().saturating_sub(offset));
+                buffer[..count].copy_from_slice(&payload[offset..offset + count]);
+                offset += count;
+                Ok(count)
+            },
+            Some(9),
+        );
+
+        let affected = db
+            .execute_with_lobs(
+                "INSERT INTO docs VALUES (?, ?)",
+                vec![
+                    crate::OwnedBindParam::Value(Value::Int(7)),
+                    crate::OwnedBindParam::Lob(source),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(affected, 1);
+        assert_eq!(mock.execute_streaming_calls(), 1);
+        assert_eq!(mock.last_stream_values(), vec![Value::Int(7), Value::Null]);
+        assert_eq!(
+            mock.last_streamed_lobs().get(&1).map(Vec::as_slice),
+            Some(b"owned-lob".as_slice())
+        );
+        assert_eq!(db.pool().idle_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_with_lobs_source_error_is_single_attempt_and_discards_dead_lease() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+        let source = crate::owned_lob_callback(
+            |_buffer| Err(Error::new(ErrorCode::Connection, "source disconnected")),
+            None,
+        );
+
+        let error = db
+            .execute_with_lobs(
+                "INSERT INTO docs VALUES (?)",
+                vec![crate::OwnedBindParam::Lob(source)],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Connection);
+        assert_eq!(mock.execute_streaming_calls(), 1);
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
     }
 
     #[tokio::test]
@@ -442,6 +645,55 @@ mod tests {
         assert_eq!(out.unwrap_err().code, ErrorCode::Constraint);
         assert_eq!(mock.commit_calls(), 0);
         assert_eq!(mock.rollback_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn transaction_with_isolation_commits_restores_cs_and_returns_lease() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+
+        let value = db
+            .transaction_with_isolation(crate::Isolation::UncommittedRead, |_tx| Ok(17_i32))
+            .await
+            .unwrap();
+
+        assert_eq!(value, 17);
+        assert_eq!(mock.commit_calls(), 1);
+        assert_eq!(mock.rollback_calls(), 0);
+        assert_eq!(mock.auto_commit_calls(), vec![false, true]);
+        assert_eq!(
+            mock.isolation_calls(),
+            vec![
+                crate::Isolation::UncommittedRead,
+                crate::Isolation::CursorStability,
+            ]
+        );
+        assert_eq!(db.pool().idle_count(), 1);
+        assert_eq!(db.pool().active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn transaction_with_isolation_rolls_back_on_closure_error() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+
+        let result: Result<()> = db
+            .transaction_with_isolation(crate::Isolation::RepeatableRead, |_tx| {
+                Err(Error::new(ErrorCode::Constraint, "dup"))
+            })
+            .await;
+
+        assert_eq!(result.unwrap_err().code, ErrorCode::Constraint);
+        assert_eq!(mock.commit_calls(), 0);
+        assert_eq!(mock.rollback_calls(), 1);
+        assert_eq!(
+            mock.isolation_calls(),
+            vec![
+                crate::Isolation::RepeatableRead,
+                crate::Isolation::CursorStability,
+            ]
+        );
+        assert_eq!(db.pool().idle_count(), 1);
     }
 
     #[tokio::test]

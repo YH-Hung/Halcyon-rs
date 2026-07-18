@@ -101,6 +101,22 @@ impl OwnedLobSource {
         }
         self
     }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn into_borrowed(self) -> LobSource<'static> {
+        match self {
+            Self::File { path, as_clob } => LobSource::File { path, as_clob },
+            Self::Callback {
+                pull,
+                size_hint,
+                as_clob,
+            } => LobSource::Callback {
+                pull,
+                size_hint,
+                as_clob,
+            },
+        }
+    }
 }
 
 /// Owned counterpart of [`BindParam`], used by the async facade.
@@ -112,6 +128,16 @@ pub enum OwnedBindParam {
 impl From<Value> for OwnedBindParam {
     fn from(value: Value) -> Self {
         Self::Value(value)
+    }
+}
+
+impl OwnedBindParam {
+    #[cfg(feature = "tokio")]
+    pub(crate) fn into_borrowed(self) -> BindParam<'static> {
+        match self {
+            Self::Value(value) => BindParam::Value(value),
+            Self::Lob(source) => BindParam::Lob(source.into_borrowed()),
+        }
     }
 }
 
