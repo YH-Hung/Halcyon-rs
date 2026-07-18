@@ -527,7 +527,7 @@ mod tests {
             assert_eq!(event.fields.get("attempt").map(String::as_str), Some("3"));
             assert_eq!(
                 event.fields.get("code").map(String::as_str),
-                Some("connection")
+                Some("Connection")
             );
             assert_eq!(
                 event.fields.get("sqlstate").map(String::as_str),

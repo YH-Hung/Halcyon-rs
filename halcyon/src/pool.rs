@@ -406,6 +406,7 @@ impl PoolInner {
     /// Ported from the C++ `ConnectionPool::maintain`.
     fn maintain(&self) {
         let mut discarded: Vec<Connection> = Vec::new();
+        let mut reaped = 0_usize;
         let mut guard = self.lock();
         let now = Instant::now();
 
@@ -422,6 +423,7 @@ impl PoolInner {
             let over_min = total > self.config.min;
             if expired_life || (expired_idle && over_min) {
                 total -= 1;
+                reaped += 1;
                 discarded.push(ic.conn); // disconnect after the lock is released
             } else {
                 kept.push_back(ic);
@@ -465,8 +467,8 @@ impl PoolInner {
             pm
         };
         drop(guard);
-        if !discarded.is_empty() {
-            crate::obs::emit_pool_reap(discarded.len());
+        if reaped > 0 {
+            crate::obs::emit_pool_reap(reaped);
         }
         #[cfg(feature = "observability")]
         crate::obs::flush_pool_metrics(&pm);
@@ -710,8 +712,18 @@ impl fmt::Debug for PooledConnection {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    #[cfg(feature = "observability")]
+    use crate::driver::{ConnectionHandle, GetDataChunk, ParamStreamSource, StatementHandle};
+    #[cfg(feature = "observability")]
+    use crate::obs::{obs_lock, with_tracing_events};
     use crate::testing::MockCliDriver;
+    #[cfg(feature = "observability")]
+    use crate::value::Value;
+    #[cfg(feature = "observability")]
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
+    #[cfg(feature = "observability")]
+    use std::sync::Barrier;
 
     fn params() -> ConnectionParams {
         ConnectionParams {
@@ -750,6 +762,126 @@ mod tests {
         let mut e = Error::new(ErrorCode::Connection, msg);
         e.retriable = true;
         e
+    }
+
+    #[cfg(feature = "observability")]
+    struct BlockingRefillDriver {
+        next_connection: AtomicU64,
+        refill_connected: Barrier,
+        release_refill: Barrier,
+    }
+
+    #[cfg(feature = "observability")]
+    impl BlockingRefillDriver {
+        fn new() -> Self {
+            Self {
+                next_connection: AtomicU64::new(1),
+                refill_connected: Barrier::new(2),
+                release_refill: Barrier::new(2),
+            }
+        }
+    }
+
+    #[cfg(feature = "observability")]
+    impl CliDriver for BlockingRefillDriver {
+        fn connect(&self, _params: &ConnectionParams) -> Result<ConnectionHandle> {
+            let handle = self.next_connection.fetch_add(1, Ordering::SeqCst);
+            if handle == 2 {
+                self.refill_connected.wait();
+                self.release_refill.wait();
+            }
+            Ok(ConnectionHandle(handle))
+        }
+
+        fn disconnect(&self, _conn: ConnectionHandle) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_alive(&self, _conn: ConnectionHandle) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn prepare(&self, _conn: ConnectionHandle, _sql: &str) -> Result<StatementHandle> {
+            Ok(StatementHandle(1))
+        }
+
+        fn bind_params(&self, _stmt: StatementHandle, _params: &[Value]) -> Result<()> {
+            Ok(())
+        }
+
+        fn execute(&self, _stmt: StatementHandle) -> Result<i64> {
+            Ok(0)
+        }
+
+        fn execute_batch(&self, _stmt: StatementHandle, _rows: &[Vec<Value>]) -> Result<i64> {
+            Ok(0)
+        }
+
+        fn column_count(&self, _stmt: StatementHandle) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn column_name(&self, _stmt: StatementHandle, _index: usize) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn fetch_block(&self, _stmt: StatementHandle, _max_rows: usize) -> Result<Vec<Vec<Value>>> {
+            Ok(Vec::new())
+        }
+
+        fn fetch_next(&self, _stmt: StatementHandle) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn get_value(&self, _stmt: StatementHandle, _column: usize) -> Result<Value> {
+            Ok(Value::Null)
+        }
+
+        fn get_data_chunk(
+            &self,
+            _stmt: StatementHandle,
+            _column: usize,
+            _buffer: &mut [u8],
+        ) -> Result<GetDataChunk> {
+            Ok(GetDataChunk {
+                bytes: 0,
+                done: true,
+                is_null: true,
+            })
+        }
+
+        fn execute_streaming(
+            &self,
+            _stmt: StatementHandle,
+            _params: &[Value],
+            _sources: Vec<ParamStreamSource<'_>>,
+        ) -> Result<i64> {
+            Ok(0)
+        }
+
+        fn finalize(&self, _stmt: StatementHandle) -> Result<()> {
+            Ok(())
+        }
+
+        fn close_cursor(&self, _stmt: StatementHandle) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_auto_commit(&self, _conn: ConnectionHandle, _enabled: bool) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_isolation(&self, _conn: ConnectionHandle, _level: Isolation) -> Result<()> {
+            Ok(())
+        }
+
+        fn commit(&self, _conn: ConnectionHandle) -> Result<()> {
+            Ok(())
+        }
+
+        fn rollback(&self, _conn: ConnectionHandle) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1089,6 +1221,39 @@ mod tests {
         assert_eq!(p.total_count(), 1);
         assert_eq!(mock.disconnect_calls(), 1);
         assert_eq!(mock.connect_calls(), 2); // warmup + refill
+    }
+
+    #[cfg(feature = "observability")]
+    #[test]
+    fn maintenance_shutdown_discard_is_not_counted_as_reaped() {
+        let _guard = obs_lock();
+        let driver = Arc::new(BlockingRefillDriver::new());
+        let mut config = cfg(1, 1);
+        config.max_lifetime = Duration::ZERO;
+        let pool = Arc::new(
+            ConnectionPool::create(driver.clone(), params(), config).expect("warmup connection"),
+        );
+
+        let worker_pool = Arc::clone(&pool);
+        let worker = thread::spawn(move || {
+            with_tracing_events(|_, events| {
+                worker_pool.maintain();
+                let guard = events.lock().unwrap();
+                guard
+                    .iter()
+                    .find(|event| event.name == "pool.reap")
+                    .and_then(|event| event.fields.get("count"))
+                    .cloned()
+            })
+        });
+
+        // The expired warmup slot has been removed and its replacement has
+        // connected, but maintain() has not yet re-locked the pool state.
+        driver.refill_connected.wait();
+        pool.inner.lock().stopping = true;
+        driver.release_refill.wait();
+
+        assert_eq!(worker.join().unwrap().as_deref(), Some("1"));
     }
 
     #[test]

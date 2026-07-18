@@ -1,7 +1,6 @@
 //! Structured tracing events matching the C++ observability catalog.
 
 use crate::error::Error;
-use crate::obs::labels::code_label;
 
 pub(crate) fn emit_connect_ok(attempt: u32) {
     tracing::event!(
@@ -16,7 +15,7 @@ pub(crate) fn emit_connect_fail(attempt: u32, error: &Error) {
         name: "connect.fail",
         tracing::Level::ERROR,
         attempt = attempt as u64,
-        code = code_label(error.code),
+        code = error.code.as_str(),
         sqlstate = error.sqlstate.as_str(),
     );
 }
@@ -33,7 +32,7 @@ pub(crate) fn emit_reconnect_fail(error: &Error) {
     tracing::event!(
         name: "reconnect.fail",
         tracing::Level::ERROR,
-        code = code_label(error.code),
+        code = error.code.as_str(),
     );
 }
 
@@ -95,6 +94,6 @@ pub(crate) fn emit_isolation_restore_fail(error: &Error) {
     tracing::event!(
         name: "isolation.restore_fail",
         tracing::Level::ERROR,
-        code = code_label(error.code),
+        code = error.code.as_str(),
     );
 }

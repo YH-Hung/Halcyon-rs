@@ -106,7 +106,7 @@ fn connect_attempts_emit_exact_success_and_failure_events() {
         assert_eq!(fail.fields.get("attempt").map(String::as_str), Some("1"));
         assert_eq!(
             fail.fields.get("code").map(String::as_str),
-            Some("connection")
+            Some("Connection")
         );
         assert_eq!(
             fail.fields.get("sqlstate").map(String::as_str),
@@ -176,7 +176,7 @@ fn reconnect_failure_emits_error_code() {
         assert_eq!(fail.fields.len(), 1);
         assert_eq!(
             fail.fields.get("code").map(String::as_str),
-            Some("connection")
+            Some("Connection")
         );
     });
 }

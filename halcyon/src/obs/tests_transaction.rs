@@ -119,7 +119,7 @@ fn isolation_restore_failure_emits_exact_error_code() {
         assert_eq!(restore.fields.len(), 1);
         assert_eq!(
             restore.fields.get("code").map(String::as_str),
-            Some("connection")
+            Some("Connection")
         );
     });
 }
