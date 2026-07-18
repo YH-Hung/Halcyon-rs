@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use halcyon::driver::{CliDriver, ConnectionParams, Db2CliDriver};
+use halcyon::driver::{CliDriver, ConnectionParams, Db2CliDriver, ParamStreamSource};
 use halcyon::{named, Connection, Database, Error, ErrorCode, Value};
 
 fn test_dsn() -> Option<String> {
@@ -334,4 +334,127 @@ fn live_rowset_fetch_and_long_column_fallback() {
 
     conn.execute("DROP TABLE halcyon_rowset_rs", ())
         .expect("drop rowset table");
+}
+
+/// Proves `SQLCancel` leaves a statement out of `SQL_NEED_DATA` by reusing the
+/// exact direct-seam handle after a source abort. A facade/cache re-prepare
+/// would not prove this property, so there is deliberately no portable wrapper
+/// between the two `execute_streaming` calls below.
+#[test]
+fn aborted_streaming_execute_allows_reuse_of_same_statement_handle() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("HALCYON_TEST_DSN not set; skipping same-handle SQLCancel live proof");
+        return;
+    };
+    let (driver, conn) = open(&dsn);
+    const TABLE: &str = "halcyon_cancel_lob";
+    let _ = conn.execute(&format!("DROP TABLE {TABLE}"), ());
+    conn.execute(
+        &format!("CREATE TABLE {TABLE}(id INT NOT NULL, body BLOB(1M))"),
+        (),
+    )
+    .expect("create SQLCancel proof table");
+
+    let statement = match driver.prepare(
+        conn.handle(),
+        &format!("INSERT INTO {TABLE}(id, body) VALUES (?, ?)"),
+    ) {
+        Ok(statement) => statement,
+        Err(error) => {
+            let _ = conn.execute(&format!("DROP TABLE {TABLE}"), ());
+            panic!("prepare SQLCancel proof statement: {error}");
+        }
+    };
+
+    let proof = (|| -> halcyon::Result<()> {
+        let mut pulls = 0usize;
+        let abort_message = "intentional LOB source abort after first chunk";
+        let aborted = driver.execute_streaming(
+            statement,
+            &[Value::Int(1), Value::Null],
+            vec![ParamStreamSource {
+                param_index: 1,
+                pull: Box::new(|stage| {
+                    pulls += 1;
+                    if pulls == 1 {
+                        let chunk = b"partial-chunk";
+                        if stage.len() < chunk.len() {
+                            return Err(Error::new(
+                                ErrorCode::Mapping,
+                                "Db2 LOB stage unexpectedly too small",
+                            ));
+                        }
+                        stage[..chunk.len()].copy_from_slice(chunk);
+                        Ok(chunk.len())
+                    } else {
+                        Err(Error::new(ErrorCode::Mapping, abort_message))
+                    }
+                }),
+                size_hint: None,
+                is_clob: false,
+            }],
+        );
+        match aborted {
+            Err(error) if error.code == ErrorCode::Mapping && error.message == abort_message => {}
+            Err(error) => {
+                return Err(Error::new(
+                    ErrorCode::Mapping,
+                    format!("streaming abort returned an unexpected error: {error}"),
+                ));
+            }
+            Ok(rows) => {
+                return Err(Error::new(
+                    ErrorCode::InvalidState,
+                    format!("streaming abort unexpectedly succeeded with {rows} rows"),
+                ));
+            }
+        }
+
+        // No finalize or prepare occurs here: `statement` is exactly the same
+        // StatementHandle that was left by the aborted NEED_DATA exchange.
+        let payload = b"complete-value";
+        let mut offset = 0usize;
+        let rows = driver.execute_streaming(
+            statement,
+            &[Value::Int(2), Value::Null],
+            vec![ParamStreamSource {
+                param_index: 1,
+                pull: Box::new(|stage| {
+                    let count = stage.len().min(payload.len().saturating_sub(offset));
+                    stage[..count].copy_from_slice(&payload[offset..offset + count]);
+                    offset += count;
+                    Ok(count)
+                }),
+                size_hint: Some(payload.len() as u64),
+                is_clob: false,
+            }],
+        )?;
+        if rows != 1 {
+            return Err(Error::new(
+                ErrorCode::InvalidState,
+                format!("same-handle execute affected {rows} rows instead of 1"),
+            ));
+        }
+
+        let ids: Vec<(i32,)> = conn.query_as(&format!("SELECT id FROM {TABLE} ORDER BY id"), ())?;
+        if ids != vec![(2,)] {
+            return Err(Error::new(
+                ErrorCode::InvalidState,
+                format!("unexpected rows after abort/reuse: {ids:?}"),
+            ));
+        }
+        Ok(())
+    })();
+
+    // Run both cleanup steps before surfacing a proof error. Cleanup diagnostics
+    // are supplemental and never replace the same-handle assertion result.
+    let finalize = driver.finalize(statement);
+    let drop_table = conn.execute(&format!("DROP TABLE {TABLE}"), ());
+    if let Err(error) = proof {
+        panic!(
+            "same-handle SQLCancel proof failed: {error}; statement cleanup: {finalize:?}; table cleanup: {drop_table:?}"
+        );
+    }
+    finalize.expect("finalize SQLCancel proof statement");
+    drop_table.expect("drop SQLCancel proof table");
 }
