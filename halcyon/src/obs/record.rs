@@ -43,6 +43,13 @@ pub(crate) struct SpanRecord {
     meta: &'static TraceMetadata<'static>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EventRecord {
+    pub name: String,
+    pub level: tracing::Level,
+    pub fields: HashMap<String, String>,
+}
+
 /// Captures every metric emission into a shared sample list.
 #[derive(Clone, Default)]
 pub(crate) struct RecordingRecorder {
@@ -178,6 +185,7 @@ pub(crate) fn with_metrics<R>(f: impl FnOnce(&RecordingRecorder) -> R) -> R {
 /// Recording tracing subscriber: captures span names, string attrs, parentage.
 pub(crate) struct RecordingSubscriber {
     spans: Arc<Mutex<Vec<SpanRecord>>>,
+    events: Arc<Mutex<Vec<EventRecord>>>,
     next_id: Mutex<u64>,
     /// Per-thread enter stack of span ids.
     stack: thread_local::ThreadLocalCell,
@@ -212,8 +220,16 @@ mod thread_local {
 
 impl RecordingSubscriber {
     pub(crate) fn new(spans: Arc<Mutex<Vec<SpanRecord>>>) -> Self {
+        Self::with_events(spans, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    pub(crate) fn with_events(
+        spans: Arc<Mutex<Vec<SpanRecord>>>,
+        events: Arc<Mutex<Vec<EventRecord>>>,
+    ) -> Self {
         RecordingSubscriber {
             spans,
+            events,
             next_id: Mutex::new(1),
             stack: thread_local::ThreadLocalCell,
         }
@@ -317,6 +333,21 @@ impl Subscriber for RecordingSubscriber {
     fn record_follows_from(&self, _: &Id, _: &Id) {}
 
     fn event(&self, event: &Event<'_>) {
+        let mut fields = HashMap::new();
+        let mut errored = false;
+        event.record(&mut AttrVisitor {
+            attrs: &mut fields,
+            errored: &mut errored,
+        });
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(EventRecord {
+                name: event.metadata().name().to_string(),
+                level: *event.metadata().level(),
+                fields,
+            });
+
         // Mark the current span errored on error-level events.
         if *event.metadata().level() <= tracing::Level::ERROR {
             if let Some(top) = self.stack.top() {
@@ -360,6 +391,16 @@ pub(crate) fn with_tracing<R>(f: impl FnOnce(Arc<Mutex<Vec<SpanRecord>>>) -> R) 
     let spans = Arc::new(Mutex::new(Vec::new()));
     let sub = RecordingSubscriber::new(Arc::clone(&spans));
     tracing::subscriber::with_default(sub, || f(spans))
+}
+
+/// Runs `f` with independently recorded spans and events.
+pub(crate) fn with_tracing_events<R>(
+    f: impl FnOnce(Arc<Mutex<Vec<SpanRecord>>>, Arc<Mutex<Vec<EventRecord>>>) -> R,
+) -> R {
+    let spans = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sub = RecordingSubscriber::with_events(Arc::clone(&spans), Arc::clone(&events));
+    tracing::subscriber::with_default(sub, || f(spans, events))
 }
 
 /// Runs `f` with both a recording metrics recorder and tracing subscriber.
@@ -433,6 +474,65 @@ mod tests {
             let guard = spans.lock().unwrap();
             let s = find_span(&guard, "halcyon.execute").expect("span");
             assert_eq!(s.attrs.get("db.system").map(String::as_str), Some("db2"));
+        });
+    }
+
+    #[test]
+    fn subscriber_records_events_independently_from_spans() {
+        let _g = obs_lock();
+        with_tracing_events(|spans, events| {
+            tracing::event!(
+                name: "connect.fail",
+                tracing::Level::ERROR,
+                attempt = 2_u64,
+                code = "connection",
+                sqlstate = "08001"
+            );
+
+            assert!(spans.lock().unwrap().is_empty());
+            let guard = events.lock().unwrap();
+            let event = guard.first().expect("event");
+            assert_eq!(event.name, "connect.fail");
+            assert_eq!(event.level, tracing::Level::ERROR);
+            assert_eq!(event.fields.get("attempt").map(String::as_str), Some("2"));
+            assert_eq!(
+                event.fields.get("code").map(String::as_str),
+                Some("connection")
+            );
+            assert_eq!(
+                event.fields.get("sqlstate").map(String::as_str),
+                Some("08001")
+            );
+        });
+    }
+
+    #[test]
+    fn connect_fail_event_has_exact_catalog_metadata() {
+        let _g = obs_lock();
+        with_tracing_events(|_, events| {
+            let error = crate::error::Error {
+                code: crate::error::ErrorCode::Connection,
+                sqlstate: "08001".into(),
+                native_error: -30082,
+                message: "connect failed".into(),
+                retriable: true,
+            };
+            crate::obs::emit_connect_fail(3, &error);
+
+            let guard = events.lock().unwrap();
+            let event = guard.first().expect("event");
+            assert_eq!(event.name, "connect.fail");
+            assert_eq!(event.level, tracing::Level::ERROR);
+            assert_eq!(event.fields.len(), 3);
+            assert_eq!(event.fields.get("attempt").map(String::as_str), Some("3"));
+            assert_eq!(
+                event.fields.get("code").map(String::as_str),
+                Some("connection")
+            );
+            assert_eq!(
+                event.fields.get("sqlstate").map(String::as_str),
+                Some("08001")
+            );
         });
     }
 }

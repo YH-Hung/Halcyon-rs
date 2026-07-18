@@ -215,6 +215,7 @@ pub(crate) fn emit_retry(outcome: &'static str) {
         }
         _ => metrics::counter!("halcyon_retries_total", "outcome" => "other").increment(1),
     }
+    super::events::emit_retry_attempt(outcome);
 }
 
 /// Pending pool metric samples — filled under the pool mutex, flushed after unlock.

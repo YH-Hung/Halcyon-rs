@@ -129,6 +129,7 @@ impl StatementCache {
                 .map(|(k, _)| k.clone());
             match victim {
                 Some(key) => {
+                    crate::obs::emit_stmt_cache_evict(&key);
                     let e = self.entries.remove(&key).expect("victim key just found");
                     let _ = driver.finalize(e.handle);
                     crate::obs::emit_stmt_cache("evict", self.entries.len());

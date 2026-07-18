@@ -6,7 +6,8 @@ use std::time::Duration;
 use crate::driver::ConnectionParams;
 use crate::facade::Database;
 use crate::obs::{
-    count, find_child, find_span, max_value, obs_lock, with_metrics, with_obs, RecordingRecorder,
+    count, find_child, find_span, max_value, obs_lock, with_metrics, with_obs, with_tracing_events,
+    RecordingRecorder,
 };
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::retry::BackoffPolicy;
@@ -80,6 +81,156 @@ fn reconnect_emits_reconnects_total() {
         let db = Database::open(mock, params(), cfg).unwrap();
         assert!(db.execute("UPDATE t SET a=?", (1,)).is_ok());
         assert!(count(&rec.snapshot(), "halcyon_reconnects_total", &[]) >= 1);
+    });
+}
+
+#[test]
+fn connect_attempts_emit_exact_success_and_failure_events() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    let mut failure = crate::error::Error::new(crate::error::ErrorCode::Connection, "refused");
+    failure.sqlstate = "08001".into();
+    failure.retriable = true;
+    mock.push_connect_error(failure);
+    let mut cfg = config();
+    cfg.min = 1;
+
+    with_tracing_events(|_, events| {
+        ConnectionPool::create(mock, params(), cfg).unwrap();
+        let guard = events.lock().unwrap();
+        let fail = guard
+            .iter()
+            .find(|event| event.name == "connect.fail")
+            .expect("connect.fail");
+        assert_eq!(fail.level, tracing::Level::ERROR);
+        assert_eq!(fail.fields.get("attempt").map(String::as_str), Some("1"));
+        assert_eq!(
+            fail.fields.get("code").map(String::as_str),
+            Some("connection")
+        );
+        assert_eq!(
+            fail.fields.get("sqlstate").map(String::as_str),
+            Some("08001")
+        );
+
+        let ok = guard
+            .iter()
+            .find(|event| event.name == "connect.ok")
+            .expect("connect.ok");
+        assert_eq!(ok.level, tracing::Level::INFO);
+        assert_eq!(ok.fields.len(), 1);
+        assert_eq!(ok.fields.get("attempt").map(String::as_str), Some("2"));
+    });
+}
+
+#[test]
+fn reconnect_success_emits_attempt_and_ok_events() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    let mut cfg = config();
+    cfg.min = 1;
+    cfg.validate_on_acquire = true;
+    let pool = ConnectionPool::create(mock.clone(), params(), cfg).unwrap();
+    mock.push_alive_result(false);
+
+    with_tracing_events(|_, events| {
+        drop(pool.acquire().unwrap());
+        let guard = events.lock().unwrap();
+        let attempt = guard
+            .iter()
+            .find(|event| event.name == "reconnect.attempt")
+            .expect("reconnect.attempt");
+        assert_eq!(attempt.level, tracing::Level::WARN);
+        assert!(attempt.fields.is_empty());
+        let ok = guard
+            .iter()
+            .find(|event| event.name == "reconnect.ok")
+            .expect("reconnect.ok");
+        assert_eq!(ok.level, tracing::Level::INFO);
+        assert!(ok.fields.is_empty());
+    });
+}
+
+#[test]
+fn reconnect_failure_emits_error_code() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    let mut cfg = config();
+    cfg.min = 1;
+    cfg.validate_on_acquire = true;
+    let pool = ConnectionPool::create(mock.clone(), params(), cfg).unwrap();
+    mock.push_alive_result(false);
+    mock.push_connect_error(crate::error::Error::new(
+        crate::error::ErrorCode::Connection,
+        "refused",
+    ));
+
+    with_tracing_events(|_, events| {
+        assert!(pool.acquire().is_err());
+        let guard = events.lock().unwrap();
+        let fail = guard
+            .iter()
+            .find(|event| event.name == "reconnect.fail")
+            .expect("reconnect.fail");
+        assert_eq!(fail.level, tracing::Level::ERROR);
+        assert_eq!(fail.fields.len(), 1);
+        assert_eq!(
+            fail.fields.get("code").map(String::as_str),
+            Some("connection")
+        );
+    });
+}
+
+#[test]
+fn acquire_timeout_emits_pool_exhausted_timeout() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    let mut cfg = config();
+    cfg.min = 1;
+    cfg.max = 1;
+    cfg.acquire_timeout = Duration::from_millis(30);
+    let pool = ConnectionPool::create(mock, params(), cfg).unwrap();
+    let _hold = pool.acquire().unwrap();
+
+    with_tracing_events(|_, events| {
+        assert!(pool.acquire().is_err());
+        let guard = events.lock().unwrap();
+        let exhausted = guard
+            .iter()
+            .find(|event| event.name == "pool.exhausted")
+            .expect("pool.exhausted");
+        assert_eq!(exhausted.level, tracing::Level::WARN);
+        assert_eq!(exhausted.fields.len(), 1);
+        assert_eq!(
+            exhausted.fields.get("timeout_ms").map(String::as_str),
+            Some("30")
+        );
+    });
+}
+
+#[test]
+fn maintain_emits_pool_reap_count() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    let mut cfg = config();
+    cfg.min = 1;
+    cfg.idle_timeout = Duration::ZERO;
+    let pool = ConnectionPool::create(mock, params(), cfg).unwrap();
+    let a = pool.acquire().unwrap();
+    let b = pool.acquire().unwrap();
+    let c = pool.acquire().unwrap();
+    drop((a, b, c));
+
+    with_tracing_events(|_, events| {
+        pool.maintain();
+        let guard = events.lock().unwrap();
+        let reap = guard
+            .iter()
+            .find(|event| event.name == "pool.reap")
+            .expect("pool.reap");
+        assert_eq!(reap.level, tracing::Level::DEBUG);
+        assert_eq!(reap.fields.len(), 1);
+        assert_eq!(reap.fields.get("count").map(String::as_str), Some("2"));
     });
 }
 

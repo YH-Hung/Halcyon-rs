@@ -742,9 +742,15 @@ impl ScopedTransaction {
         );
         self.active.set(false);
         if poisoned {
-            self.poisoned.set(true);
+            self.poison();
         }
         result
+    }
+
+    fn poison(&self) {
+        if !self.poisoned.replace(true) {
+            crate::obs::emit_txn_poisoned();
+        }
     }
 }
 
@@ -758,7 +764,7 @@ impl SavepointOwner for ScopedTransaction {
     }
 
     fn poison_from_savepoint(&self) {
-        self.poisoned.set(true);
+        self.poison();
     }
 
     fn savepoint_state(&self) -> &SavepointState {

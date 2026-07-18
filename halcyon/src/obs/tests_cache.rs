@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::driver::ConnectionParams;
 use crate::facade::Database;
-use crate::obs::{count, max_value, obs_lock, with_metrics};
+use crate::obs::{count, max_value, obs_lock, with_metrics, with_tracing_events};
 use crate::pool::PoolConfig;
 use crate::retry::BackoffPolicy;
 use crate::testing::{MockCliDriver, ScriptedRows};
@@ -61,5 +61,36 @@ fn statement_cache_hit_and_miss_emit_counters() {
             1
         );
         assert!(max_value(&samples, "halcyon_stmt_cache_size", &[]) >= 1.0);
+    });
+}
+
+#[test]
+fn statement_cache_eviction_emits_only_fnv_sql_hash() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(1)]]));
+    mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(2)]]));
+    let mut cfg = cached_config();
+    cfg.statement_cache_size = 1;
+    let db = Database::open(mock, params(), cfg).unwrap();
+
+    with_tracing_events(|_, events| {
+        let first: Vec<(i64,)> = db.query_as("SELECT id FROM first", ()).unwrap();
+        let second: Vec<(i64,)> = db.query_as("SELECT id FROM second", ()).unwrap();
+        assert_eq!(first, vec![(1,)]);
+        assert_eq!(second, vec![(2,)]);
+
+        let guard = events.lock().unwrap();
+        let evict = guard
+            .iter()
+            .find(|event| event.name == "stmt_cache.evict")
+            .expect("stmt_cache.evict");
+        assert_eq!(evict.level, tracing::Level::DEBUG);
+        assert_eq!(evict.fields.len(), 1);
+        assert_eq!(
+            evict.fields.get("sql_hash").map(String::as_str),
+            Some("24051bc60870353a")
+        );
+        assert!(evict.fields.values().all(|value| !value.contains("SELECT")));
     });
 }

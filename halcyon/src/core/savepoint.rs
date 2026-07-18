@@ -123,8 +123,10 @@ impl Savepoint<'_> {
     }
 
     fn poison(&self) {
-        self.poisoned.set(true);
-        self.owner.poison_from_savepoint();
+        if !self.poisoned.replace(true) {
+            crate::obs::emit_savepoint_poisoned(&self.name);
+            self.owner.poison_from_savepoint();
+        }
     }
 }
 

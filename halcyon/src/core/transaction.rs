@@ -153,10 +153,16 @@ impl<'c> Transaction<'c> {
         );
         self.active.set(false);
         if poisoned {
-            self.poisoned.set(true); // dead connection or autocommit lost
+            self.poison(); // dead connection or autocommit lost
             self.conn.mark_unusable();
         }
         result
+    }
+
+    fn poison(&self) {
+        if !self.poisoned.replace(true) {
+            crate::obs::emit_txn_poisoned();
+        }
     }
 }
 
@@ -173,7 +179,7 @@ impl SavepointOwner for Transaction<'_> {
         // This mirrors C++ `Transaction::poison`: a failed savepoint terminal
         // operation makes the transaction untrustworthy, but does not itself
         // claim the standalone connection's session transition was lost.
-        self.poisoned.set(true);
+        self.poison();
     }
 
     fn savepoint_state(&self) -> &SavepointState {
@@ -201,7 +207,10 @@ pub(crate) fn terminate(
     };
     let restored = driver.set_auto_commit(handle, true);
     let isolation_restored = match restore_isolation {
-        Some(level) => driver.set_isolation(handle, level),
+        Some(level) => driver.set_isolation(handle, level).map_err(|error| {
+            crate::obs::emit_isolation_restore_fail(&error);
+            error
+        }),
         None => Ok(()),
     };
     let poisoned = ended.is_err() || restored.is_err() || isolation_restored.is_err();

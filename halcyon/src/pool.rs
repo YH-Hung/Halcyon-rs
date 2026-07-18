@@ -163,8 +163,12 @@ impl PoolInner {
                 &self.params,
                 self.config.statement_cache_size,
             ) {
-                Ok(conn) => return Ok(conn),
+                Ok(conn) => {
+                    crate::obs::emit_connect_ok(attempt);
+                    return Ok(conn);
+                }
                 Err(e) => {
+                    crate::obs::emit_connect_fail(attempt, &e);
                     // Retry is driven by `Error.retriable` (the repo rule; spec
                     // Phase 4 "transparent reconnect … driven by Error.retriable").
                     // A non-retriable connect failure — bad credentials, unknown
@@ -205,8 +209,10 @@ impl PoolInner {
         }
         // Dead: disconnect it (unlocked), then reconnect in its place.
         drop(conn);
+        crate::obs::emit_reconnect_attempt();
         match self.make_connection() {
             Ok(fresh) => {
+                crate::obs::emit_reconnect_ok();
                 #[cfg(feature = "observability")]
                 {
                     pm.reconnects += 1;
@@ -221,6 +227,7 @@ impl PoolInner {
                 ))
             }
             Err(e) => {
+                crate::obs::emit_reconnect_fail(&e);
                 let mut guard = self.lock();
                 guard.leased -= 1;
                 #[cfg(feature = "observability")]
@@ -250,11 +257,18 @@ impl PoolInner {
         let start = Instant::now();
         #[cfg(feature = "observability")]
         let mut pm = crate::obs::PendingMetrics::default();
+        let mut exhausted = false;
 
         let result = self.acquire_loop(
+            &mut exhausted,
             #[cfg(feature = "observability")]
             &mut pm,
         );
+        if exhausted {
+            let timeout_ms =
+                u64::try_from(self.config.acquire_timeout.as_millis()).unwrap_or(u64::MAX);
+            crate::obs::emit_pool_exhausted(timeout_ms);
+        }
 
         #[cfg(feature = "observability")]
         {
@@ -275,6 +289,7 @@ impl PoolInner {
 
     fn acquire_loop(
         self: &Arc<Self>,
+        exhausted: &mut bool,
         #[cfg(feature = "observability")] pm: &mut crate::obs::PendingMetrics,
     ) -> Result<PooledConnection> {
         let mut guard = self.lock();
@@ -335,7 +350,10 @@ impl PoolInner {
             // 3. At capacity: block until a release, or time out.
             let remaining = match self.config.acquire_timeout.checked_sub(start.elapsed()) {
                 Some(r) if !r.is_zero() => r,
-                _ => return Err(acquire_timeout_error()),
+                _ => {
+                    *exhausted = true;
+                    return Err(acquire_timeout_error());
+                }
             };
             let (g, timeout) = self
                 .available
@@ -346,6 +364,7 @@ impl PoolInner {
                 && guard.idle.is_empty()
                 && guard.established() + guard.pending >= self.config.max
             {
+                *exhausted = true;
                 return Err(acquire_timeout_error());
             }
         }
@@ -446,6 +465,9 @@ impl PoolInner {
             pm
         };
         drop(guard);
+        if !discarded.is_empty() {
+            crate::obs::emit_pool_reap(discarded.len());
+        }
         #[cfg(feature = "observability")]
         crate::obs::flush_pool_metrics(&pm);
         drop(discarded); // disconnect reaped/leftover connections outside the lock

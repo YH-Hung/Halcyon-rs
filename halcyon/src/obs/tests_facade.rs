@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::driver::ConnectionParams;
 use crate::error::{Error, ErrorCode, Result};
 use crate::facade::Database;
-use crate::obs::{count, find_child, find_span, obs_lock, with_obs};
+use crate::obs::{count, find_child, find_span, obs_lock, with_obs, with_tracing_events};
 use crate::pool::PoolConfig;
 use crate::retry::BackoffPolicy;
 use crate::testing::MockCliDriver;
@@ -137,6 +137,44 @@ fn retries_emit_retried_then_exhausted() {
         assert_eq!(
             count(&samples, "halcyon_queries_total", &[("status", "error")]),
             1
+        );
+    });
+}
+
+#[test]
+fn retries_emit_exact_attempt_events() {
+    let _g = obs_lock();
+    let mock = Arc::new(MockCliDriver::new());
+    for _ in 0..3 {
+        let mut error = Error::new(ErrorCode::Deadlock, "deadlock");
+        error.retriable = true;
+        mock.push_execute_error(error);
+    }
+    let db = Database::open(mock, params(), config()).unwrap();
+
+    with_tracing_events(|_, events| {
+        let result: Result<Vec<(i64,)>> = db.query_as("SELECT n FROM t", ());
+        assert!(result.is_err());
+        let guard = events.lock().unwrap();
+        let retries: Vec<_> = guard
+            .iter()
+            .filter(|event| event.name == "retry.attempt")
+            .collect();
+        assert_eq!(retries.len(), 3);
+        assert!(retries
+            .iter()
+            .all(|event| event.level == tracing::Level::WARN && event.fields.len() == 1));
+        assert_eq!(
+            retries[0].fields.get("outcome").map(String::as_str),
+            Some("retried")
+        );
+        assert_eq!(
+            retries[1].fields.get("outcome").map(String::as_str),
+            Some("retried")
+        );
+        assert_eq!(
+            retries[2].fields.get("outcome").map(String::as_str),
+            Some("exhausted")
         );
     });
 }
