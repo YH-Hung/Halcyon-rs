@@ -1165,8 +1165,11 @@ mod tests {
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
-    use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
-    use crate::error::{Error, ErrorCode, Result};
+    use crate::driver::{
+        CliDriver, ConnectionHandle, ConnectionParams, GetDataChunk, ParamStreamSource,
+        StatementHandle,
+    };
+    use crate::error::Result;
     use crate::value::Value;
     use crate::Isolation;
     use loom::sync::Arc as LoomArc; // for spawning; pool internals use std::sync::Arc
@@ -1207,6 +1210,32 @@ mod loom_tests {
         }
         fn fetch_block(&self, _s: StatementHandle, _max_rows: usize) -> Result<Vec<Vec<Value>>> {
             Ok(Vec::new())
+        }
+        fn fetch_next(&self, _s: StatementHandle) -> Result<bool> {
+            Ok(false)
+        }
+        fn get_value(&self, _s: StatementHandle, _column: usize) -> Result<Value> {
+            Ok(Value::Null)
+        }
+        fn get_data_chunk(
+            &self,
+            _s: StatementHandle,
+            _column: usize,
+            _buffer: &mut [u8],
+        ) -> Result<GetDataChunk> {
+            Ok(GetDataChunk {
+                bytes: 0,
+                done: true,
+                is_null: true,
+            })
+        }
+        fn execute_streaming(
+            &self,
+            _s: StatementHandle,
+            _params: &[Value],
+            _sources: Vec<ParamStreamSource<'_>>,
+        ) -> Result<i64> {
+            Ok(0)
         }
         fn finalize(&self, _s: StatementHandle) -> Result<()> {
             Ok(())
@@ -1254,6 +1283,28 @@ mod loom_tests {
             statement_cache_size: 0,
             isolation: None,
         }
+    }
+
+    #[test]
+    fn loom_fake_task7_seam_is_deterministic() {
+        let fake = LoomFake;
+        assert!(!fake.fetch_next(StatementHandle(1)).unwrap());
+        assert_eq!(fake.get_value(StatementHandle(1), 0).unwrap(), Value::Null);
+        let mut buffer = [0u8; 4];
+        assert_eq!(
+            fake.get_data_chunk(StatementHandle(1), 0, &mut buffer)
+                .unwrap(),
+            crate::driver::GetDataChunk {
+                bytes: 0,
+                done: true,
+                is_null: true,
+            }
+        );
+        assert_eq!(
+            fake.execute_streaming(StatementHandle(1), &[], Vec::new())
+                .unwrap(),
+            0
+        );
     }
 
     // Two threads contend for a single connection. Whichever acquires first
