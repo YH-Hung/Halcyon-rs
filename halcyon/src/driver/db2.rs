@@ -201,6 +201,34 @@ struct StmtEntry {
     state: Arc<Mutex<StmtState>>,
 }
 
+/// Gives the native CLI the last word on whether it destroyed a statement. A
+/// failed `SQLFreeHandle` leaves the statement valid, so return its Rust owner
+/// intact rather than dropping storage that the CLI may still reference.
+fn attempt_free_stmt<F>(entry: StmtEntry, free: F) -> std::result::Result<(), StmtEntry>
+where
+    F: FnOnce(cli::SQLHANDLE) -> cli::SQLRETURN,
+{
+    let rc = {
+        // Wait out any in-flight operation before attempting terminal cleanup.
+        let st = entry.state.lock().unwrap_or_else(|p| p.into_inner());
+        free(st.handle.0)
+    };
+    if cli_ok(rc) {
+        Ok(())
+    } else {
+        Err(entry)
+    }
+}
+
+fn stmt_handle(entry: &StmtEntry) -> cli::SQLHANDLE {
+    entry
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .handle
+        .0
+}
+
 #[derive(Default)]
 struct Inner {
     conns: HashMap<u64, RawHandle>,
@@ -285,8 +313,15 @@ impl Drop for Db2CliDriver {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|p| p.into_inner());
         for (_, entry) in inner.stmts.drain() {
-            let st = entry.state.lock().unwrap_or_else(|p| p.into_inner());
-            unsafe { cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, st.handle.0) };
+            if let Err(entry) = attempt_free_stmt(entry, |h| unsafe {
+                cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, h)
+            }) {
+                // Drop cannot surface the CLI diagnostic. The contract says a
+                // failed free leaves the native statement valid, which may
+                // retain rowset/parameter pointers, so leak the owner rather
+                // than freeing its backing storage underneath the native handle.
+                std::mem::forget(entry);
+            }
         }
         for (_, dbc) in inner.conns.drain() {
             unsafe {
@@ -912,7 +947,7 @@ impl CliDriver for Db2CliDriver {
     }
 
     fn disconnect(&self, conn: ConnectionHandle) -> Result<()> {
-        let (dbc, children) = {
+        let (dbc, mut children) = {
             let mut inner = self.lock();
             let Some(dbc) = inner.conns.remove(&conn.0) else {
                 return Ok(());
@@ -920,20 +955,35 @@ impl CliDriver for Db2CliDriver {
             // Unregister this connection's statements so a later finalize is a
             // clean no-op instead of freeing a stale child handle.
             let mut children = Vec::new();
-            inner.stmts.retain(|_, e| {
-                if e.conn == conn.0 {
-                    children.push(e.state.clone());
-                    false
+            for (stmt, entry) in std::mem::take(&mut inner.stmts) {
+                if entry.conn == conn.0 {
+                    children.push((stmt, entry));
                 } else {
-                    true
+                    inner.stmts.insert(stmt, entry);
                 }
-            });
+            }
             (dbc, children)
         };
         // Free children before the parent dbc (waiting out in-flight use).
-        for child in children {
-            let st = child.lock().unwrap_or_else(|p| p.into_inner());
-            unsafe { cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, st.handle.0) };
+        while let Some((stmt, entry)) = children.pop() {
+            if let Err(entry) = attempt_free_stmt(entry, |h| unsafe {
+                cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, h)
+            }) {
+                let h = stmt_handle(&entry);
+                let error = make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLFreeHandle(SQL_HANDLE_STMT) failed during disconnect",
+                );
+                let mut inner = self.lock();
+                inner.conns.insert(conn.0, dbc);
+                inner.stmts.insert(stmt, entry);
+                for (stmt, entry) in children {
+                    inner.stmts.insert(stmt, entry);
+                }
+                return Err(error);
+            }
         }
         unsafe {
             cli::SQLDisconnect(dbc.0);
@@ -1416,10 +1466,22 @@ impl CliDriver for Db2CliDriver {
                 None => return Ok(()),
             }
         };
-        // Wait out any in-flight operation on this statement before freeing.
-        let st = entry.state.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe { cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, st.handle.0) };
-        Ok(())
+        match attempt_free_stmt(entry, |h| unsafe {
+            cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, h)
+        }) {
+            Ok(()) => Ok(()),
+            Err(entry) => {
+                let h = stmt_handle(&entry);
+                let error = make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLFreeHandle(SQL_HANDLE_STMT) failed",
+                );
+                self.lock().stmts.insert(stmt.0, entry);
+                Err(error)
+            }
+        }
     }
 
     fn close_cursor(&self, stmt: StatementHandle) -> Result<()> {
@@ -1561,6 +1623,34 @@ mod tests {
         let retained = st.pending_rowset.as_mut().unwrap();
         assert_eq!(std::ptr::addr_of_mut!(retained.rows_fetched), fetched_ptr);
         assert_eq!(retained.row_status.as_mut_ptr(), status_ptr);
+    }
+
+    #[test]
+    fn failed_statement_free_returns_pending_rowset_owner() {
+        let mut storage = Box::new(RowsetStorage {
+            buffers: vec![vec![0]],
+            indicators: vec![vec![0]],
+            rows_fetched: 0,
+            row_status: vec![0],
+        });
+        let fetched_ptr = std::ptr::addr_of_mut!(storage.rows_fetched);
+        let status_ptr = storage.row_status.as_mut_ptr();
+        let entry = StmtEntry {
+            conn: 1,
+            state: Arc::new(Mutex::new(StmtState {
+                handle: RawHandle(ptr::null_mut()),
+                bound: Vec::new(),
+                cols: None,
+                block_fallback: false,
+                pending_rowset: Some(storage),
+            })),
+        };
+
+        let retained = attempt_free_stmt(entry, |_| cli::SQL_ERROR).unwrap_err();
+        let mut state = retained.state.lock().unwrap();
+        let storage = state.pending_rowset.as_mut().unwrap();
+        assert_eq!(std::ptr::addr_of_mut!(storage.rows_fetched), fetched_ptr);
+        assert_eq!(storage.row_status.as_mut_ptr(), status_ptr);
     }
 
     #[test]
