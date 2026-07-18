@@ -12,7 +12,7 @@ use halcyon::stress::{
     config_for, make_pool_contention, make_reconnect_faults, make_txn_churn, run_workload,
     ConcurrentFakeDriver, RunConfig, Scenario, Stop,
 };
-use halcyon::Database;
+use halcyon::{Database, Isolation};
 
 fn open(fake: Arc<ConcurrentFakeDriver>, scenario: Scenario, pool_max: usize) -> Database {
     Database::open(
@@ -123,4 +123,64 @@ fn reaper_races_acquire_release_safely() {
         db.pool().total_count() >= db.pool().idle_count(),
         "accounting consistent"
     );
+}
+
+#[test]
+fn concurrent_savepoints_restore_each_connection_session() {
+    const THREADS: usize = 8;
+    const ITERS: usize = 200;
+    const TRANSACTIONS: i64 = (THREADS * ITERS) as i64;
+
+    let fake = Arc::new(ConcurrentFakeDriver::new());
+    let db = open(fake.clone(), Scenario::Txn, 8);
+    let failures = AtomicI64::new(0);
+
+    std::thread::scope(|scope| {
+        for worker in 0..THREADS {
+            let db = &db;
+            let failures = &failures;
+            scope.spawn(move || {
+                for iteration in 0..ITERS {
+                    let isolation = if iteration % 2 == 0 {
+                        Isolation::CursorStability
+                    } else {
+                        Isolation::RepeatableRead
+                    };
+                    let result = db.transaction_with_isolation(isolation, |tx| {
+                        tx.execute("INSERT INTO t VALUES (?)", (worker as i64,))?;
+                        let savepoint = tx.savepoint()?;
+                        tx.execute("INSERT INTO t VALUES (?)", (iteration as i64,))?;
+                        if iteration % 3 == 0 {
+                            savepoint.rollback()?;
+                        } else {
+                            savepoint.release()?;
+                        }
+                        tx.nested(|nested| {
+                            nested
+                                .execute("INSERT INTO t VALUES (?)", ((worker + iteration) as i64,))
+                        })
+                    });
+                    if result.is_err() {
+                        failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+
+    assert_eq!(failures.load(Ordering::Relaxed), 0);
+    assert_eq!(fake.auto_commit_off(), TRANSACTIONS);
+    assert_eq!(fake.auto_commit_on(), TRANSACTIONS);
+    assert_eq!(fake.set_isolation_calls(), 2 * TRANSACTIONS);
+    assert_eq!(fake.commit_calls(), TRANSACTIONS);
+    for state in fake.connection_states() {
+        assert!(state.autocommit, "connection left with autocommit off");
+        assert!(
+            state.isolation.is_none() || state.isolation == Some(Isolation::CursorStability),
+            "connection left mid-override: {:?}",
+            state.isolation
+        );
+    }
+    assert_eq!(db.pool().active_count(), 0);
+    assert_eq!(db.pool().idle_count(), db.pool().total_count());
 }

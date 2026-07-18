@@ -28,9 +28,26 @@ struct StmtState {
 struct State {
     live: HashSet<u64>,
     dead: HashSet<u64>,
+    connections: HashMap<u64, ConnectionState>,
     stmts: HashMap<u64, StmtState>,
     next_conn: u64,
     next_stmt: u64,
+}
+
+/// Loaded per-connection session state exposed to stress assertions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionState {
+    pub autocommit: bool,
+    pub isolation: Option<Isolation>,
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self {
+            autocommit: true,
+            isolation: None,
+        }
+    }
 }
 
 /// Deterministic, thread-safe fake driver. Construct with [`new`](Self::new),
@@ -64,6 +81,7 @@ pub struct ConcurrentFakeDriver {
     rollback_calls: AtomicI64,
     auto_commit_on: AtomicI64,
     auto_commit_off: AtomicI64,
+    set_isolation_calls: AtomicI64,
     in_flight: AtomicI64,
     peak_in_flight: AtomicI64,
 }
@@ -106,8 +124,19 @@ impl ConcurrentFakeDriver {
     pub fn auto_commit_off(&self) -> i64 {
         self.auto_commit_off.load(Ordering::Relaxed)
     }
+    pub fn set_isolation_calls(&self) -> i64 {
+        self.set_isolation_calls.load(Ordering::Relaxed)
+    }
     pub fn peak_in_flight(&self) -> i64 {
         self.peak_in_flight.load(Ordering::Relaxed)
+    }
+    pub fn connection_states(&self) -> Vec<ConnectionState> {
+        let state = self.state.lock().unwrap();
+        state
+            .live
+            .iter()
+            .filter_map(|handle| state.connections.get(handle).copied())
+            .collect()
     }
 
     fn enter_in_flight(&self) -> InFlightGuard<'_> {
@@ -181,6 +210,7 @@ impl CliDriver for ConcurrentFakeDriver {
         g.next_conn += 1;
         let h = g.next_conn;
         g.live.insert(h);
+        g.connections.insert(h, ConnectionState::default());
         Ok(ConnectionHandle(h))
     }
 
@@ -189,6 +219,7 @@ impl CliDriver for ConcurrentFakeDriver {
         let mut g = self.state.lock().unwrap();
         g.live.remove(&conn.0);
         g.dead.remove(&conn.0);
+        g.connections.remove(&conn.0);
         Ok(())
     }
 
@@ -463,16 +494,31 @@ impl CliDriver for ConcurrentFakeDriver {
         Ok(())
     }
 
-    fn set_auto_commit(&self, _conn: ConnectionHandle, enabled: bool) -> Result<()> {
+    fn set_auto_commit(&self, conn: ConnectionHandle, enabled: bool) -> Result<()> {
         if enabled {
             self.auto_commit_on.fetch_add(1, Ordering::Relaxed);
         } else {
             self.auto_commit_off.fetch_add(1, Ordering::Relaxed);
         }
+        self.state
+            .lock()
+            .unwrap()
+            .connections
+            .get_mut(&conn.0)
+            .ok_or_else(stale)?
+            .autocommit = enabled;
         Ok(())
     }
 
-    fn set_isolation(&self, _conn: ConnectionHandle, _level: Isolation) -> Result<()> {
+    fn set_isolation(&self, conn: ConnectionHandle, level: Isolation) -> Result<()> {
+        self.set_isolation_calls.fetch_add(1, Ordering::Relaxed);
+        self.state
+            .lock()
+            .unwrap()
+            .connections
+            .get_mut(&conn.0)
+            .ok_or_else(stale)?
+            .isolation = Some(level);
         Ok(())
     }
 

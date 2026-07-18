@@ -24,13 +24,80 @@
 //! cursor open/close cycles and still return correct results.
 #![cfg(feature = "db2")]
 
+use std::fs::File;
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use halcyon::driver::{CliDriver, ConnectionParams, Db2CliDriver, ParamStreamSource};
-use halcyon::{named, Connection, Database, Error, ErrorCode, Value};
+use halcyon::{
+    lob_callback, lob_file, lob_reader, named, BindParam, Connection, Database, Error, ErrorCode,
+    Isolation, Value,
+};
+
+const LARGE_LOB_BYTES: usize = 32 * 1024 * 1024;
+const FNV_OFFSET: u64 = 1_469_598_103_934_665_603;
+const FNV_PRIME: u64 = 1_099_511_628_211;
 
 fn test_dsn() -> Option<String> {
     std::env::var("HALCYON_TEST_DSN").ok()
+}
+
+fn live_check(condition: bool, message: impl Into<String>) -> halcyon::Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(Error::new(ErrorCode::InvalidState, message))
+    }
+}
+
+fn deterministic_lob() -> Vec<u8> {
+    (0..LARGE_LOB_BYTES)
+        .map(|index| {
+            let index = index as u64;
+            ((index.wrapping_mul(31) ^ (index >> 7) ^ (index >> 19)) % 251) as u8
+        })
+        .collect()
+}
+
+fn fnv1a_extend(mut checksum: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        checksum ^= u64::from(*byte);
+        checksum = checksum.wrapping_mul(FNV_PRIME);
+    }
+    checksum
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    fnv1a_extend(FNV_OFFSET, bytes)
+}
+
+fn checksum_file(path: &Path) -> halcyon::Result<(u64, u64)> {
+    let mut file = File::open(path)
+        .map_err(|error| Error::new(ErrorCode::Mapping, format!("open LOB output: {error}")))?;
+    let mut stage = vec![0u8; 256 * 1024];
+    let mut checksum = FNV_OFFSET;
+    let mut bytes = 0u64;
+    loop {
+        let count = file
+            .read(&mut stage)
+            .map_err(|error| Error::new(ErrorCode::Mapping, format!("read LOB output: {error}")))?;
+        if count == 0 {
+            return Ok((checksum, bytes));
+        }
+        checksum = fnv1a_extend(checksum, &stage[..count]);
+        bytes += count as u64;
+    }
+}
+
+struct TempFiles(Vec<PathBuf>);
+
+impl Drop for TempFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Returns the driver alongside the connection so the test can drive the seam's
@@ -294,6 +361,25 @@ fn live_rowset_fetch_and_long_column_fallback() {
         .expect("insert rowset row");
     }
 
+    // Ordinary `query` over a long column returns the complete mapped values.
+    // The direct-seam section below separately makes the driver's intentional
+    // at-most-one-row fallback observable.
+    {
+        let mut rows = conn
+            .query("SELECT id, body FROM halcyon_rowset_rs ORDER BY id", ())
+            .expect("ordinary CLOB query");
+        for id in 1..=5i64 {
+            let row = rows.next().expect("fetch ordinary CLOB row").expect("row");
+            assert_eq!(row.column::<i64>(0).expect("CLOB row id"), id);
+            assert_eq!(
+                row.column::<String>(1).expect("CLOB row body"),
+                format!("lob-{id}-{}", "z".repeat(5000))
+            );
+        }
+        assert!(rows.next().expect("ordinary CLOB EOF").is_none());
+    }
+
+    // Bounded non-LOB projection: one multi-row block with exact `Value`s.
     let bounded = driver
         .prepare(
             conn.handle(),
@@ -334,6 +420,298 @@ fn live_rowset_fetch_and_long_column_fallback() {
 
     conn.execute("DROP TABLE halcyon_rowset_rs", ())
         .expect("drop rowset table");
+}
+
+#[test]
+fn live_savepoints_nested_reuse_and_data_effects() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("HALCYON_TEST_DSN not set; skipping live Db2 savepoint coverage");
+        return;
+    };
+    const TABLE: &str = "halcyon_v01_savepoints";
+    let db = Database::connect(&dsn).expect("open savepoint database");
+
+    let proof = (|| -> halcyon::Result<()> {
+        let _ = db.execute(&format!("DROP TABLE {TABLE}"), ());
+        db.execute(&format!("CREATE TABLE {TABLE}(id INT NOT NULL)"), ())?;
+
+        db.transaction(|tx| {
+            tx.execute(&format!("INSERT INTO {TABLE} VALUES (?)"), (10,))?;
+
+            let outer = tx.savepoint_named("outer_sp")?;
+            tx.execute(&format!("INSERT INTO {TABLE} VALUES (?)"), (20,))?;
+            let inner = tx.savepoint_named("inner_sp")?;
+            tx.execute(&format!("INSERT INTO {TABLE} VALUES (?)"), (30,))?;
+            inner.release()?;
+            outer.rollback()?;
+            let after_outer: Vec<(i32,)> =
+                tx.query_as(&format!("SELECT id FROM {TABLE} ORDER BY id"), ())?;
+            live_check(
+                after_outer == vec![(10,)],
+                "outer savepoint rollback did not undo nested work",
+            )?;
+
+            let active = tx.savepoint_named("ReUsEd")?;
+            tx.execute(&format!("INSERT INTO {TABLE} VALUES (?)"), (40,))?;
+            match tx.savepoint_named("rEuSeD") {
+                Err(error) => live_check(
+                    error.code == ErrorCode::InvalidArgument,
+                    "active case-folded savepoint reuse was misclassified",
+                )?,
+                Ok(unexpected) => {
+                    unexpected.release()?;
+                    return Err(Error::new(
+                        ErrorCode::InvalidState,
+                        "active case-folded savepoint reuse was accepted",
+                    ));
+                }
+            }
+            active.rollback()?;
+
+            let after_rollback = tx.savepoint_named("REUSED")?;
+            tx.execute(&format!("INSERT INTO {TABLE} VALUES (?)"), (50,))?;
+            after_rollback.release()?;
+            let after_release = tx.savepoint_named("reused")?;
+            tx.execute(&format!("INSERT INTO {TABLE} VALUES (?)"), (60,))?;
+            after_release.rollback()?;
+
+            tx.nested(|nested| {
+                nested.execute(&format!("INSERT INTO {TABLE} VALUES (?)"), (70,))?;
+                Ok(())
+            })?;
+            let nested_error = tx.nested(|nested| -> halcyon::Result<()> {
+                nested.execute(&format!("INSERT INTO {TABLE} VALUES (?)"), (80,))?;
+                Err(Error::new(ErrorCode::Constraint, "nested work rejected"))
+            });
+            live_check(
+                nested_error
+                    .as_ref()
+                    .is_err_and(|error| error.code == ErrorCode::Constraint),
+                "nested error was not preserved",
+            )?;
+
+            let surviving: Vec<(i32,)> =
+                tx.query_as(&format!("SELECT id FROM {TABLE} ORDER BY id"), ())?;
+            live_check(
+                surviving == vec![(10,), (50,), (70,)],
+                "savepoint terminal data effects were incorrect",
+            )
+        })?;
+
+        let committed: Vec<(i32,)> =
+            db.query_as(&format!("SELECT id FROM {TABLE} ORDER BY id"), ())?;
+        live_check(
+            committed == vec![(10,), (50,), (70,)],
+            "committed savepoint data effects were incorrect",
+        )
+    })();
+
+    let cleanup = db.execute(&format!("DROP TABLE {TABLE}"), ());
+    if let Err(error) = proof {
+        let _ = cleanup;
+        panic!("live savepoint proof failed: {error}");
+    }
+    cleanup.expect("drop savepoint table");
+}
+
+#[test]
+fn live_isolation_currently_committed_visibility() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("HALCYON_TEST_DSN not set; skipping live Db2 isolation coverage");
+        return;
+    };
+    const TABLE: &str = "halcyon_v01_isolation";
+    let writer = Database::connect(&dsn).expect("open isolation writer");
+    let reader = Database::connect(&dsn).expect("open isolation reader");
+
+    let proof = (|| -> halcyon::Result<()> {
+        let _ = reader.execute(&format!("DROP TABLE {TABLE}"), ());
+        reader.execute(&format!("CREATE TABLE {TABLE}(id INT NOT NULL)"), ())?;
+
+        let mut writer_tx = writer.begin()?;
+        writer_tx.execute(&format!("INSERT INTO {TABLE} VALUES (?)"), (42,))?;
+
+        let mut uncommitted_read = reader.begin_with_isolation(Isolation::UncommittedRead)?;
+        let dirty_count: Vec<(i64,)> =
+            uncommitted_read.query_as(&format!("SELECT COUNT(*) FROM {TABLE}"), ())?;
+        live_check(
+            dirty_count == vec![(1,)],
+            "Uncommitted Read did not see the writer's in-flight row",
+        )?;
+        uncommitted_read.commit()?;
+
+        let mut cursor_stability = reader.begin_with_isolation(Isolation::CursorStability)?;
+        let committed_count: Vec<(i64,)> =
+            cursor_stability.query_as(&format!("SELECT COUNT(*) FROM {TABLE}"), ())?;
+        live_check(
+            committed_count == vec![(0,)],
+            "Cursor Stability saw an uncommitted row under Currently Committed",
+        )?;
+        cursor_stability.commit()?;
+
+        writer_tx.rollback()?;
+        let after_rollback: Vec<(i64,)> =
+            reader.query_as(&format!("SELECT COUNT(*) FROM {TABLE}"), ())?;
+        live_check(
+            after_rollback == vec![(0,)],
+            "writer rollback left the in-flight row behind",
+        )
+    })();
+
+    let cleanup = reader.execute(&format!("DROP TABLE {TABLE}"), ());
+    if let Err(error) = proof {
+        let _ = cleanup;
+        panic!("live isolation proof failed: {error}");
+    }
+    cleanup.expect("drop isolation table");
+}
+
+#[test]
+fn live_large_lob_source_and_streaming_output_matrix() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("HALCYON_TEST_DSN not set; skipping live Db2 32 MiB LOB coverage");
+        return;
+    };
+    const TABLE: &str = "halcyon_v01_lobs";
+    let db = Database::connect(&dsn).expect("open LOB database");
+    let prefix = format!("halcyon-rs-v01-lob-{}", std::process::id());
+    let input_path = std::env::temp_dir().join(format!("{prefix}-input.bin"));
+    let output_path = std::env::temp_dir().join(format!("{prefix}-output.bin"));
+    let _temp_files = TempFiles(vec![input_path.clone(), output_path.clone()]);
+
+    let proof = (|| -> halcyon::Result<()> {
+        let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_file(&output_path);
+        let _ = db.execute(&format!("DROP TABLE {TABLE}"), ());
+        db.execute(
+            &format!("CREATE TABLE {TABLE}(id INT NOT NULL, body BLOB(64M))"),
+            (),
+        )?;
+
+        let payload = deterministic_lob();
+        let expected_checksum = fnv1a(&payload);
+        std::fs::write(&input_path, &payload)
+            .map_err(|error| Error::new(ErrorCode::Mapping, format!("write LOB input: {error}")))?;
+
+        db.execute_with_lobs(
+            &format!("INSERT INTO {TABLE} VALUES (?, ?)"),
+            vec![
+                BindParam::Value(Value::Int(1)),
+                BindParam::Lob(lob_file(&input_path)),
+            ],
+        )?;
+
+        let mut borrowed = Cursor::new(payload.as_slice());
+        db.execute_with_lobs(
+            &format!("INSERT INTO {TABLE} VALUES (?, ?)"),
+            vec![
+                BindParam::Value(Value::Int(2)),
+                BindParam::Lob(lob_reader(&mut borrowed, Some(LARGE_LOB_BYTES as u64))),
+            ],
+        )?;
+
+        let mut callback_offset = 0usize;
+        db.execute_with_lobs(
+            &format!("INSERT INTO {TABLE} VALUES (?, ?)"),
+            vec![
+                BindParam::Value(Value::Int(3)),
+                BindParam::Lob(lob_callback(
+                    |buffer| {
+                        let count = buffer
+                            .len()
+                            .min(payload.len().saturating_sub(callback_offset));
+                        buffer[..count]
+                            .copy_from_slice(&payload[callback_offset..callback_offset + count]);
+                        callback_offset += count;
+                        Ok(count)
+                    },
+                    Some(LARGE_LOB_BYTES as u64),
+                )),
+            ],
+        )?;
+
+        {
+            let mut rows =
+                db.query_streaming(&format!("SELECT body FROM {TABLE} WHERE id = ?"), (1,))?;
+            {
+                let mut row = rows.next()?.ok_or_else(|| {
+                    Error::new(ErrorCode::InvalidState, "missing file-source LOB")
+                })?;
+                let copied = row.lob(0)?.copy_to_file(&output_path)?;
+                live_check(
+                    copied == LARGE_LOB_BYTES as u64,
+                    "copy_to_file returned the wrong byte count",
+                )?;
+            }
+            live_check(
+                rows.next()?.is_none(),
+                "file-source LOB returned extra rows",
+            )?;
+        }
+        let (file_checksum, file_bytes) = checksum_file(&output_path)?;
+        live_check(
+            file_bytes == LARGE_LOB_BYTES as u64 && file_checksum == expected_checksum,
+            "file-source/copy_to_file LOB checksum mismatch",
+        )?;
+
+        {
+            let mut rows =
+                db.query_streaming(&format!("SELECT body FROM {TABLE} WHERE id = ?"), (2,))?;
+            {
+                let mut row = rows.next()?.ok_or_else(|| {
+                    Error::new(ErrorCode::InvalidState, "missing borrowed-reader LOB")
+                })?;
+                {
+                    let mut lob = row.lob(0)?;
+                    let mut stage = vec![0u8; 257 * 1024];
+                    let mut checksum = FNV_OFFSET;
+                    let mut bytes = 0u64;
+                    loop {
+                        let count = lob.read(&mut stage)?;
+                        if count == 0 {
+                            break;
+                        }
+                        checksum = fnv1a_extend(checksum, &stage[..count]);
+                        bytes += count as u64;
+                    }
+                    live_check(
+                        bytes == LARGE_LOB_BYTES as u64 && checksum == expected_checksum,
+                        "borrowed-reader/chunked-output LOB checksum mismatch",
+                    )?;
+                }
+            }
+            live_check(
+                rows.next()?.is_none(),
+                "borrowed-reader LOB returned extra rows",
+            )?;
+        }
+
+        {
+            let mut rows =
+                db.query_streaming(&format!("SELECT body FROM {TABLE} WHERE id = ?"), (3,))?;
+            {
+                let mut row = rows
+                    .next()?
+                    .ok_or_else(|| Error::new(ErrorCode::InvalidState, "missing callback LOB"))?;
+                let materialized = row.lob(0)?.to_vec()?;
+                live_check(
+                    materialized.len() == LARGE_LOB_BYTES
+                        && fnv1a(&materialized) == expected_checksum,
+                    "callback/materialized-output LOB checksum mismatch",
+                )?;
+            }
+            live_check(rows.next()?.is_none(), "callback LOB returned extra rows")?;
+        }
+
+        Ok(())
+    })();
+
+    let cleanup = db.execute(&format!("DROP TABLE {TABLE}"), ());
+    if let Err(error) = proof {
+        let _ = cleanup;
+        panic!("live 32 MiB LOB proof failed: {error}");
+    }
+    cleanup.expect("drop LOB table");
 }
 
 /// Proves `SQLCancel` leaves a statement out of `SQL_NEED_DATA` by reusing the
