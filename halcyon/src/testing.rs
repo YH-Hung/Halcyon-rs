@@ -19,7 +19,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
-use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
+use crate::driver::{
+    CliDriver, ConnectionHandle, ConnectionParams, GetDataChunk, ParamStreamSource, StatementHandle,
+};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
 use crate::Isolation;
@@ -64,6 +66,7 @@ struct StmtState {
     bound_params: Vec<Value>,
     cursor: ScriptedRows,
     position: i64,
+    lob_offsets: HashMap<usize, usize>,
 }
 
 /// All scriptable inputs and recorded outputs, guarded by the mock's mutex.
@@ -98,6 +101,19 @@ struct State {
     fetch_block_size: usize, // 0 => caller's max_rows; >0 => cap per call
     unbounded_columns: bool, // long/LOB mode caps each successful block at one row
     fetch_block_requests: Vec<usize>,
+
+    // --- streaming read/write scripting ---
+    fetch_next_calls: u32,
+    fail_fetch_next_on_call: u32,
+    fetch_next_error: Option<Error>,
+    get_data_chunk_errors: VecDeque<Error>,
+    lob_chunk_cap: usize,
+    execute_streaming_errors: VecDeque<Error>,
+    stream_row_counts: VecDeque<i64>,
+    execute_streaming_calls: u32,
+    last_stream_values: Vec<Value>,
+    last_streamed_lobs: HashMap<usize, Vec<u8>>,
+    stream_pull_cap: usize,
 
     // --- finalize / close_cursor ---
     finalize_calls: u32,
@@ -255,6 +271,39 @@ impl MockCliDriver {
         self
     }
 
+    pub fn fail_fetch_next_on_call(&self, call_index: u32, error: Error) -> &Self {
+        let mut state = self.lock();
+        state.fail_fetch_next_on_call = call_index;
+        state.fetch_next_error = Some(error);
+        drop(state);
+        self
+    }
+
+    pub fn push_get_data_chunk_error(&self, error: Error) -> &Self {
+        self.lock().get_data_chunk_errors.push_back(error);
+        self
+    }
+
+    pub fn set_lob_chunk_cap(&self, bytes: usize) -> &Self {
+        self.lock().lob_chunk_cap = bytes;
+        self
+    }
+
+    pub fn set_stream_pull_cap(&self, bytes: usize) -> &Self {
+        self.lock().stream_pull_cap = bytes;
+        self
+    }
+
+    pub fn push_execute_streaming_error(&self, error: Error) -> &Self {
+        self.lock().execute_streaming_errors.push_back(error);
+        self
+    }
+
+    pub fn push_stream_row_count(&self, rows: i64) -> &Self {
+        self.lock().stream_row_counts.push_back(rows);
+        self
+    }
+
     // --- inspection -----------------------------------------------------------
 
     pub fn connect_calls(&self) -> u32 {
@@ -319,6 +368,18 @@ impl MockCliDriver {
     }
     pub fn fetch_block_requests(&self) -> Vec<usize> {
         self.lock().fetch_block_requests.clone()
+    }
+    pub fn fetch_next_calls(&self) -> u32 {
+        self.lock().fetch_next_calls
+    }
+    pub fn execute_streaming_calls(&self) -> u32 {
+        self.lock().execute_streaming_calls
+    }
+    pub fn last_stream_values(&self) -> Vec<Value> {
+        self.lock().last_stream_values.clone()
+    }
+    pub fn last_streamed_lobs(&self) -> HashMap<usize, Vec<u8>> {
+        self.lock().last_streamed_lobs.clone()
     }
 }
 
@@ -447,6 +508,138 @@ impl CliDriver for MockCliDriver {
         let block = st.cursor.rows[start..end].to_vec();
         st.position = end as i64 - 1;
         Ok(block)
+    }
+
+    fn fetch_next(&self, stmt: StatementHandle) -> Result<bool> {
+        let mut state = self.lock();
+        state.fetch_next_calls += 1;
+        if state.fail_fetch_next_on_call != 0
+            && state.fetch_next_calls == state.fail_fetch_next_on_call
+        {
+            return Err(state
+                .fetch_next_error
+                .clone()
+                .unwrap_or_else(|| Error::new(ErrorCode::Unknown, "scripted fetch_next failure")));
+        }
+        let st = state.statements.get_mut(&stmt.0).ok_or_else(unknown_stmt)?;
+        let next = st.position + 1;
+        if next as usize >= st.cursor.rows.len() {
+            return Ok(false);
+        }
+        st.position = next;
+        st.lob_offsets.clear();
+        Ok(true)
+    }
+
+    fn get_value(&self, stmt: StatementHandle, column: usize) -> Result<Value> {
+        let state = self.lock();
+        let st = state.statements.get(&stmt.0).ok_or_else(unknown_stmt)?;
+        let row = st
+            .cursor
+            .rows
+            .get(st.position.max(0) as usize)
+            .ok_or_else(|| Error::new(ErrorCode::InvalidState, "cursor is not on a row"))?;
+        row.get(column).cloned().ok_or_else(range_error)
+    }
+
+    fn get_data_chunk(
+        &self,
+        stmt: StatementHandle,
+        column: usize,
+        buffer: &mut [u8],
+    ) -> Result<GetDataChunk> {
+        let mut state = self.lock();
+        if let Some(error) = state.get_data_chunk_errors.pop_front() {
+            return Err(error);
+        }
+        let cap = match state.lob_chunk_cap {
+            0 => buffer.len(),
+            value => value.min(buffer.len()),
+        };
+        let st = state.statements.get_mut(&stmt.0).ok_or_else(unknown_stmt)?;
+        let row = st
+            .cursor
+            .rows
+            .get(st.position.max(0) as usize)
+            .ok_or_else(|| Error::new(ErrorCode::InvalidState, "cursor is not on a row"))?;
+        let cell = row.get(column).ok_or_else(range_error)?;
+        if matches!(cell, Value::Null) {
+            return Ok(GetDataChunk {
+                bytes: 0,
+                done: true,
+                is_null: true,
+            });
+        }
+        let bytes: &[u8] = match cell {
+            Value::Bytes(bytes) => bytes,
+            Value::Text(text) => text.as_bytes(),
+            _ => return Err(Error::new(ErrorCode::Mapping, "cell is not a LOB")),
+        };
+        let offset = st.lob_offsets.entry(column).or_default();
+        let copied = cap.min(bytes.len().saturating_sub(*offset));
+        buffer[..copied].copy_from_slice(&bytes[*offset..*offset + copied]);
+        *offset += copied;
+        Ok(GetDataChunk {
+            bytes: copied,
+            done: *offset == bytes.len(),
+            is_null: false,
+        })
+    }
+
+    fn execute_streaming(
+        &self,
+        stmt: StatementHandle,
+        params: &[Value],
+        mut sources: Vec<ParamStreamSource<'_>>,
+    ) -> Result<i64> {
+        let (scripted_error, pull_cap) = {
+            let mut state = self.lock();
+            state.execute_streaming_calls += 1;
+            state.last_stream_values = params.to_vec();
+            state.last_streamed_lobs.clear();
+            (
+                state.execute_streaming_errors.pop_front(),
+                if state.stream_pull_cap == 0 {
+                    8
+                } else {
+                    state.stream_pull_cap
+                },
+            )
+        };
+        if let Some(error) = scripted_error {
+            return Err(error);
+        }
+
+        let mut streamed = HashMap::new();
+        for source in &mut sources {
+            if source.param_index >= params.len() || streamed.contains_key(&source.param_index) {
+                return Err(Error::new(
+                    ErrorCode::Mapping,
+                    "bad data-at-exec stream source index",
+                ));
+            }
+            let mut bytes = Vec::new();
+            let mut stage = vec![0u8; pull_cap];
+            loop {
+                let count = (source.pull)(&mut stage)?;
+                if count > stage.len() {
+                    return Err(Error::new(
+                        ErrorCode::Mapping,
+                        "LOB source returned an oversized chunk",
+                    ));
+                }
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&stage[..count]);
+            }
+            streamed.insert(source.param_index, bytes);
+        }
+        let mut state = self.lock();
+        state.last_streamed_lobs = streamed;
+        let st = state.statements.get_mut(&stmt.0).ok_or_else(unknown_stmt)?;
+        st.bound_params = params.to_vec();
+        Ok(state.stream_row_counts.pop_front().unwrap_or(0))
     }
 
     fn finalize(&self, stmt: StatementHandle) -> Result<()> {

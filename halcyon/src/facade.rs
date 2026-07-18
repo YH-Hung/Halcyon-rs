@@ -28,10 +28,11 @@ use std::thread;
 use crate::core::{
     auto_savepoint, named_savepoint, nested_savepoint, start_with_isolation, terminate, Connection,
     FromRow, IntoParams, IsolationBegin, Params, ResultSet, Row, Savepoint, SavepointOwner,
-    SavepointState, StmtLease, FETCH_BLOCK_ROWS,
+    SavepointState, StmtLease, StreamingResultSet, StreamingState, FETCH_BLOCK_ROWS,
 };
-use crate::driver::{CliDriver, ConnectionParams, StatementHandle};
+use crate::driver::{CliDriver, ConnectionParams, GetDataChunk, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
+use crate::lob::{BindParam, StreamingAccess, StreamingRow};
 use crate::pool::{ConnectionPool, PoolConfig, PooledConnection};
 use crate::retry::{is_read_only, ExecPolicy};
 use crate::value::Value;
@@ -78,6 +79,21 @@ impl Database {
         })
     }
 
+    /// Executes positional values and LOB streams exactly once.
+    pub fn execute_with_lobs(&self, sql: &str, params: Vec<BindParam<'_>>) -> Result<i64> {
+        crate::obs::instrument_execute(sql, || {
+            let mut lease = self.pool.acquire()?;
+            let result = lease.execute_with_lobs(sql, params);
+            if result
+                .as_ref()
+                .is_err_and(|error| error.code == ErrorCode::Connection)
+            {
+                lease.mark_broken();
+            }
+            result
+        })
+    }
+
     /// Runs a streaming query, returning a [`QueryResult`] cursor that owns its
     /// leased connection until dropped. The lease is not returned to the pool
     /// while the cursor is live.
@@ -85,6 +101,30 @@ impl Database {
         let params = params.into_params();
         let policy = self.default_policy(sql);
         crate::obs::instrument_query(sql, || self.query_with_policy(&policy, sql, params))
+    }
+
+    /// Opens a row-at-a-time streaming query in one attempt, retaining its
+    /// pooled lease until the returned cursor is dropped.
+    pub fn query_streaming(
+        &self,
+        sql: &str,
+        params: impl IntoParams,
+    ) -> Result<StreamingQueryResult> {
+        let params = params.into_params();
+        crate::obs::instrument_query(sql, || {
+            let mut lease = self.pool.acquire()?;
+            match lease.execute_streaming_query_raw(sql, params) {
+                Ok((stmt_lease, columns)) => {
+                    Ok(StreamingQueryResult::new(lease, stmt_lease, columns))
+                }
+                Err(error) => {
+                    if error.code == ErrorCode::Connection {
+                        lease.mark_broken();
+                    }
+                    Err(error)
+                }
+            }
+        })
     }
 
     /// Runs a query and maps every row into `T` via [`FromRow`], collecting a
@@ -472,6 +512,88 @@ impl fmt::Debug for QueryResult {
     }
 }
 
+/// A row-at-a-time streaming cursor that owns its pooled connection lease.
+pub struct StreamingQueryResult {
+    lease: PooledConnection,
+    stmt_lease: Option<StmtLease>,
+    state: StreamingState,
+}
+
+impl StreamingQueryResult {
+    fn new(lease: PooledConnection, stmt_lease: StmtLease, columns: usize) -> Self {
+        let state = StreamingState::new(stmt_lease.handle(), columns);
+        Self {
+            lease,
+            stmt_lease: Some(stmt_lease),
+            state,
+        }
+    }
+
+    pub fn column_count(&self) -> usize {
+        self.state.column_count()
+    }
+
+    pub fn error(&self) -> Option<Error> {
+        self.state.error()
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<StreamingRow<'_>>> {
+        let driver = self.lease.driver_ref();
+        if self.state.next(driver)? {
+            Ok(Some(StreamingRow::new(self)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl StreamingAccess for StreamingQueryResult {
+    fn streaming_column_count(&self) -> usize {
+        self.state.column_count()
+    }
+
+    fn streaming_get(&mut self, column: usize) -> Result<Value> {
+        let driver = self.lease.driver_ref();
+        self.state.get(driver, column)
+    }
+
+    fn streaming_start_lob(&mut self, column: usize) -> Result<()> {
+        self.state.start_lob(column)
+    }
+
+    fn streaming_read_lob(&mut self, column: usize, buffer: &mut [u8]) -> Result<GetDataChunk> {
+        let driver = self.lease.driver_ref();
+        self.state.read_lob(driver, column, buffer)
+    }
+}
+
+impl Drop for StreamingQueryResult {
+    fn drop(&mut self) {
+        if let Some(stmt_lease) = self.stmt_lease.take() {
+            if self.state.error().is_some() {
+                stmt_lease.poison();
+            }
+            self.lease.release_stmt(stmt_lease);
+        }
+        if self
+            .state
+            .error()
+            .is_some_and(|error| error.code == ErrorCode::Connection)
+        {
+            self.lease.mark_broken();
+        }
+    }
+}
+
+impl fmt::Debug for StreamingQueryResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamingQueryResult")
+            .field("columns", &self.column_count())
+            .finish_non_exhaustive()
+    }
+}
+
 /// A transaction that owns the pooled connection it runs on, returned by
 /// [`Database::begin`]. Autocommit is off for its lifetime; commit/rollback end
 /// it and restore autocommit. An uncommitted transaction rolls back on drop, and
@@ -515,6 +637,11 @@ impl ScopedTransaction {
         crate::obs::instrument_execute(sql, move || self.note(self.lease.execute(sql, params)))
     }
 
+    /// Executes positional values and LOB streams once in this transaction.
+    pub fn execute_with_lobs(&self, sql: &str, params: Vec<BindParam<'_>>) -> Result<i64> {
+        crate::obs::instrument_execute(sql, || self.note(self.lease.execute_with_lobs(sql, params)))
+    }
+
     /// Runs a streaming query within the unit of work, returning a [`TxCursor`]
     /// that borrows the transaction (so it must be finished — dropped — before
     /// commit/rollback). A connection-class failure while scanning the cursor
@@ -525,6 +652,23 @@ impl ScopedTransaction {
         crate::obs::instrument_query(sql, move || {
             let rows = self.note(self.lease.query(sql, params))?;
             Ok(TxCursor {
+                rows,
+                broken: &self.conn_broken,
+            })
+        })
+    }
+
+    /// Opens a row-at-a-time streaming cursor that reports connection failures
+    /// back to this transaction on drop.
+    pub fn query_streaming(
+        &self,
+        sql: &str,
+        params: impl IntoParams,
+    ) -> Result<TxStreamingCursor<'_>> {
+        let params = params.into_params();
+        crate::obs::instrument_query(sql, move || {
+            let rows = self.note(self.lease.query_streaming(sql, params))?;
+            Ok(TxStreamingCursor {
                 rows,
                 broken: &self.conn_broken,
             })
@@ -723,6 +867,47 @@ impl fmt::Debug for TxCursor<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TxCursor")
             .field("columns", &self.rows.column_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Transaction-scoped row-at-a-time streaming cursor.
+pub struct TxStreamingCursor<'t> {
+    rows: StreamingResultSet<'t>,
+    broken: &'t Cell<bool>,
+}
+
+impl TxStreamingCursor<'_> {
+    pub fn column_count(&self) -> usize {
+        self.rows.column_count()
+    }
+
+    pub fn error(&self) -> Option<Error> {
+        self.rows.error()
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<StreamingRow<'_>>> {
+        self.rows.next()
+    }
+}
+
+impl Drop for TxStreamingCursor<'_> {
+    fn drop(&mut self) {
+        if self
+            .rows
+            .error()
+            .is_some_and(|error| error.code == ErrorCode::Connection)
+        {
+            self.broken.set(true);
+        }
+    }
+}
+
+impl fmt::Debug for TxStreamingCursor<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TxStreamingCursor")
+            .field("columns", &self.column_count())
             .finish_non_exhaustive()
     }
 }
@@ -1135,6 +1320,42 @@ mod tests {
             assert_eq!(rs.error().map(|e| e.code), Some(ErrorCode::Connection));
         } // cursor drops → lease discarded (not returned)
         assert_eq!(db.pool().idle_count(), 0);
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn streaming_query_result_marks_lease_broken_on_connection_error() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(
+            ["doc"],
+            vec![vec![Value::Bytes(vec![1])]],
+        ));
+        mock.fail_fetch_next_on_call(1, Error::new(ErrorCode::Connection, "stream dropped"));
+        let db = open(&mock);
+        {
+            let mut rs = db.query_streaming("SELECT doc FROM docs", ()).unwrap();
+            assert_eq!(rs.next().unwrap_err().code, ErrorCode::Connection);
+        }
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn tx_streaming_cursor_sets_conn_broken_on_connection_error() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(
+            ["doc"],
+            vec![vec![Value::Bytes(vec![1])]],
+        ));
+        mock.fail_fetch_next_on_call(1, Error::new(ErrorCode::Connection, "stream dropped"));
+        let db = open(&mock);
+        let result: Result<()> = db.transaction(|tx| {
+            let mut rs = tx.query_streaming("SELECT doc FROM docs", ())?;
+            rs.next()?;
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().code, ErrorCode::Connection);
         assert_eq!(db.pool().total_count(), 0);
         assert_eq!(mock.disconnect_calls(), 1);
     }

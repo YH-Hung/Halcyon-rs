@@ -45,6 +45,7 @@ pub const SQL_NULL_HANDLE: SQLHANDLE = std::ptr::null_mut();
 
 pub const SQL_SUCCESS: SQLRETURN = 0;
 pub const SQL_SUCCESS_WITH_INFO: SQLRETURN = 1;
+pub const SQL_NEED_DATA: SQLRETURN = 99;
 pub const SQL_NO_DATA: SQLRETURN = 100;
 pub const SQL_ERROR: SQLRETURN = -1;
 pub const SQL_INVALID_HANDLE: SQLRETURN = -2;
@@ -59,7 +60,15 @@ pub const SQL_HANDLE_STMT: SQLSMALLINT = 3;
 
 pub const SQL_NTS: SQLINTEGER = -3;
 pub const SQL_NULL_DATA: SQLLEN = -1;
+pub const SQL_DATA_AT_EXEC: SQLLEN = -2;
 pub const SQL_NO_TOTAL: SQLLEN = -4;
+
+/// `SQL_LEN_DATA_AT_EXEC(length)` from `sqlext.h`. The C macro performs the
+/// arithmetic in `SQLLEN`. Callers must keep `-length - 100` representable in
+/// that signed type; the safe driver seam validates this before binding.
+pub const fn sql_len_data_at_exec(length: SQLLEN) -> SQLLEN {
+    length.wrapping_neg().wrapping_sub(100)
+}
 
 // --- SQL data types ---
 
@@ -229,6 +238,12 @@ extern "C" {
         buffer_length: SQLLEN,
         str_len_or_ind: *mut SQLLEN,
     ) -> SQLRETURN;
+
+    pub fn SQLParamData(hstmt: SQLHSTMT, value: *mut SQLPOINTER) -> SQLRETURN;
+
+    pub fn SQLPutData(hstmt: SQLHSTMT, value: SQLPOINTER, length: SQLLEN) -> SQLRETURN;
+
+    pub fn SQLCancel(hstmt: SQLHSTMT) -> SQLRETURN;
 
     pub fn SQLFreeStmt(hstmt: SQLHSTMT, option: SQLUSMALLINT) -> SQLRETURN;
 

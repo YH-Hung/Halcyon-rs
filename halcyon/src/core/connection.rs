@@ -22,10 +22,11 @@ use std::sync::Arc;
 use crate::core::mapping;
 use crate::core::params::{bind_named, IntoParams, Params};
 use crate::core::result_set::{FromRow, ResultSet};
-use crate::core::{StatementCache, StmtLease};
+use crate::core::{StatementCache, StmtLease, StreamingResultSet};
 use crate::driver::batch::validate_batch_rows;
 use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
+use crate::lob::BindParam;
 use crate::value::Value;
 use crate::Isolation;
 
@@ -148,6 +149,21 @@ impl Connection {
         result
     }
 
+    /// Executes positional values and single-use LOB sources exactly once.
+    /// Named parameters are intentionally unsupported on this path.
+    pub fn execute_with_lobs(&self, sql: &str, params: Vec<BindParam<'_>>) -> Result<i64> {
+        self.ensure_usable()?;
+        let stmt = self.prepare(sql)?;
+        let (values, sources) = lower_lob_params(params);
+        let result = self
+            .driver
+            .execute_streaming(stmt.handle(), &values, sources);
+        if result.is_err() {
+            stmt.poison();
+        }
+        result
+    }
+
     /// Prepares, binds, executes, and returns a streaming [`ResultSet`] cursor.
     /// Accepts positional (`?`) or named (`:name`) parameters.
     pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<ResultSet<'_>> {
@@ -165,6 +181,29 @@ impl Connection {
             }
         };
         Ok(ResultSet::from_executed(stmt, columns))
+    }
+
+    /// Runs a dedicated row-at-a-time query for chunked LOB access. This path
+    /// never calls `fetch_block` and is always a single attempt.
+    pub fn query_streaming(
+        &self,
+        sql: &str,
+        params: impl IntoParams,
+    ) -> Result<StreamingResultSet<'_>> {
+        self.ensure_usable()?;
+        let stmt = self.prepare_and_bind(sql, params.into_params())?;
+        let columns = match self
+            .driver
+            .execute(stmt.handle())
+            .and_then(|_| self.driver.column_count(stmt.handle()))
+        {
+            Ok(columns) => columns,
+            Err(error) => {
+                stmt.poison();
+                return Err(error);
+            }
+        };
+        Ok(StreamingResultSet::from_executed(stmt, columns))
     }
 
     /// Runs `sql` and maps every row into `T` via [`FromRow`], collecting a
@@ -253,12 +292,39 @@ impl Connection {
         }
     }
 
+    /// Owned-facade counterpart of [`query_streaming`](Self::query_streaming):
+    /// transfers the executed statement lease to `StreamingQueryResult`.
+    pub(crate) fn execute_streaming_query_raw(
+        &self,
+        sql: &str,
+        params: Params,
+    ) -> Result<(StmtLease, usize)> {
+        self.execute_query_raw(sql, params)
+    }
+
     /// Hands a statement lease back to this connection's cache: transient
     /// leases are finalized, cached ones reset and returned to the LRU (or
     /// dropped if poisoned). The release half of every prepare path above.
     pub(crate) fn release_stmt(&self, lease: StmtLease) {
         self.cache.borrow_mut().release(self.driver.as_ref(), lease);
     }
+}
+
+fn lower_lob_params<'a>(
+    params: Vec<BindParam<'a>>,
+) -> (Vec<Value>, Vec<crate::driver::ParamStreamSource<'a>>) {
+    let mut values = Vec::with_capacity(params.len());
+    let mut sources = Vec::new();
+    for (index, param) in params.into_iter().enumerate() {
+        match param {
+            BindParam::Value(value) => values.push(value),
+            BindParam::Lob(source) => {
+                values.push(Value::Null);
+                sources.push(source.into_stream(index));
+            }
+        }
+    }
+    (values, sources)
 }
 
 impl Drop for Connection {
@@ -610,6 +676,174 @@ mod tests {
         assert_eq!(affected, 3);
         // The transient statement was finalized after execute.
         assert_eq!(mock.finalize_calls(), 1);
+    }
+
+    #[test]
+    fn execute_with_lobs_routes_to_execute_streaming_once() {
+        use crate::{lob_callback, BindParam};
+
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_stream_row_count(4);
+        mock.set_stream_pull_cap(2);
+        let conn = Connection::open_with_cache(mock.clone(), &params(), 8).unwrap();
+        let mut offset = 0;
+        let affected = conn
+            .execute_with_lobs(
+                "INSERT INTO docs VALUES (?, ?)",
+                vec![
+                    BindParam::Value(Value::Int(7)),
+                    BindParam::Lob(lob_callback(
+                        move |buf| {
+                            let source = b"lob";
+                            let count = buf.len().min(source.len() - offset);
+                            buf[..count].copy_from_slice(&source[offset..offset + count]);
+                            offset += count;
+                            Ok(count)
+                        },
+                        Some(3),
+                    )),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(affected, 4);
+        assert_eq!(mock.execute_streaming_calls(), 1);
+        assert_eq!(mock.last_stream_values(), vec![Value::Int(7), Value::Null]);
+        assert_eq!(mock.last_streamed_lobs().get(&1), Some(&b"lob".to_vec()));
+    }
+
+    #[test]
+    fn execute_with_lobs_driver_failure_is_not_retried() {
+        use crate::BindParam;
+
+        let mock = Arc::new(MockCliDriver::new());
+        let mut error = Error::new(ErrorCode::Transient, "retryable but single-use");
+        error.retriable = true;
+        mock.push_execute_streaming_error(error);
+        let conn = connect(&mock);
+
+        let got = conn
+            .execute_with_lobs(
+                "INSERT INTO docs VALUES (?)",
+                vec![BindParam::Value(Value::Bytes(vec![1]))],
+            )
+            .unwrap_err();
+        assert!(got.retriable);
+        assert_eq!(mock.execute_streaming_calls(), 1);
+    }
+
+    #[test]
+    fn execute_with_lobs_failure_poisons_statement_lease() {
+        use crate::{lob_callback, BindParam};
+
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = Connection::open_with_cache(mock.clone(), &params(), 8).unwrap();
+        let err = conn
+            .execute_with_lobs(
+                "INSERT INTO docs VALUES (?)",
+                vec![BindParam::Lob(lob_callback(
+                    |_| Err(Error::new(ErrorCode::Mapping, "source failed")),
+                    None,
+                ))],
+            )
+            .unwrap_err();
+        assert_eq!(err.message, "source failed");
+        assert_eq!(mock.finalize_calls(), 1);
+
+        mock.push_stream_row_count(1);
+        conn.execute_with_lobs(
+            "INSERT INTO docs VALUES (?)",
+            vec![BindParam::Value(Value::Bytes(vec![1]))],
+        )
+        .unwrap();
+        assert_eq!(mock.prepared_sql().len(), 2);
+    }
+
+    #[test]
+    fn lob_reader_chunk_boundaries_and_streaming_never_fetches_blocks() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(
+            ["empty", "null", "exact", "tail"],
+            vec![vec![
+                Value::Bytes(Vec::new()),
+                Value::Null,
+                Value::Bytes(b"abcdefgh".to_vec()),
+                Value::Bytes(b"abandoned".to_vec()),
+            ]],
+        ));
+        mock.set_lob_chunk_cap(4);
+        let conn = Connection::open_with_cache(mock.clone(), &params(), 8).unwrap();
+        let mut rs = conn
+            .query_streaming("SELECT empty, null, exact, tail FROM t", ())
+            .unwrap();
+        let mut row = rs.next().unwrap().unwrap();
+
+        let mut buf = [0u8; 4];
+        {
+            let mut empty = row.lob(0).unwrap();
+            assert_eq!(empty.read(&mut buf).unwrap(), 0);
+            assert!(!empty.is_null());
+        }
+        {
+            let mut null = row.lob(1).unwrap();
+            assert_eq!(null.read(&mut buf).unwrap(), 0);
+            assert!(null.is_null());
+        }
+        {
+            let mut exact = row.lob(2).unwrap();
+            assert_eq!(exact.read(&mut buf).unwrap(), 4);
+            assert_eq!(&buf, b"abcd");
+            assert_eq!(exact.read(&mut buf).unwrap(), 4);
+            assert_eq!(&buf, b"efgh");
+            assert_eq!(exact.read(&mut buf).unwrap(), 0);
+        }
+        {
+            let mut abandoned = row.lob(3).unwrap();
+            assert_eq!(abandoned.read(&mut buf).unwrap(), 4);
+        }
+        drop(rs);
+        assert_eq!(mock.fetch_block_calls(), 0);
+        assert_eq!(mock.fetch_next_calls(), 1);
+        assert_eq!(mock.close_cursor_calls(), 1);
+    }
+
+    #[test]
+    fn lob_reader_driver_error_is_retained_and_poisons_statement() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(
+            ["doc"],
+            vec![vec![Value::Bytes(vec![1, 2])]],
+        ));
+        mock.push_get_data_chunk_error(Error::new(ErrorCode::Connection, "chunk failed"));
+        let conn = Connection::open_with_cache(mock.clone(), &params(), 8).unwrap();
+        {
+            let mut rs = conn.query_streaming("SELECT doc FROM docs", ()).unwrap();
+            let mut row = rs.next().unwrap().unwrap();
+            {
+                let mut lob = row.lob(0).unwrap();
+                assert_eq!(lob.read(&mut [0u8; 4]).unwrap_err().message, "chunk failed");
+                assert_eq!(lob.read(&mut [0u8; 4]).unwrap(), 0);
+            }
+            assert_eq!(
+                rs.error().map(|error| error.code),
+                Some(ErrorCode::Connection)
+            );
+        }
+        assert_eq!(mock.finalize_calls(), 1);
+    }
+
+    #[test]
+    fn ascending_column_violation_is_invalid_state() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(
+            ["a", "b"],
+            vec![vec![Value::Int(1), Value::Int(2)]],
+        ));
+        let conn = connect(&mock);
+        let mut rs = conn.query_streaming("SELECT a, b FROM t", ()).unwrap();
+        let mut row = rs.next().unwrap().unwrap();
+        assert_eq!(row.get::<i64>(1).unwrap(), 2);
+        assert_eq!(row.get::<i64>(0).unwrap_err().code, ErrorCode::InvalidState);
     }
 
     #[test]

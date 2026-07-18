@@ -9,13 +9,16 @@
 #![allow(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use halcyon_sys as cli;
 
 use crate::driver::sqlstate::classify_sqlstate;
-use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
+use crate::driver::{
+    CliDriver, ConnectionHandle, ConnectionParams, GetDataChunk, ParamStreamSource, StatementHandle,
+};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
 use crate::Isolation;
@@ -23,6 +26,7 @@ use crate::Isolation;
 const FETCH_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BLOCK_ROWS: usize = 4096;
 const MAX_BOUND_COL_BYTES: usize = 64 * 1024;
+const LOB_STAGE_BYTES: usize = 256 * 1024;
 
 /// Raw CLI handle that may cross threads. The IBM CLI is thread-safe for
 /// distinct handles used from distinct threads, and Halcyon guarantees a
@@ -36,6 +40,10 @@ unsafe impl Sync for RawHandle {}
 
 fn cli_ok(rc: cli::SQLRETURN) -> bool {
     rc == cli::SQL_SUCCESS || rc == cli::SQL_SUCCESS_WITH_INFO
+}
+
+fn streaming_execute_terminal_ok(rc: cli::SQLRETURN) -> bool {
+    cli_ok(rc) || rc == cli::SQL_NO_DATA
 }
 
 fn bytes_to_string(buf: &[u8]) -> String {
@@ -101,6 +109,75 @@ fn isolation_attr_value(level: Isolation) -> cli::SQLULEN {
         Isolation::CursorStability => cli::SQL_TXN_READ_COMMITTED,
         Isolation::ReadStability => cli::SQL_TXN_REPEATABLE_READ,
         Isolation::RepeatableRead => cli::SQL_TXN_SERIALIZABLE,
+    }
+}
+
+/// Ensures a LOB size hint can cross the supported non-Windows SQLLEN/SQLULEN
+/// ABI without truncation.
+fn validate_lob_size_hint(hint: Option<u64>) -> Result<Option<i32>> {
+    hint.map(|value| {
+        // SQL_LEN_DATA_AT_EXEC(n) is `-n - 100`; on the 32-bit SQLLEN ABI,
+        // n must be at most i32::MAX - 99 for that negative indicator to be
+        // representable and remain distinguishable from an ordinary length.
+        const MAX_ENCODED_HINT: u64 = (i32::MAX - 99) as u64;
+        if value > MAX_ENCODED_HINT {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "LOB size hint exceeds the supported 32-bit data-at-exec range",
+            ));
+        }
+        i32::try_from(value).map_err(|_| {
+            Error::new(
+                ErrorCode::InvalidArgument,
+                "LOB size hint exceeds the supported 32-bit data-at-exec range",
+            )
+        })
+    })
+    .transpose()
+}
+
+/// Pumps one NEED_DATA token. Every abnormal exit invokes the injected cancel
+/// callback, including a user callback panic caught at the seam.
+fn pump_need_data_source(
+    stage: &mut [u8],
+    pull: &mut dyn FnMut(&mut [u8]) -> Result<usize>,
+    mut put: impl FnMut(&[u8]) -> Result<()>,
+    mut cancel: impl FnMut(),
+) -> Result<()> {
+    let mut any_put = false;
+    loop {
+        let pulled = match catch_unwind(AssertUnwindSafe(|| pull(stage))) {
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) => {
+                cancel();
+                return Err(error);
+            }
+            Err(_) => {
+                cancel();
+                return Err(Error::new(ErrorCode::Mapping, "LOB source pull panicked"));
+            }
+        };
+        if pulled > stage.len() {
+            cancel();
+            return Err(Error::new(
+                ErrorCode::Mapping,
+                "LOB source returned an oversized chunk",
+            ));
+        }
+        if pulled == 0 {
+            if !any_put {
+                if let Err(error) = put(&stage[..0]) {
+                    cancel();
+                    return Err(error);
+                }
+            }
+            return Ok(());
+        }
+        if let Err(error) = put(&stage[..pulled]) {
+            cancel();
+            return Err(error);
+        }
+        any_put = true;
     }
 }
 
@@ -187,6 +264,10 @@ struct StmtState {
     /// Kept alive (and address-stable) between bind_params and execute — the
     /// CLI holds pointers into these until the statement is executed or rebound.
     bound: Vec<BoundParam>,
+    /// The CLI retains each streamed parameter's StrLen_or_IndPtr after
+    /// execute, so this storage must be owned by the cached statement rather
+    /// than by one execute_streaming stack frame.
+    stream_indicators: Vec<cli::SQLLEN>,
     /// Described once per successfully executed cursor, then cleared on close
     /// or re-execute so cached statements never retain stale result metadata.
     cols: Option<Vec<ColMeta>>,
@@ -444,6 +525,7 @@ where
                 state: Arc::new(Mutex::new(StmtState {
                     handle: stmt,
                     bound: Vec::new(),
+                    stream_indicators: Vec::new(),
                     cols: None,
                     block_fallback: false,
                     pending_rowset: None,
@@ -1713,6 +1795,330 @@ impl CliDriver for Db2CliDriver {
         }
     }
 
+    fn fetch_next(&self, stmt: StatementHandle) -> Result<bool> {
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
+        let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
+        if st.cols.is_none() {
+            describe_columns(&mut st)?;
+        }
+        let h = st.handle.0;
+        let rc = unsafe { cli::SQLFetch(h) };
+        if rc == cli::SQL_NO_DATA {
+            return Ok(false);
+        }
+        if !cli_ok(rc) {
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Connection,
+                "SQLFetch (streaming) failed",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn get_value(&self, stmt: StatementHandle, column: usize) -> Result<Value> {
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
+        let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
+        if st.cols.is_none() {
+            describe_columns(&mut st)?;
+        }
+        let meta = st
+            .cols
+            .as_ref()
+            .and_then(|columns| columns.get(column))
+            .copied()
+            .ok_or_else(|| Error::new(ErrorCode::Mapping, "column index out of range"))?;
+        read_column_typed(st.handle.0, column, meta.sql_type)
+    }
+
+    fn get_data_chunk(
+        &self,
+        stmt: StatementHandle,
+        column: usize,
+        buffer: &mut [u8],
+    ) -> Result<GetDataChunk> {
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
+        let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
+        if st.cols.is_none() {
+            describe_columns(&mut st)?;
+        }
+        let sql_type = st
+            .cols
+            .as_ref()
+            .and_then(|columns| columns.get(column))
+            .map(|meta| meta.sql_type)
+            .ok_or_else(|| Error::new(ErrorCode::Mapping, "column index out of range"))?;
+        let character = !matches!(
+            sql_type,
+            cli::SQL_BINARY | cli::SQL_VARBINARY | cli::SQL_LONGVARBINARY | cli::SQL_BLOB
+        );
+        if buffer.is_empty() || (character && buffer.len() < 2) {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "LOB chunk buffer is too small",
+            ));
+        }
+        let buffer_len = cli::SQLLEN::try_from(buffer.len()).map_err(|_| {
+            Error::new(
+                ErrorCode::InvalidArgument,
+                "LOB chunk buffer exceeds the supported CLI length range",
+            )
+        })?;
+        let h = st.handle.0;
+        let mut indicator: cli::SQLLEN = 0;
+        let rc = unsafe {
+            cli::SQLGetData(
+                h,
+                (column + 1) as cli::SQLUSMALLINT,
+                if character {
+                    cli::SQL_C_CHAR
+                } else {
+                    cli::SQL_C_BINARY
+                },
+                buffer.as_mut_ptr().cast(),
+                buffer_len,
+                &mut indicator,
+            )
+        };
+        if rc == cli::SQL_NO_DATA {
+            return Ok(GetDataChunk {
+                bytes: 0,
+                done: true,
+                is_null: false,
+            });
+        }
+        if !cli_ok(rc) {
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Connection,
+                "SQLGetData (chunk) failed",
+            ));
+        }
+        if indicator == cli::SQL_NULL_DATA {
+            return Ok(GetDataChunk {
+                bytes: 0,
+                done: true,
+                is_null: true,
+            });
+        }
+        let capacity = if character {
+            buffer.len() - 1
+        } else {
+            buffer.len()
+        };
+        if rc == cli::SQL_SUCCESS_WITH_INFO {
+            Ok(GetDataChunk {
+                bytes: capacity,
+                done: false,
+                is_null: false,
+            })
+        } else {
+            let bytes = if indicator == cli::SQL_NO_TOTAL {
+                capacity
+            } else {
+                usize::try_from(indicator).unwrap_or(capacity).min(capacity)
+            };
+            Ok(GetDataChunk {
+                bytes,
+                done: true,
+                is_null: false,
+            })
+        }
+    }
+
+    fn execute_streaming(
+        &self,
+        stmt: StatementHandle,
+        params: &[Value],
+        mut sources: Vec<ParamStreamSource<'_>>,
+    ) -> Result<i64> {
+        // Validate every portable value before binding or entering NEED_DATA.
+        let mut source_by_param = vec![None; params.len()];
+        let mut validated_hints = Vec::with_capacity(sources.len());
+        for (source_index, source) in sources.iter().enumerate() {
+            if source.param_index >= params.len()
+                || source_by_param[source.param_index]
+                    .replace(source_index)
+                    .is_some()
+            {
+                return Err(Error::new(
+                    ErrorCode::Mapping,
+                    "bad data-at-exec stream source index",
+                ));
+            }
+            validated_hints.push(validate_lob_size_hint(source.size_hint)?);
+        }
+
+        let Some(st) = self.stmt_state(stmt) else {
+            return Err(unknown_stmt());
+        };
+        let mut st = st.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_rowset_reset(&mut st)?;
+        st.cols = None;
+        st.block_fallback = false;
+        st.bound = params.iter().map(BoundParam::from_value).collect();
+        st.stream_indicators.clear();
+        st.stream_indicators.resize(params.len(), 0);
+        let h = st.handle.0;
+        static EMPTY: [u8; 1] = [0];
+
+        let StmtState {
+            bound,
+            stream_indicators,
+            ..
+        } = &mut *st;
+        for (param_index, bp) in bound.iter_mut().enumerate() {
+            if let Some(source_index) = source_by_param[param_index] {
+                let source = &sources[source_index];
+                let hint = validated_hints[source_index];
+                stream_indicators[param_index] = hint
+                    .map(cli::sql_len_data_at_exec)
+                    .unwrap_or(cli::SQL_DATA_AT_EXEC);
+                let rc = unsafe {
+                    cli::SQLBindParameter(
+                        h,
+                        (param_index + 1) as cli::SQLUSMALLINT,
+                        cli::SQL_PARAM_INPUT,
+                        if source.is_clob {
+                            cli::SQL_C_CHAR
+                        } else {
+                            cli::SQL_C_BINARY
+                        },
+                        if source.is_clob {
+                            cli::SQL_CLOB
+                        } else {
+                            cli::SQL_BLOB
+                        },
+                        hint.unwrap_or(0) as cli::SQLULEN,
+                        0,
+                        param_index as cli::SQLPOINTER,
+                        0,
+                        &mut stream_indicators[param_index],
+                    )
+                };
+                if !cli_ok(rc) {
+                    return Err(make_error(
+                        cli::SQL_HANDLE_STMT,
+                        h,
+                        ErrorCode::Syntax,
+                        "SQLBindParameter (data-at-exec) failed",
+                    ));
+                }
+                continue;
+            }
+
+            let mut buffer_length: cli::SQLLEN = 0;
+            let value_ptr: cli::SQLPOINTER = if bp.c_type == cli::SQL_C_SBIGINT {
+                (&mut bp.i64_val as *mut i64).cast()
+            } else if bp.c_type == cli::SQL_C_DOUBLE {
+                (&mut bp.f64_val as *mut f64).cast()
+            } else if bp.buf.is_empty() {
+                EMPTY.as_ptr() as *mut u8 as cli::SQLPOINTER
+            } else {
+                buffer_length = bp.buf.len() as cli::SQLLEN;
+                bp.buf.as_mut_ptr().cast()
+            };
+            let rc = unsafe {
+                cli::SQLBindParameter(
+                    h,
+                    (param_index + 1) as cli::SQLUSMALLINT,
+                    cli::SQL_PARAM_INPUT,
+                    bp.c_type,
+                    bp.sql_type,
+                    if bp.len_ind == cli::SQL_NULL_DATA {
+                        0
+                    } else {
+                        buffer_length as cli::SQLULEN
+                    },
+                    0,
+                    value_ptr,
+                    buffer_length,
+                    &mut bp.len_ind,
+                )
+            };
+            if !cli_ok(rc) {
+                return Err(make_error(
+                    cli::SQL_HANDLE_STMT,
+                    h,
+                    ErrorCode::Unknown,
+                    "SQLBindParameter failed",
+                ));
+            }
+        }
+
+        let mut rc = unsafe { cli::SQLExecute(h) };
+        let mut stage = vec![0u8; LOB_STAGE_BYTES];
+        while rc == cli::SQL_NEED_DATA {
+            let mut token: cli::SQLPOINTER = ptr::null_mut();
+            rc = unsafe { cli::SQLParamData(h, &mut token) };
+            if rc != cli::SQL_NEED_DATA {
+                break;
+            }
+            let param_index = token as usize;
+            let Some(source_index) = source_by_param.get(param_index).copied().flatten() else {
+                unsafe { cli::SQLCancel(h) };
+                return Err(Error::new(ErrorCode::Mapping, "unknown data-at-exec token"));
+            };
+            let source = &mut sources[source_index];
+            pump_need_data_source(
+                &mut stage,
+                source.pull.as_mut(),
+                |bytes| {
+                    let put = unsafe {
+                        cli::SQLPutData(
+                            h,
+                            bytes.as_ptr() as *mut u8 as cli::SQLPOINTER,
+                            bytes.len() as cli::SQLLEN,
+                        )
+                    };
+                    if cli_ok(put) {
+                        Ok(())
+                    } else {
+                        Err(make_error(
+                            cli::SQL_HANDLE_STMT,
+                            h,
+                            ErrorCode::Connection,
+                            if bytes.is_empty() {
+                                "SQLPutData(empty) failed"
+                            } else {
+                                "SQLPutData failed"
+                            },
+                        ))
+                    }
+                },
+                || unsafe {
+                    cli::SQLCancel(h);
+                },
+            )?;
+        }
+        if !streaming_execute_terminal_ok(rc) {
+            let error = make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Connection,
+                "SQLExecute (streaming) failed",
+            );
+            // A SQLParamData failure can still leave the statement in the
+            // data-at-execution state. Cancel after capturing its diagnostic.
+            unsafe { cli::SQLCancel(h) };
+            return Err(error);
+        }
+        let mut rows: cli::SQLLEN = 0;
+        unsafe { cli::SQLRowCount(h, &mut rows) };
+        Ok(i64::from(rows.max(0)))
+    }
+
     fn finalize(&self, stmt: StatementHandle) -> Result<()> {
         finalize_stmt_with(&self.inner, stmt.0, |h| {
             free_statement_handle(h, "SQLFreeHandle(SQL_HANDLE_STMT) failed")
@@ -1824,6 +2230,130 @@ mod tests {
     }
 
     #[test]
+    fn pump_source_err_invokes_cancel_and_propagates() {
+        let mut stage = [0u8; 8];
+        let mut cancelled = 0;
+        let mut pull = |_: &mut [u8]| Err(Error::new(ErrorCode::Mapping, "read failed"));
+        let err = pump_need_data_source(&mut stage, &mut pull, |_| Ok(()), || cancelled += 1)
+            .unwrap_err();
+        assert_eq!(err.message, "read failed");
+        assert_eq!(cancelled, 1);
+    }
+
+    #[test]
+    fn pump_rejects_oversized_pull_before_put() {
+        let mut stage = [0u8; 8];
+        let mut puts = 0;
+        let mut cancelled = 0;
+        let mut pull = |_: &mut [u8]| Ok(9);
+        let err = pump_need_data_source(
+            &mut stage,
+            &mut pull,
+            |_| {
+                puts += 1;
+                Ok(())
+            },
+            || cancelled += 1,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Mapping);
+        assert_eq!(puts, 0);
+        assert_eq!(cancelled, 1);
+    }
+
+    #[test]
+    fn pump_cancels_on_pull_panic() {
+        let mut stage = [0u8; 8];
+        let mut cancelled = 0;
+        let mut pull = |_: &mut [u8]| -> Result<usize> { panic!("callback panic") };
+        let err = pump_need_data_source(&mut stage, &mut pull, |_| Ok(()), || cancelled += 1)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Mapping);
+        assert_eq!(cancelled, 1);
+    }
+
+    #[test]
+    fn validate_lob_size_hint_rejects_overflow() {
+        let err = validate_lob_size_hint(Some(i32::MAX as u64 + 1)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        let max_encodable = (i32::MAX - 99) as u64;
+        assert_eq!(
+            validate_lob_size_hint(Some(max_encodable)).unwrap(),
+            Some(i32::MAX - 99)
+        );
+        assert_eq!(
+            validate_lob_size_hint(Some(max_encodable + 1))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(validate_lob_size_hint(Some(7)).unwrap(), Some(7));
+        assert_eq!(validate_lob_size_hint(None).unwrap(), None);
+    }
+
+    #[test]
+    fn streaming_execute_accepts_no_data_as_zero_rows() {
+        assert!(streaming_execute_terminal_ok(cli::SQL_NO_DATA));
+        assert!(streaming_execute_terminal_ok(cli::SQL_SUCCESS));
+        assert!(!streaming_execute_terminal_ok(cli::SQL_ERROR));
+    }
+
+    #[test]
+    fn streamed_indicator_storage_is_owned_by_statement_state() {
+        let (_, state) = test_stmt_entry(3);
+        let pointer = {
+            let mut state = state.lock().unwrap();
+            state.stream_indicators = vec![cli::SQL_DATA_AT_EXEC];
+            state.stream_indicators.as_mut_ptr()
+        };
+        let mut state = state.lock().unwrap();
+        assert_eq!(state.stream_indicators.as_mut_ptr(), pointer);
+    }
+
+    #[test]
+    fn pump_empty_non_null_issues_one_zero_length_put() {
+        let mut stage = [0u8; 8];
+        let mut lengths = Vec::new();
+        let mut pull = |_: &mut [u8]| Ok(0);
+        pump_need_data_source(
+            &mut stage,
+            &mut pull,
+            |bytes| {
+                lengths.push(bytes.len());
+                Ok(())
+            },
+            || panic!("must not cancel"),
+        )
+        .unwrap();
+        assert_eq!(lengths, vec![0]);
+    }
+
+    #[test]
+    fn pump_cancels_when_put_fails() {
+        let mut stage = [0u8; 8];
+        let mut cancelled = 0;
+        let mut calls = 0;
+        let mut pull = |buf: &mut [u8]| {
+            calls += 1;
+            if calls == 1 {
+                buf[0] = 1;
+                Ok(1)
+            } else {
+                Ok(0)
+            }
+        };
+        let err = pump_need_data_source(
+            &mut stage,
+            &mut pull,
+            |_| Err(Error::new(ErrorCode::Connection, "put failed")),
+            || cancelled += 1,
+        )
+        .unwrap_err();
+        assert_eq!(err.message, "put failed");
+        assert_eq!(cancelled, 1);
+    }
+
+    #[test]
     fn driver_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Db2CliDriver>();
@@ -1842,6 +2372,7 @@ mod tests {
         let mut st = StmtState {
             handle: RawHandle(ptr::null_mut()),
             bound: Vec::new(),
+            stream_indicators: Vec::new(),
             cols: None,
             block_fallback: false,
             pending_rowset: None,
@@ -1875,6 +2406,7 @@ mod tests {
             state: Arc::new(Mutex::new(StmtState {
                 handle: RawHandle(ptr::null_mut()),
                 bound: Vec::new(),
+                stream_indicators: Vec::new(),
                 cols: None,
                 block_fallback: false,
                 pending_rowset: Some(storage),
@@ -1933,6 +2465,7 @@ mod tests {
         let state = Arc::new(Mutex::new(StmtState {
             handle: RawHandle(ptr::null_mut()),
             bound: Vec::new(),
+            stream_indicators: Vec::new(),
             cols: None,
             block_fallback: false,
             pending_rowset: None,

@@ -58,6 +58,7 @@ pub mod driver;
 mod error;
 mod facade;
 mod isolation;
+mod lob;
 // Feature-gated async facade (tokio spawn_blocking). See async_db.rs.
 #[cfg(feature = "tokio")]
 mod async_db;
@@ -85,11 +86,18 @@ pub mod stress;
 pub use async_db::AsyncDatabase;
 pub use core::{
     Connection, FromColumn, FromRow, IntoParams, Named, Params, QueryMap, ResultSet, Row,
-    Savepoint, Statement, Transaction,
+    Savepoint, Statement, StreamingResultSet, Transaction,
 };
 pub use error::{Error, ErrorCode, Result};
-pub use facade::{Database, QueryResult, ScopedTransaction, TxCursor, TxQueryMap};
+pub use facade::{
+    Database, QueryResult, ScopedTransaction, StreamingQueryResult, TxCursor, TxQueryMap,
+    TxStreamingCursor,
+};
 pub use isolation::Isolation;
+pub use lob::{
+    lob_callback, lob_file, lob_reader, owned_lob_callback, owned_lob_file, BindParam, LobReader,
+    LobSource, OwnedBindParam, OwnedLobSource, StreamingRow,
+};
 pub use pool::{ConnectionPool, PoolConfig, PooledConnection};
 pub use retry::{BackoffPolicy, ExecPolicy};
 pub use value::Value;

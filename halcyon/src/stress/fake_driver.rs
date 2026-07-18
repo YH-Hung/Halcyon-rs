@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
-use crate::driver::{CliDriver, ConnectionHandle, ConnectionParams, StatementHandle};
+use crate::driver::{
+    CliDriver, ConnectionHandle, ConnectionParams, GetDataChunk, ParamStreamSource, StatementHandle,
+};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
 use crate::Isolation;
@@ -290,6 +292,54 @@ impl CliDriver for ConcurrentFakeDriver {
         }
         s.position = 0;
         Ok(vec![vec![Value::Int(encoded_value(&s.sql))]]) // exactly one row
+    }
+
+    fn fetch_next(&self, stmt: StatementHandle) -> Result<bool> {
+        let mut g = self.state.lock().unwrap();
+        let conn = g.stmts.get(&stmt.0).map(|s| s.conn).ok_or_else(stale)?;
+        if !g.live.contains(&conn) {
+            return Err(stale());
+        }
+        let s = g.stmts.get_mut(&stmt.0).ok_or_else(stale)?;
+        if s.position >= 0 || !is_select(&s.sql) {
+            Ok(false)
+        } else {
+            s.position = 0;
+            Ok(true)
+        }
+    }
+
+    fn get_value(&self, stmt: StatementHandle, column: usize) -> Result<Value> {
+        let g = self.state.lock().unwrap();
+        let s = g.stmts.get(&stmt.0).ok_or_else(stale)?;
+        if column != 0 {
+            return Err(Error::new(ErrorCode::Mapping, "column index out of range"));
+        }
+        Ok(Value::Int(encoded_value(&s.sql)))
+    }
+
+    fn get_data_chunk(
+        &self,
+        _stmt: StatementHandle,
+        _column: usize,
+        _buffer: &mut [u8],
+    ) -> Result<GetDataChunk> {
+        Err(Error::new(
+            ErrorCode::Unknown,
+            "stress fake LOB chunks are unsupported",
+        ))
+    }
+
+    fn execute_streaming(
+        &self,
+        _stmt: StatementHandle,
+        _params: &[Value],
+        _sources: Vec<ParamStreamSource<'_>>,
+    ) -> Result<i64> {
+        Err(Error::new(
+            ErrorCode::Unknown,
+            "stress fake streaming writes are unsupported",
+        ))
     }
 
     fn finalize(&self, stmt: StatementHandle) -> Result<()> {

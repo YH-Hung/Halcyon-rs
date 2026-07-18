@@ -24,6 +24,24 @@ use crate::error::Result;
 use crate::value::Value;
 use crate::Isolation;
 
+/// Result of one chunked LOB read. `bytes == 0 && done` is clean EOF.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GetDataChunk {
+    pub bytes: usize,
+    pub done: bool,
+    pub is_null: bool,
+}
+
+/// One data-at-execution parameter stream for [`CliDriver::execute_streaming`].
+pub type ParamStreamPull<'a> = dyn FnMut(&mut [u8]) -> Result<usize> + 'a;
+
+pub struct ParamStreamSource<'a> {
+    pub param_index: usize,
+    pub pull: Box<ParamStreamPull<'a>>,
+    pub size_hint: Option<u64>,
+    pub is_clob: bool,
+}
+
 /// Opaque token for a driver-owned connection. `0` is never a live handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionHandle(pub u64);
@@ -101,6 +119,28 @@ pub trait CliDriver: Send + Sync {
     /// block means the cursor is exhausted. Driver failures are classified and
     /// returned as errors.
     fn fetch_block(&self, stmt: StatementHandle, max_rows: usize) -> Result<Vec<Vec<Value>>>;
+
+    /// Positions a dedicated row-at-a-time streaming cursor on its next row.
+    fn fetch_next(&self, stmt: StatementHandle) -> Result<bool>;
+
+    /// Reads one scalar cell on the current streaming row.
+    fn get_value(&self, stmt: StatementHandle, column: usize) -> Result<Value>;
+
+    /// Reads one chunk of a cell on the current streaming row.
+    fn get_data_chunk(
+        &self,
+        stmt: StatementHandle,
+        column: usize,
+        buffer: &mut [u8],
+    ) -> Result<GetDataChunk>;
+
+    /// Binds ordinary values and data-at-execution streams, then executes once.
+    fn execute_streaming(
+        &self,
+        stmt: StatementHandle,
+        params: &[Value],
+        sources: Vec<ParamStreamSource<'_>>,
+    ) -> Result<i64>;
 
     /// Releases a statement handle. Idempotent for already-finalized handles.
     fn finalize(&self, stmt: StatementHandle) -> Result<()>;

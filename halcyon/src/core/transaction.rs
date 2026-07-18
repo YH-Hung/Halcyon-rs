@@ -14,11 +14,13 @@ use std::fmt;
 use crate::core::connection::Connection;
 use crate::core::params::IntoParams;
 use crate::core::result_set::{FromRow, ResultSet};
+use crate::core::StreamingResultSet;
 use crate::core::{
     auto_savepoint, named_savepoint, nested_savepoint, Savepoint, SavepointOwner, SavepointState,
 };
 use crate::driver::{CliDriver, ConnectionHandle};
 use crate::error::{Error, Result};
+use crate::lob::BindParam;
 use crate::value::Value;
 use crate::Isolation;
 
@@ -71,11 +73,25 @@ impl<'c> Transaction<'c> {
         self.conn.execute(sql, params)
     }
 
+    /// Executes positional values and LOB streams once within this transaction.
+    pub fn execute_with_lobs(&self, sql: &str, params: Vec<BindParam<'_>>) -> Result<i64> {
+        self.conn.execute_with_lobs(sql, params)
+    }
+
     /// Runs a streaming query within the unit of work. The returned cursor
     /// borrows the transaction, so it must be finished (dropped) before
     /// commit/rollback. See [`Connection::query`].
     pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<ResultSet<'_>> {
         self.conn.query(sql, params)
+    }
+
+    /// Opens a row-at-a-time streaming cursor within this transaction.
+    pub fn query_streaming(
+        &self,
+        sql: &str,
+        params: impl IntoParams,
+    ) -> Result<StreamingResultSet<'_>> {
+        self.conn.query_streaming(sql, params)
     }
 
     /// Runs a query and maps every row into `T`. See [`Connection::query_as`].

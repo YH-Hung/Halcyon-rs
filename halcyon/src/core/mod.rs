@@ -13,6 +13,7 @@ mod params;
 mod result_set;
 mod savepoint;
 mod stmt_cache;
+mod streaming;
 mod transaction;
 
 #[cfg(all(test, feature = "derive"))]
@@ -24,6 +25,8 @@ pub use params::{IntoParams, Named, Params};
 pub(crate) use result_set::FETCH_BLOCK_ROWS;
 pub use result_set::{FromRow, QueryMap, ResultSet, Row};
 pub use savepoint::Savepoint;
+pub use streaming::StreamingResultSet;
+pub(crate) use streaming::StreamingState;
 pub use transaction::Transaction;
 // Shared with the facade's owned pooled cursor / RAII transaction, which live
 // outside `core` and so can't reach these through the private submodules.
