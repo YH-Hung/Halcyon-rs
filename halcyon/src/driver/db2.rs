@@ -201,32 +201,61 @@ struct StmtEntry {
     state: Arc<Mutex<StmtState>>,
 }
 
+/// A liveness probe's native child that could not be freed. It has no public
+/// statement handle, but it must retain its DBC until disconnect or Drop can
+/// retry destruction.
+struct TemporaryStmtEntry {
+    conn: u64,
+    handle: RawHandle,
+}
+
 /// Gives the native CLI the last word on whether it destroyed a statement. A
 /// failed `SQLFreeHandle` leaves the statement valid, so return its Rust owner
-/// intact rather than dropping storage that the CLI may still reference.
-fn attempt_free_stmt<F>(entry: StmtEntry, free: F) -> std::result::Result<(), StmtEntry>
+/// and its diagnostic intact rather than dropping storage that the CLI may
+/// still reference. The injected error is constructed while the statement
+/// lock is held, before another operation can replace the CLI diagnostic.
+fn attempt_free_stmt<F>(entry: StmtEntry, free: F) -> std::result::Result<(), (StmtEntry, Error)>
 where
-    F: FnOnce(cli::SQLHANDLE) -> cli::SQLRETURN,
+    F: FnOnce(cli::SQLHANDLE) -> Result<()>,
 {
-    let rc = {
+    let error = {
         // Wait out any in-flight operation before attempting terminal cleanup.
         let st = entry.state.lock().unwrap_or_else(|p| p.into_inner());
-        free(st.handle.0)
+        free(st.handle.0).err()
     };
-    if cli_ok(rc) {
-        Ok(())
-    } else {
-        Err(entry)
+    match error {
+        Some(error) => Err((entry, error)),
+        None => Ok(()),
     }
 }
 
-fn stmt_handle(entry: &StmtEntry) -> cli::SQLHANDLE {
-    entry
-        .state
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .handle
-        .0
+/// A failed temporary-child free is also terminally significant: retain the
+/// child and its parent relationship so a later teardown can retry safely.
+fn attempt_free_temporary_stmt<F>(
+    entry: TemporaryStmtEntry,
+    free: F,
+) -> std::result::Result<(), (TemporaryStmtEntry, Error)>
+where
+    F: FnOnce(cli::SQLHANDLE) -> Result<()>,
+{
+    match free(entry.handle.0) {
+        Ok(()) => Ok(()),
+        Err(error) => Err((entry, error)),
+    }
+}
+
+fn free_statement_handle(handle: cli::SQLHANDLE, context: &str) -> Result<()> {
+    let rc = unsafe { cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, handle) };
+    if cli_ok(rc) {
+        Ok(())
+    } else {
+        Err(make_error(
+            cli::SQL_HANDLE_STMT,
+            handle,
+            ErrorCode::Unknown,
+            context,
+        ))
+    }
 }
 
 /// Runs one native handle-graph mutation with lifecycle serialization. Clone
@@ -245,13 +274,9 @@ fn with_handle_graph_lifecycle<T>(inner: &Mutex<Inner>, operation: impl FnOnce()
 
 /// Completes an explicit finalization attempt. On a failed native free, put the
 /// exact entry back into the live map before returning its diagnostic handle.
-fn finalize_stmt_with<F>(
-    inner: &Mutex<Inner>,
-    stmt: u64,
-    free: F,
-) -> std::result::Result<(), cli::SQLHANDLE>
+fn finalize_stmt_with<F>(inner: &Mutex<Inner>, stmt: u64, free: F) -> Result<()>
 where
-    F: FnOnce(cli::SQLHANDLE) -> cli::SQLRETURN,
+    F: FnOnce(cli::SQLHANDLE) -> Result<()>,
 {
     with_handle_graph_lifecycle(inner, || {
         let entry = {
@@ -263,14 +288,13 @@ where
         };
         match attempt_free_stmt(entry, free) {
             Ok(()) => Ok(()),
-            Err(entry) => {
-                let h = stmt_handle(&entry);
+            Err((entry, error)) => {
                 inner
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .stmts
                     .insert(stmt, entry);
-                Err(h)
+                Err(error)
             }
         }
     })
@@ -285,14 +309,14 @@ fn disconnect_with<F, D, B>(
     mut free_stmt: F,
     mut disconnect: D,
     mut free_dbc: B,
-) -> std::result::Result<(), cli::SQLHANDLE>
+) -> Result<()>
 where
-    F: FnMut(cli::SQLHANDLE) -> cli::SQLRETURN,
+    F: FnMut(cli::SQLHANDLE) -> Result<()>,
     D: FnMut(RawHandle),
     B: FnMut(RawHandle),
 {
     with_handle_graph_lifecycle(inner, || {
-        let (dbc, mut children) = {
+        let (dbc, mut children, mut temporary_children) = {
             let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
             let Some(dbc) = inner.conns.remove(&conn) else {
                 return Ok(());
@@ -305,23 +329,81 @@ where
                     inner.stmts.insert(stmt, entry);
                 }
             }
-            (dbc, children)
+            let mut temporary_children = Vec::new();
+            for entry in std::mem::take(&mut inner.temporary_stmts) {
+                if entry.conn == conn {
+                    temporary_children.push(entry);
+                } else {
+                    inner.temporary_stmts.push(entry);
+                }
+            }
+            (dbc, children, temporary_children)
         };
         while let Some((stmt, entry)) = children.pop() {
-            if let Err(entry) = attempt_free_stmt(entry, &mut free_stmt) {
-                let h = stmt_handle(&entry);
+            if let Err((entry, error)) = attempt_free_stmt(entry, &mut free_stmt) {
                 let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
                 inner.conns.insert(conn, dbc);
                 inner.stmts.insert(stmt, entry);
                 for (stmt, entry) in children {
                     inner.stmts.insert(stmt, entry);
                 }
-                return Err(h);
+                inner.temporary_stmts.extend(temporary_children);
+                return Err(error);
+            }
+        }
+        while let Some(entry) = temporary_children.pop() {
+            if let Err((entry, error)) = attempt_free_temporary_stmt(entry, &mut free_stmt) {
+                let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
+                inner.conns.insert(conn, dbc);
+                inner.temporary_stmts.push(entry);
+                inner.temporary_stmts.extend(temporary_children);
+                return Err(error);
             }
         }
         disconnect(dbc);
         free_dbc(dbc);
         Ok(())
+    })
+}
+
+/// Uses a short-lived statement for liveness probing while retaining the
+/// graph lifecycle guard from DBC lookup through child free. A terminal free
+/// failure records the otherwise-unreachable child for future teardown.
+fn is_alive_with<A, E, F>(
+    inner: &Mutex<Inner>,
+    conn: u64,
+    allocate: A,
+    execute: E,
+    free: F,
+) -> Result<bool>
+where
+    A: FnOnce(RawHandle) -> Option<RawHandle>,
+    E: FnOnce(RawHandle) -> bool,
+    F: FnOnce(RawHandle) -> Result<()>,
+{
+    with_handle_graph_lifecycle(inner, || {
+        let dbc = {
+            let inner = inner.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(dbc) = inner.conns.get(&conn).copied() else {
+                return Ok(false);
+            };
+            dbc
+        };
+        let Some(stmt) = allocate(dbc) else {
+            return Ok(false);
+        };
+        let alive = execute(stmt);
+        match free(stmt) {
+            Ok(()) => Ok(alive),
+            Err(error) => {
+                inner
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .temporary_stmts
+                    .push(TemporaryStmtEntry { conn, handle: stmt });
+                Err(error)
+            }
+        }
     })
 }
 
@@ -377,6 +459,7 @@ where
 /// and environment prevents a still-live child from outliving either parent.
 struct DropRetainedHandles {
     statements: Vec<StmtEntry>,
+    temporary_statements: Vec<TemporaryStmtEntry>,
     connections: Vec<RawHandle>,
     environment: Option<RawHandle>,
 }
@@ -394,22 +477,30 @@ fn drop_handles_with<F, D, B, E>(
     mut free_env: E,
 ) -> DropRetainedHandles
 where
-    F: FnMut(cli::SQLHANDLE) -> cli::SQLRETURN,
+    F: FnMut(cli::SQLHANDLE) -> Result<()>,
     D: FnMut(RawHandle),
     B: FnMut(RawHandle) -> cli::SQLRETURN,
     E: FnMut(RawHandle) -> cli::SQLRETURN,
 {
     let mut retained = DropRetainedHandles {
         statements: Vec::new(),
+        temporary_statements: Vec::new(),
         connections: Vec::new(),
         environment: None,
     };
     let mut retained_connection_ids = HashSet::new();
     for (_, entry) in inner.stmts.drain() {
         let conn = entry.conn;
-        if let Err(entry) = attempt_free_stmt(entry, &mut free_stmt) {
+        if let Err((entry, _error)) = attempt_free_stmt(entry, &mut free_stmt) {
             retained_connection_ids.insert(conn);
             retained.statements.push(entry);
+        }
+    }
+    for entry in inner.temporary_stmts.drain(..) {
+        let conn = entry.conn;
+        if let Err((entry, _error)) = attempt_free_temporary_stmt(entry, &mut free_stmt) {
+            retained_connection_ids.insert(conn);
+            retained.temporary_statements.push(entry);
         }
     }
     for (conn, dbc) in inner.conns.drain() {
@@ -439,6 +530,7 @@ struct Inner {
     lifecycle: Arc<Mutex<()>>,
     conns: HashMap<u64, RawHandle>,
     stmts: HashMap<u64, StmtEntry>,
+    temporary_stmts: Vec<TemporaryStmtEntry>,
     next_conn: u64,
     next_stmt: u64,
 }
@@ -521,7 +613,7 @@ impl Drop for Db2CliDriver {
         let retained = drop_handles_with(
             inner,
             self.env,
-            |h| unsafe { cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, h) },
+            |h| free_statement_handle(h, "SQLFreeHandle(SQL_HANDLE_STMT) failed during drop"),
             |dbc| unsafe {
                 cli::SQLDisconnect(dbc.0);
             },
@@ -1148,43 +1240,44 @@ impl CliDriver for Db2CliDriver {
     }
 
     fn disconnect(&self, conn: ConnectionHandle) -> Result<()> {
-        match disconnect_with(
+        disconnect_with(
             &self.inner,
             conn.0,
-            |h| unsafe { cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, h) },
+            |h| free_statement_handle(h, "SQLFreeHandle(SQL_HANDLE_STMT) failed during disconnect"),
             |dbc| unsafe {
                 cli::SQLDisconnect(dbc.0);
             },
             |dbc| unsafe {
                 cli::SQLFreeHandle(cli::SQL_HANDLE_DBC, dbc.0);
             },
-        ) {
-            Ok(()) => Ok(()),
-            Err(h) => Err(make_error(
-                cli::SQL_HANDLE_STMT,
-                h,
-                ErrorCode::Unknown,
-                "SQLFreeHandle(SQL_HANDLE_STMT) failed during disconnect",
-            )),
-        }
+        )
     }
 
     fn is_alive(&self, conn: ConnectionHandle) -> Result<bool> {
-        let Some(dbc) = self.conn_handle(conn) else {
-            return Ok(false);
-        };
-        let mut s: cli::SQLHANDLE = ptr::null_mut();
-        let rc = unsafe { cli::SQLAllocHandle(cli::SQL_HANDLE_STMT, dbc.0, &mut s) };
-        if !cli_ok(rc) {
-            return Ok(false);
-        }
         // Explicit byte length — never SQL_NTS: a Rust buffer carries no NUL
         // terminator for the CLI to stop at.
         let mut sql = b"SELECT 1 FROM SYSIBM.SYSDUMMY1".to_vec();
-        let rc = unsafe { cli::SQLExecDirect(s, sql.as_mut_ptr(), sql.len() as cli::SQLINTEGER) };
-        let alive = cli_ok(rc);
-        unsafe { cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, s) };
-        Ok(alive)
+        is_alive_with(
+            &self.inner,
+            conn.0,
+            |dbc| {
+                let mut stmt: cli::SQLHANDLE = ptr::null_mut();
+                let rc = unsafe { cli::SQLAllocHandle(cli::SQL_HANDLE_STMT, dbc.0, &mut stmt) };
+                cli_ok(rc).then_some(RawHandle(stmt))
+            },
+            |stmt| {
+                let rc = unsafe {
+                    cli::SQLExecDirect(stmt.0, sql.as_mut_ptr(), sql.len() as cli::SQLINTEGER)
+                };
+                cli_ok(rc)
+            },
+            |stmt| {
+                free_statement_handle(
+                    stmt.0,
+                    "SQLFreeHandle(SQL_HANDLE_STMT) failed during liveness check",
+                )
+            },
+        )
     }
 
     fn prepare(&self, conn: ConnectionHandle, sql: &str) -> Result<StatementHandle> {
@@ -1621,17 +1714,9 @@ impl CliDriver for Db2CliDriver {
     }
 
     fn finalize(&self, stmt: StatementHandle) -> Result<()> {
-        match finalize_stmt_with(&self.inner, stmt.0, |h| unsafe {
-            cli::SQLFreeHandle(cli::SQL_HANDLE_STMT, h)
-        }) {
-            Ok(()) => Ok(()),
-            Err(h) => Err(make_error(
-                cli::SQL_HANDLE_STMT,
-                h,
-                ErrorCode::Unknown,
-                "SQLFreeHandle(SQL_HANDLE_STMT) failed",
-            )),
-        }
+        finalize_stmt_with(&self.inner, stmt.0, |h| {
+            free_statement_handle(h, "SQLFreeHandle(SQL_HANDLE_STMT) failed")
+        })
     }
 
     fn close_cursor(&self, stmt: StatementHandle) -> Result<()> {
@@ -1796,11 +1881,52 @@ mod tests {
             })),
         };
 
-        let retained = attempt_free_stmt(entry, |_| cli::SQL_ERROR).unwrap_err();
+        let (retained, _) = attempt_free_stmt(entry, |_| {
+            Err(Error::new(ErrorCode::Unknown, "statement free failed"))
+        })
+        .unwrap_err();
         let mut state = retained.state.lock().unwrap();
         let storage = state.pending_rowset.as_mut().unwrap();
         assert_eq!(std::ptr::addr_of_mut!(storage.rows_fetched), fetched_ptr);
         assert_eq!(storage.row_status.as_mut_ptr(), status_ptr);
+    }
+
+    #[test]
+    fn failed_statement_free_preserves_its_diagnostic_after_unlock() {
+        let (entry, state) = test_stmt_entry(3);
+        let diagnostic = Arc::new(Mutex::new("originating diagnostic"));
+        let free_failed = Arc::new(std::sync::Barrier::new(2));
+        let overwrite_done = Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let overwrite_state = state.clone();
+            let overwrite_diagnostic = diagnostic.clone();
+            let free_failed_for_thread = free_failed.clone();
+            let overwrite_done_for_thread = overwrite_done.clone();
+            let overwriter = scope.spawn(move || {
+                free_failed_for_thread.wait();
+                let _state = overwrite_state.lock().unwrap();
+                *overwrite_diagnostic.lock().unwrap() = "overwriting diagnostic";
+                overwrite_done_for_thread.wait();
+            });
+
+            let free_failed_for_attempt = free_failed.clone();
+            let (retained, error) = attempt_free_stmt(entry, move |_| {
+                assert!(matches!(
+                    state.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                free_failed_for_attempt.wait();
+                Err(Error::new(ErrorCode::Syntax, "originating diagnostic"))
+            })
+            .unwrap_err();
+
+            overwrite_done.wait();
+            overwriter.join().unwrap();
+            assert_eq!(error.message, "originating diagnostic");
+            assert_eq!(*diagnostic.lock().unwrap(), "overwriting diagnostic");
+            drop(retained);
+        });
     }
 
     fn test_stmt_entry(conn: u64) -> (StmtEntry, Arc<Mutex<StmtState>>) {
@@ -1826,7 +1952,10 @@ mod tests {
         let (entry, state) = test_stmt_entry(3);
         inner.lock().unwrap().stmts.insert(7, entry);
 
-        assert!(finalize_stmt_with(&inner, 7, |_| cli::SQL_ERROR).is_err());
+        assert!(finalize_stmt_with(&inner, 7, |_| {
+            Err(Error::new(ErrorCode::Unknown, "statement free failed"))
+        })
+        .is_err());
 
         let inner = inner.lock().unwrap();
         let restored = inner.stmts.get(&7).unwrap();
@@ -1854,7 +1983,7 @@ mod tests {
             3,
             |_| {
                 child_free_calls += 1;
-                cli::SQL_ERROR
+                Err(Error::new(ErrorCode::Unknown, "statement free failed"))
             },
             |_| disconnect_calls += 1,
             |_| dbc_free_calls += 1,
@@ -1892,7 +2021,7 @@ mod tests {
             RawHandle(ptr::null_mut()),
             |_| {
                 child_free_calls += 1;
-                cli::SQL_ERROR
+                Err(Error::new(ErrorCode::Unknown, "statement free failed"))
             },
             |_| disconnect_calls += 1,
             |_| {
@@ -1939,7 +2068,7 @@ mod tests {
                     finalizer_ready_for_thread.wait();
                     release_finalizer_for_thread.wait();
                     finalizer_events.lock().unwrap().push("child-free");
-                    cli::SQL_SUCCESS
+                    Ok(())
                 })
                 .unwrap();
             });
@@ -1953,7 +2082,7 @@ mod tests {
                 disconnect_with(
                     &disconnect_inner,
                     3,
-                    |_| cli::SQL_SUCCESS,
+                    |_| Ok(()),
                     |_| {},
                     |_| disconnect_events.lock().unwrap().push("parent-free"),
                 )
@@ -2016,7 +2145,7 @@ mod tests {
                     3,
                     |_| {
                         disconnect_events.lock().unwrap().push("child-free");
-                        cli::SQL_SUCCESS
+                        Ok(())
                     },
                     |_| {},
                     |_| disconnect_events.lock().unwrap().push("parent-free"),
@@ -2034,6 +2163,100 @@ mod tests {
             events.lock().unwrap().as_slice(),
             ["prepared", "child-free", "parent-free"]
         );
+    }
+
+    #[test]
+    fn lifecycle_orders_temporary_liveness_child_before_parent_release() {
+        let inner = Arc::new(Mutex::new(Inner::default()));
+        inner
+            .lock()
+            .unwrap()
+            .conns
+            .insert(3, RawHandle(ptr::null_mut()));
+        let liveness_ready = Arc::new(std::sync::Barrier::new(2));
+        let disconnect_started = Arc::new(std::sync::Barrier::new(2));
+        let release_liveness = Arc::new(std::sync::Barrier::new(2));
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        std::thread::scope(|scope| {
+            let liveness_inner = inner.clone();
+            let liveness_ready_for_thread = liveness_ready.clone();
+            let release_liveness_for_thread = release_liveness.clone();
+            let liveness_events = events.clone();
+            let liveness = scope.spawn(move || {
+                assert!(is_alive_with(
+                    &liveness_inner,
+                    3,
+                    |_| Some(RawHandle(ptr::null_mut())),
+                    |_| {
+                        liveness_ready_for_thread.wait();
+                        release_liveness_for_thread.wait();
+                        true
+                    },
+                    |_| {
+                        liveness_events.lock().unwrap().push("temporary-child-free");
+                        Ok(())
+                    },
+                )
+                .unwrap());
+            });
+
+            liveness_ready.wait();
+            let disconnect_inner = inner.clone();
+            let disconnect_started_for_thread = disconnect_started.clone();
+            let disconnect_events = events.clone();
+            let disconnector = scope.spawn(move || {
+                disconnect_started_for_thread.wait();
+                disconnect_with(
+                    &disconnect_inner,
+                    3,
+                    |_| Ok(()),
+                    |_| {},
+                    |_| disconnect_events.lock().unwrap().push("parent-free"),
+                )
+                .unwrap();
+            });
+
+            disconnect_started.wait();
+            release_liveness.wait();
+            liveness.join().unwrap();
+            disconnector.join().unwrap();
+        });
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["temporary-child-free", "parent-free"]
+        );
+    }
+
+    #[test]
+    fn failed_liveness_child_free_retains_its_parent_until_disconnect_retries() {
+        let inner = Mutex::new(Inner::default());
+        inner
+            .lock()
+            .unwrap()
+            .conns
+            .insert(3, RawHandle(ptr::null_mut()));
+
+        let error = is_alive_with(
+            &inner,
+            3,
+            |_| Some(RawHandle(ptr::null_mut())),
+            |_| true,
+            |_| Err(Error::new(ErrorCode::Unknown, "liveness free failed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "liveness free failed");
+        {
+            let inner = inner.lock().unwrap();
+            assert!(inner.conns.contains_key(&3));
+            assert_eq!(inner.temporary_stmts.len(), 1);
+        }
+
+        disconnect_with(&inner, 3, |_| Ok(()), |_| {}, |_| {}).unwrap();
+        let inner = inner.lock().unwrap();
+        assert!(!inner.conns.contains_key(&3));
+        assert!(inner.temporary_stmts.is_empty());
     }
 
     #[test]
