@@ -1221,6 +1221,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_savepoint_terminal_discards_pooled_transaction_lease() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+        let tx = db.begin().unwrap();
+        let savepoint = tx.savepoint_named("poisoned_stage").unwrap();
+        mock.push_execute_error(Error::new(ErrorCode::Syntax, "release failed"));
+
+        let error = savepoint.release().unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Syntax);
+        assert!(tx.active());
+        assert!(tx.poisoned());
+        drop(savepoint);
+        drop(tx); // best-effort rollback, then discard the poisoned lease
+
+        assert_eq!(mock.rollback_calls(), 1);
+        assert_eq!(mock.auto_commit_calls(), vec![false, true]);
+        assert_eq!(db.pool().active_count(), 0);
+        assert_eq!(db.pool().idle_count(), 0);
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
     fn transaction_with_isolation_restores_after_commit() {
         let mock = Arc::new(MockCliDriver::new());
         let db = open(&mock);
