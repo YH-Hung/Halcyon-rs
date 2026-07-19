@@ -275,10 +275,24 @@ struct StmtState {
     pending_rowset: Option<Box<RowsetStorage>>,
 }
 
+/// A live connection's native handle plus its lifecycle guard. The guard
+/// serializes handle-graph mutations (statement alloc/prepare/free, liveness
+/// probes, disconnect) for this one connection, so distinct physical
+/// connections prepare and validate concurrently — the C++ driver's
+/// concurrency contract, which never holds a lock across a CLI round-trip for
+/// unrelated handles.
+struct ConnEntry {
+    handle: RawHandle,
+    lifecycle: Arc<Mutex<()>>,
+}
+
 /// A live statement plus the connection it was prepared on, so disconnecting
 /// (or dropping the driver) can free child statements before their parent.
 struct StmtEntry {
     conn: u64,
+    /// The parent connection's lifecycle guard, so explicit finalization
+    /// serializes with that connection's disconnect without a parent lookup.
+    lifecycle: Arc<Mutex<()>>,
     state: Arc<Mutex<StmtState>>,
 }
 
@@ -339,18 +353,33 @@ fn free_statement_handle(handle: cli::SQLHANDLE, context: &str) -> Result<()> {
     }
 }
 
-/// Runs one native handle-graph mutation with lifecycle serialization. Clone
-/// the guard while holding the bookkeeping mutex only briefly, then release it
-/// before acquiring the lifecycle guard; graph operations therefore use the
-/// single lock order lifecycle -> bookkeeping -> statement state.
-fn with_handle_graph_lifecycle<T>(inner: &Mutex<Inner>, operation: impl FnOnce() -> T) -> T {
-    let lifecycle = inner
+/// Clones `conn`'s per-connection lifecycle guard, or `None` when the
+/// connection is unknown. The bookkeeping mutex is held only for the clone and
+/// released before the guard is locked; graph operations therefore use the
+/// single lock order lifecycle -> bookkeeping -> statement state. Callers must
+/// re-look-up their entries under the bookkeeping mutex after locking the
+/// guard: an entry can vanish between clone and lock (a concurrent
+/// disconnect), and the re-lookup turns that race into the same answer as
+/// arriving after the disconnect. Connection ids are never reused, so a stale
+/// guard can only miss, never alias a new connection.
+fn conn_lifecycle(inner: &Mutex<Inner>, conn: u64) -> Option<Arc<Mutex<()>>> {
+    inner
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .lifecycle
-        .clone();
-    let _lifecycle = lifecycle.lock().unwrap_or_else(|p| p.into_inner());
-    operation()
+        .conns
+        .get(&conn)
+        .map(|entry| entry.lifecycle.clone())
+}
+
+/// Clones the lifecycle guard of `stmt`'s parent connection; the discipline in
+/// [`conn_lifecycle`] applies.
+fn stmt_lifecycle(inner: &Mutex<Inner>, stmt: u64) -> Option<Arc<Mutex<()>>> {
+    inner
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .stmts
+        .get(&stmt)
+        .map(|entry| entry.lifecycle.clone())
 }
 
 /// Completes an explicit finalization attempt. On a failed native free, put the
@@ -359,26 +388,28 @@ fn finalize_stmt_with<F>(inner: &Mutex<Inner>, stmt: u64, free: F) -> Result<()>
 where
     F: FnOnce(cli::SQLHANDLE) -> Result<()>,
 {
-    with_handle_graph_lifecycle(inner, || {
-        let entry = {
-            let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(entry) = inner.stmts.remove(&stmt) else {
-                return Ok(());
-            };
-            entry
+    let Some(lifecycle) = stmt_lifecycle(inner, stmt) else {
+        return Ok(());
+    };
+    let _lifecycle = lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = {
+        let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = inner.stmts.remove(&stmt) else {
+            return Ok(());
         };
-        match attempt_free_stmt(entry, free) {
-            Ok(()) => Ok(()),
-            Err((entry, error)) => {
-                inner
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .stmts
-                    .insert(stmt, entry);
-                Err(error)
-            }
+        entry
+    };
+    match attempt_free_stmt(entry, free) {
+        Ok(()) => Ok(()),
+        Err((entry, error)) => {
+            inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .stmts
+                .insert(stmt, entry);
+            Err(error)
         }
-    })
+    }
 }
 
 /// Destroys a connection's child statements before its parent. A child free
@@ -396,55 +427,57 @@ where
     D: FnMut(RawHandle),
     B: FnMut(RawHandle),
 {
-    with_handle_graph_lifecycle(inner, || {
-        let (dbc, mut children, mut temporary_children) = {
-            let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(dbc) = inner.conns.remove(&conn) else {
-                return Ok(());
-            };
-            let mut children = Vec::new();
-            for (stmt, entry) in std::mem::take(&mut inner.stmts) {
-                if entry.conn == conn {
-                    children.push((stmt, entry));
-                } else {
-                    inner.stmts.insert(stmt, entry);
-                }
-            }
-            let mut temporary_children = Vec::new();
-            for entry in std::mem::take(&mut inner.temporary_stmts) {
-                if entry.conn == conn {
-                    temporary_children.push(entry);
-                } else {
-                    inner.temporary_stmts.push(entry);
-                }
-            }
-            (dbc, children, temporary_children)
+    let Some(lifecycle) = conn_lifecycle(inner, conn) else {
+        return Ok(());
+    };
+    let _lifecycle = lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+    let (conn_entry, mut children, mut temporary_children) = {
+        let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(conn_entry) = inner.conns.remove(&conn) else {
+            return Ok(());
         };
-        while let Some((stmt, entry)) = children.pop() {
-            if let Err((entry, error)) = attempt_free_stmt(entry, &mut free_stmt) {
-                let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
-                inner.conns.insert(conn, dbc);
+        let mut children = Vec::new();
+        for (stmt, entry) in std::mem::take(&mut inner.stmts) {
+            if entry.conn == conn {
+                children.push((stmt, entry));
+            } else {
                 inner.stmts.insert(stmt, entry);
-                for (stmt, entry) in children {
-                    inner.stmts.insert(stmt, entry);
-                }
-                inner.temporary_stmts.extend(temporary_children);
-                return Err(error);
             }
         }
-        while let Some(entry) = temporary_children.pop() {
-            if let Err((entry, error)) = attempt_free_temporary_stmt(entry, &mut free_stmt) {
-                let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
-                inner.conns.insert(conn, dbc);
+        let mut temporary_children = Vec::new();
+        for entry in std::mem::take(&mut inner.temporary_stmts) {
+            if entry.conn == conn {
+                temporary_children.push(entry);
+            } else {
                 inner.temporary_stmts.push(entry);
-                inner.temporary_stmts.extend(temporary_children);
-                return Err(error);
             }
         }
-        disconnect(dbc);
-        free_dbc(dbc);
-        Ok(())
-    })
+        (conn_entry, children, temporary_children)
+    };
+    while let Some((stmt, entry)) = children.pop() {
+        if let Err((entry, error)) = attempt_free_stmt(entry, &mut free_stmt) {
+            let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
+            inner.conns.insert(conn, conn_entry);
+            inner.stmts.insert(stmt, entry);
+            for (stmt, entry) in children {
+                inner.stmts.insert(stmt, entry);
+            }
+            inner.temporary_stmts.extend(temporary_children);
+            return Err(error);
+        }
+    }
+    while let Some(entry) = temporary_children.pop() {
+        if let Err((entry, error)) = attempt_free_temporary_stmt(entry, &mut free_stmt) {
+            let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
+            inner.conns.insert(conn, conn_entry);
+            inner.temporary_stmts.push(entry);
+            inner.temporary_stmts.extend(temporary_children);
+            return Err(error);
+        }
+    }
+    disconnect(conn_entry.handle);
+    free_dbc(conn_entry.handle);
+    Ok(())
 }
 
 /// Uses a short-lived statement for liveness probing while retaining the
@@ -462,30 +495,32 @@ where
     E: FnOnce(RawHandle) -> bool,
     F: FnOnce(RawHandle) -> Result<()>,
 {
-    with_handle_graph_lifecycle(inner, || {
-        let dbc = {
-            let inner = inner.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(dbc) = inner.conns.get(&conn).copied() else {
-                return Ok(false);
-            };
-            dbc
-        };
-        let Some(stmt) = allocate(dbc) else {
+    let Some(lifecycle) = conn_lifecycle(inner, conn) else {
+        return Ok(false);
+    };
+    let _lifecycle = lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+    let dbc = {
+        let inner = inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(dbc) = inner.conns.get(&conn).map(|entry| entry.handle) else {
             return Ok(false);
         };
-        let alive = execute(stmt);
-        match free(stmt) {
-            Ok(()) => Ok(alive),
-            Err(error) => {
-                inner
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .temporary_stmts
-                    .push(TemporaryStmtEntry { conn, handle: stmt });
-                Err(error)
-            }
+        dbc
+    };
+    let Some(stmt) = allocate(dbc) else {
+        return Ok(false);
+    };
+    let alive = execute(stmt);
+    match free(stmt) {
+        Ok(()) => Ok(alive),
+        Err(error) => {
+            inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .temporary_stmts
+                .push(TemporaryStmtEntry { conn, handle: stmt });
+            Err(error)
         }
-    })
+    }
 }
 
 /// Allocates/prepares and publishes a statement as one lifecycle mutation. The
@@ -501,39 +536,42 @@ where
     P: FnOnce(RawHandle) -> Result<RawHandle>,
     F: FnOnce(RawHandle),
 {
-    with_handle_graph_lifecycle(inner, || {
-        let dbc = {
-            let inner = inner.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(dbc) = inner.conns.get(&conn).copied() else {
-                return Err(unknown_conn());
-            };
-            dbc
-        };
-        let stmt = prepare(dbc)?;
-        let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
-        if !inner.conns.contains_key(&conn) {
-            drop(inner);
-            free_stmt(stmt);
+    let Some(lifecycle) = conn_lifecycle(inner, conn) else {
+        return Err(unknown_conn());
+    };
+    let _lifecycle = lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+    let dbc = {
+        let inner = inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(dbc) = inner.conns.get(&conn).map(|entry| entry.handle) else {
             return Err(unknown_conn());
-        }
-        inner.next_stmt += 1;
-        let handle = inner.next_stmt;
-        inner.stmts.insert(
-            handle,
-            StmtEntry {
-                conn,
-                state: Arc::new(Mutex::new(StmtState {
-                    handle: stmt,
-                    bound: Vec::new(),
-                    stream_indicators: Vec::new(),
-                    cols: None,
-                    block_fallback: false,
-                    pending_rowset: None,
-                })),
-            },
-        );
-        Ok(StatementHandle(handle))
-    })
+        };
+        dbc
+    };
+    let stmt = prepare(dbc)?;
+    let mut inner = inner.lock().unwrap_or_else(|p| p.into_inner());
+    if !inner.conns.contains_key(&conn) {
+        drop(inner);
+        free_stmt(stmt);
+        return Err(unknown_conn());
+    }
+    inner.next_stmt += 1;
+    let handle = inner.next_stmt;
+    inner.stmts.insert(
+        handle,
+        StmtEntry {
+            conn,
+            lifecycle: lifecycle.clone(),
+            state: Arc::new(Mutex::new(StmtState {
+                handle: stmt,
+                bound: Vec::new(),
+                stream_indicators: Vec::new(),
+                cols: None,
+                block_fallback: false,
+                pending_rowset: None,
+            })),
+        },
+    );
+    Ok(StatementHandle(handle))
 }
 
 /// Ownership that must survive a non-fallible driver drop. Keeping an entry
@@ -585,14 +623,14 @@ where
             retained.temporary_statements.push(entry);
         }
     }
-    for (conn, dbc) in inner.conns.drain() {
+    for (conn, entry) in inner.conns.drain() {
         if retained_connection_ids.contains(&conn) {
-            retained.connections.push(dbc);
+            retained.connections.push(entry.handle);
             continue;
         }
-        disconnect(dbc);
-        if !cli_ok(free_dbc(dbc)) {
-            retained.connections.push(dbc);
+        disconnect(entry.handle);
+        if !cli_ok(free_dbc(entry.handle)) {
+            retained.connections.push(entry.handle);
         }
     }
     if retained_connection_ids.is_empty() && retained.connections.is_empty() {
@@ -607,10 +645,11 @@ where
 
 #[derive(Default)]
 struct Inner {
-    /// Shared by all native handle-graph mutations. It deliberately does not
-    /// guard normal execution/fetch paths, which retain the per-statement lock.
-    lifecycle: Arc<Mutex<()>>,
-    conns: HashMap<u64, RawHandle>,
+    /// Each entry carries the per-connection lifecycle guard for its native
+    /// handle-graph mutations (see [`ConnEntry`]). The guards deliberately do
+    /// not cover normal execution/fetch paths, which retain the per-statement
+    /// lock.
+    conns: HashMap<u64, ConnEntry>,
     stmts: HashMap<u64, StmtEntry>,
     temporary_stmts: Vec<TemporaryStmtEntry>,
     next_conn: u64,
@@ -656,7 +695,7 @@ impl Db2CliDriver {
     }
 
     fn conn_handle(&self, h: ConnectionHandle) -> Option<RawHandle> {
-        self.lock().conns.get(&h.0).copied()
+        self.lock().conns.get(&h.0).map(|entry| entry.handle)
     }
 
     fn stmt_state(&self, h: StatementHandle) -> Option<Arc<Mutex<StmtState>>> {
@@ -717,6 +756,29 @@ fn reset_paramset(h: cli::SQLHANDLE) -> cli::SQLRETURN {
     unsafe { cli::SQLSetStmtAttr(h, cli::SQL_ATTR_PARAMSET_SIZE, attr_value(1), 0) }
 }
 
+/// Data bytes present in a character SQLGetData chunk. On truncation the CLI
+/// fills and NUL-terminates the buffer, and a negative indicator (SQL_NTS, or
+/// SQL_NO_TOTAL when the remaining length is unknown) carries no byte count —
+/// so every out-of-range indicator falls back to the NUL scan; an indicator is
+/// never used to index the chunk.
+fn char_chunk_len(chunk: &[u8], ind: cli::SQLLEN) -> usize {
+    if ind < 0 || ind >= chunk.len() as cli::SQLLEN {
+        chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len())
+    } else {
+        ind as usize
+    }
+}
+
+/// Data bytes present in a binary SQLGetData chunk: a truncated chunk (negative
+/// or over-capacity indicator) was filled completely.
+fn binary_chunk_len(capacity: usize, ind: cli::SQLLEN) -> usize {
+    if ind < 0 || ind >= capacity as cli::SQLLEN {
+        capacity
+    } else {
+        ind as usize
+    }
+}
+
 /// Reads a (possibly long) character column by looping SQLGetData.
 fn get_string(h: cli::SQLHANDLE, col: cli::SQLUSMALLINT) -> Result<Value> {
     let mut out: Vec<u8> = Vec::new();
@@ -747,14 +809,7 @@ fn get_string(h: cli::SQLHANDLE, col: cli::SQLUSMALLINT) -> Result<Value> {
         if ind == cli::SQL_NULL_DATA {
             return Ok(Value::Null);
         }
-        let copied = if ind == cli::SQLLEN::from(cli::SQL_NTS) || ind >= chunk.len() as cli::SQLLEN
-        {
-            // Truncated chunk: the CLI NUL-terminates within the buffer.
-            chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len())
-        } else {
-            ind as usize
-        };
-        out.extend_from_slice(&chunk[..copied]);
+        out.extend_from_slice(&chunk[..char_chunk_len(&chunk, ind)]);
         if rc == cli::SQL_SUCCESS {
             break; // no truncation: done
         }
@@ -796,12 +851,7 @@ fn get_binary(h: cli::SQLHANDLE, col: cli::SQLUSMALLINT) -> Result<Value> {
         if ind == cli::SQL_NULL_DATA {
             return Ok(Value::Null);
         }
-        let copied = if ind == cli::SQL_NO_TOTAL || ind >= chunk.len() as cli::SQLLEN {
-            chunk.len()
-        } else {
-            ind as usize
-        };
-        out.extend_from_slice(&chunk[..copied]);
+        out.extend_from_slice(&chunk[..binary_chunk_len(chunk.len(), ind)]);
         if rc == cli::SQL_SUCCESS {
             break; // last chunk delivered in full
         }
@@ -904,6 +954,59 @@ fn read_column_typed(h: cli::SQLHANDLE, index: usize, sql_type: cli::SQLSMALLINT
     }
 }
 
+/// Rowset binding decision for one described column: the C type, per-row byte
+/// width, and whether the column may use the bounded rowset path at all.
+/// `data_width` is the byte capacity derived from SQLDescribeCol and
+/// SQL_DESC_OCTET_LENGTH; `octet_known` records whether the octet-length probe
+/// actually succeeded. Free of CLI calls so the fallback rules are testable.
+fn column_meta(sql_type: cli::SQLSMALLINT, data_width: usize, octet_known: bool) -> ColMeta {
+    let mut meta = ColMeta {
+        sql_type,
+        c_type: cli::SQL_C_CHAR,
+        bind_width: 0,
+        bounded: true,
+    };
+    match sql_type {
+        cli::SQL_SMALLINT | cli::SQL_INTEGER | cli::SQL_BIGINT => {
+            meta.c_type = cli::SQL_C_SBIGINT;
+            meta.bind_width = std::mem::size_of::<i64>();
+        }
+        cli::SQL_REAL | cli::SQL_FLOAT | cli::SQL_DOUBLE => {
+            meta.c_type = cli::SQL_C_DOUBLE;
+            meta.bind_width = std::mem::size_of::<f64>();
+        }
+        cli::SQL_BIT => {
+            meta.c_type = cli::SQL_C_BIT;
+            meta.bind_width = 1;
+        }
+        cli::SQL_BINARY | cli::SQL_VARBINARY => {
+            meta.c_type = cli::SQL_C_BINARY;
+            meta.bind_width = data_width;
+        }
+        cli::SQL_LONGVARBINARY
+        | cli::SQL_BLOB
+        | cli::SQL_CLOB
+        | cli::SQL_DBCLOB
+        | cli::SQL_LONGVARCHAR => {
+            meta.bounded = false;
+        }
+        _ => {
+            meta.c_type = cli::SQL_C_CHAR;
+            meta.bind_width = data_width.saturating_add(1);
+        }
+    }
+    // Without a confirmed octet length, a multibyte value can exceed the
+    // code-unit-derived width; take the per-row fallback over a buffer the
+    // rowset validation would then reject as truncated.
+    if !octet_known && matches!(meta.c_type, cli::SQL_C_CHAR | cli::SQL_C_BINARY) {
+        meta.bounded = false;
+    }
+    if meta.bounded && (meta.bind_width == 0 || meta.bind_width > MAX_BOUND_COL_BYTES) {
+        meta.bounded = false;
+    }
+    meta
+}
+
 fn describe_columns(st: &mut StmtState) -> Result<()> {
     let h = st.handle.0;
     let mut count: cli::SQLSMALLINT = 0;
@@ -953,7 +1056,7 @@ fn describe_columns(st: &mut StmtState) -> Result<()> {
         // data. Text-rendered scalar types may have a wider display size, so use
         // the larger of the two just as the C++ driver does.
         let mut octet: cli::SQLLEN = 0;
-        unsafe {
+        let octet_rc = unsafe {
             cli::SQLColAttribute(
                 h,
                 (index + 1) as cli::SQLUSMALLINT,
@@ -962,48 +1065,15 @@ fn describe_columns(st: &mut StmtState) -> Result<()> {
                 0,
                 ptr::null_mut(),
                 (&mut octet as *mut cli::SQLLEN).cast(),
-            );
+            )
+        };
+        let octet_known = cli_ok(octet_rc);
+        if !octet_known {
+            octet = 0;
         }
         let data_width = (col_size as usize).max(octet.max(0) as usize);
 
-        let mut meta = ColMeta {
-            sql_type,
-            c_type: cli::SQL_C_CHAR,
-            bind_width: 0,
-            bounded: true,
-        };
-        match sql_type {
-            cli::SQL_SMALLINT | cli::SQL_INTEGER | cli::SQL_BIGINT => {
-                meta.c_type = cli::SQL_C_SBIGINT;
-                meta.bind_width = std::mem::size_of::<i64>();
-            }
-            cli::SQL_REAL | cli::SQL_FLOAT | cli::SQL_DOUBLE => {
-                meta.c_type = cli::SQL_C_DOUBLE;
-                meta.bind_width = std::mem::size_of::<f64>();
-            }
-            cli::SQL_BIT => {
-                meta.c_type = cli::SQL_C_BIT;
-                meta.bind_width = 1;
-            }
-            cli::SQL_BINARY | cli::SQL_VARBINARY => {
-                meta.c_type = cli::SQL_C_BINARY;
-                meta.bind_width = data_width;
-            }
-            cli::SQL_LONGVARBINARY
-            | cli::SQL_BLOB
-            | cli::SQL_CLOB
-            | cli::SQL_DBCLOB
-            | cli::SQL_LONGVARCHAR => {
-                meta.bounded = false;
-            }
-            _ => {
-                meta.c_type = cli::SQL_C_CHAR;
-                meta.bind_width = data_width.saturating_add(1);
-            }
-        }
-        if meta.bounded && (meta.bind_width == 0 || meta.bind_width > MAX_BOUND_COL_BYTES) {
-            meta.bounded = false;
-        }
+        let meta = column_meta(sql_type, data_width, octet_known);
         any_unbounded |= !meta.bounded;
         cols.push(meta);
     }
@@ -1090,6 +1160,199 @@ fn fetch_block_fallback(st: &StmtState) -> Result<Vec<Vec<Value>>> {
         row.push(read_column_typed(h, index, meta.sql_type)?);
     }
     Ok(vec![row])
+}
+
+/// True when any of the first `fetched` row-status entries carries
+/// SQL_ROW_SUCCESS_WITH_INFO. Hard row failures are rejected separately by
+/// [`transpose_rowset`]; this only detects rows that fetched with a warning.
+fn rowset_has_row_warnings(row_status: &[cli::SQLUSMALLINT], fetched: usize) -> bool {
+    row_status[..fetched].contains(&cli::SQL_ROW_SUCCESS_WITH_INFO)
+}
+
+/// One record of a statement's diagnostic chain.
+struct DiagRecord {
+    sqlstate: String,
+    native: i32,
+    message: String,
+}
+
+/// Reads the complete diagnostic chain off `h` in record order (Db2 orders
+/// whole-function records before row-specific ones, so record 1 alone can
+/// mask a later truncation). The boolean is true only when the read reached
+/// SQL_NO_DATA — i.e. every record was seen; an unreadable record or an
+/// exhausted record-number space leaves it false and the caller fails closed.
+fn statement_diags(h: cli::SQLHANDLE) -> (Vec<DiagRecord>, bool) {
+    let mut records = Vec::new();
+    // One record per warned row plus whole-function records: a healthy chain
+    // for a MAX_BLOCK_ROWS rowset fits well inside the SQLSMALLINT space.
+    for rec in 1..=cli::SQLSMALLINT::MAX {
+        let mut state = [0u8; 6];
+        let mut native: cli::SQLINTEGER = 0;
+        let mut msg = [0u8; 1024];
+        let mut msg_len: cli::SQLSMALLINT = 0;
+        let rc = unsafe {
+            cli::SQLGetDiagRec(
+                cli::SQL_HANDLE_STMT,
+                h,
+                rec,
+                state.as_mut_ptr(),
+                &mut native,
+                msg.as_mut_ptr(),
+                msg.len() as cli::SQLSMALLINT,
+                &mut msg_len,
+            )
+        };
+        if rc == cli::SQL_NO_DATA {
+            return (records, true);
+        }
+        if !cli_ok(rc) {
+            return (records, false);
+        }
+        records.push(DiagRecord {
+            sqlstate: bytes_to_string(&state),
+            native,
+            message: bytes_to_string(&msg),
+        });
+    }
+    (records, false)
+}
+
+/// Enforces the rowset warning policy over the complete diagnostic chain: a
+/// WITH_INFO fetch is accepted only when the chain was fully read, holds at
+/// least one record, and every record is class 01 (the SQL warning class)
+/// with none 01004 (data truncated — never silently survivable). The first
+/// offending record becomes the returned error; an empty or incompletely read
+/// chain fails closed.
+fn check_warning_chain(records: &[DiagRecord], complete: bool) -> Result<()> {
+    if records.is_empty() || !complete {
+        return Err(Error::new(
+            ErrorCode::Unknown,
+            "rowset fetch reported a warning but its diagnostic chain could not be read",
+        ));
+    }
+    for record in records {
+        if record.sqlstate.starts_with("01") && record.sqlstate != "01004" {
+            continue;
+        }
+        let classification = classify_sqlstate(&record.sqlstate, record.native);
+        let mut error = Error::new(
+            classification.code,
+            if record.message.is_empty() {
+                format!(
+                    "rowset fetch diagnostic {} is not a benign warning",
+                    record.sqlstate
+                )
+            } else {
+                record.message.clone()
+            },
+        );
+        error.sqlstate = record.sqlstate.clone();
+        error.native_error = record.native;
+        error.retriable = classification.retriable;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Arbitrates a rowset fetch's outcome. The captured diagnostic chain is
+/// enforced before the fallible transpose runs: a non-benign record (01004,
+/// a row's own error state) carries the precise SQLSTATE/native code and must
+/// win over the transpose's generic mapping error for the same condition. The
+/// transpose's own validation remains the backstop for corruption the driver
+/// did not report. The caller emits the benign-warning event only after this
+/// returns Ok — i.e. after successful materialization.
+fn materialize_checked_rowset<T>(
+    warning_chain: Option<&(Vec<DiagRecord>, bool)>,
+    transpose: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some((records, complete)) = warning_chain {
+        check_warning_chain(records, *complete)?;
+    }
+    transpose()
+}
+
+/// Byte length a rowset cell's indicator claims, or an error when the value
+/// cannot have fit its bound buffer: a negative unknown-length sentinel
+/// (SQL_NO_TOTAL), or a reported length beyond `capacity` — i.e. server-side
+/// truncation. Erroring here keeps a warning fetch from silently materializing
+/// corrupted values.
+fn cell_data_len(indicator: cli::SQLLEN, capacity: usize, row: usize, col: usize) -> Result<usize> {
+    match usize::try_from(indicator) {
+        Ok(len) if len <= capacity => Ok(len),
+        _ => Err(Error::new(
+            ErrorCode::Mapping,
+            format!(
+                "rowset cell (row {row}, column {col}) reports {indicator} data bytes \
+                 for a {capacity}-byte buffer: value truncated or length unknown"
+            ),
+        )),
+    }
+}
+
+/// Materializes `fetched` rows of a bound rowset into row-major Values,
+/// verifying the per-row status array and every variable-length indicator. Rows
+/// the server flags as failed, and cells whose values cannot have fit their
+/// buffers, surface as errors instead of silently corrupted data.
+fn transpose_rowset(
+    cols: &[ColMeta],
+    storage: &RowsetStorage,
+    fetched: usize,
+) -> Result<Vec<Vec<Value>>> {
+    for (row, &status) in storage.row_status[..fetched].iter().enumerate() {
+        if status != cli::SQL_ROW_SUCCESS && status != cli::SQL_ROW_SUCCESS_WITH_INFO {
+            return Err(Error::new(
+                ErrorCode::Mapping,
+                format!("rowset fetch failed for row {row} (row status {status})"),
+            ));
+        }
+    }
+
+    let mut block: Vec<Vec<Value>> = (0..fetched)
+        .map(|_| Vec::with_capacity(cols.len()))
+        .collect();
+    for (col_index, meta) in cols.iter().enumerate() {
+        for (row_index, (row, &indicator)) in block
+            .iter_mut()
+            .zip(storage.indicators[col_index].iter())
+            .enumerate()
+        {
+            if indicator == cli::SQL_NULL_DATA {
+                row.push(Value::Null);
+                continue;
+            }
+            let offset = meta.bind_width * row_index;
+            let base = storage.buffers[col_index].as_ptr().cast::<u8>();
+            // Safety: offset and bind_width were used to size this column's
+            // backing allocation, and row_index is bounded by row_count.
+            let slot = unsafe { std::slice::from_raw_parts(base.add(offset), meta.bind_width) };
+            match meta.c_type {
+                cli::SQL_C_SBIGINT => {
+                    let mut bytes = [0u8; std::mem::size_of::<i64>()];
+                    bytes.copy_from_slice(&slot[..std::mem::size_of::<i64>()]);
+                    row.push(Value::Int(i64::from_ne_bytes(bytes)));
+                }
+                cli::SQL_C_DOUBLE => {
+                    let mut bytes = [0u8; std::mem::size_of::<f64>()];
+                    bytes.copy_from_slice(&slot[..std::mem::size_of::<f64>()]);
+                    row.push(Value::Double(f64::from_ne_bytes(bytes)));
+                }
+                cli::SQL_C_BIT => row.push(Value::Int(i64::from(slot[0] != 0))),
+                cli::SQL_C_BINARY => {
+                    let len = cell_data_len(indicator, meta.bind_width, row_index, col_index)?;
+                    row.push(Value::Bytes(slot[..len].to_vec()));
+                }
+                _ => {
+                    // The NUL terminator is not data: capacity is bind_width - 1.
+                    let capacity = meta.bind_width.saturating_sub(1);
+                    let len = cell_data_len(indicator, capacity, row_index, col_index)?;
+                    row.push(Value::Text(
+                        String::from_utf8_lossy(&slot[..len]).into_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(block)
 }
 
 fn fetch_block_rowset(st: &mut StmtState, max_rows: usize) -> Result<Vec<Vec<Value>>> {
@@ -1197,51 +1460,21 @@ fn fetch_block_rowset(st: &mut StmtState, max_rows: usize) -> Result<Vec<Vec<Val
                 "Db2 reported more rowset rows than the bound capacity",
             ));
         }
-        let mut block: Vec<Vec<Value>> = (0..fetched)
-            .map(|_| Vec::with_capacity(cols.len()))
-            .collect();
-        for (col_index, meta) in cols.iter().enumerate() {
-            for (row_index, (row, &indicator)) in block
-                .iter_mut()
-                .zip(storage.indicators[col_index].iter())
-                .enumerate()
-            {
-                if indicator == cli::SQL_NULL_DATA {
-                    row.push(Value::Null);
-                    continue;
-                }
-                let offset = meta.bind_width * row_index;
-                let base = storage.buffers[col_index].as_ptr().cast::<u8>();
-                // Safety: offset and bind_width were used to size this column's
-                // backing allocation, and row_index is bounded by row_count.
-                let slot = unsafe { std::slice::from_raw_parts(base.add(offset), meta.bind_width) };
-                match meta.c_type {
-                    cli::SQL_C_SBIGINT => {
-                        let mut bytes = [0u8; std::mem::size_of::<i64>()];
-                        bytes.copy_from_slice(&slot[..std::mem::size_of::<i64>()]);
-                        row.push(Value::Int(i64::from_ne_bytes(bytes)));
-                    }
-                    cli::SQL_C_DOUBLE => {
-                        let mut bytes = [0u8; std::mem::size_of::<f64>()];
-                        bytes.copy_from_slice(&slot[..std::mem::size_of::<f64>()]);
-                        row.push(Value::Double(f64::from_ne_bytes(bytes)));
-                    }
-                    cli::SQL_C_BIT => row.push(Value::Int(i64::from(slot[0] != 0))),
-                    cli::SQL_C_BINARY => {
-                        let len = usize::try_from(indicator)
-                            .unwrap_or(meta.bind_width)
-                            .min(meta.bind_width);
-                        row.push(Value::Bytes(slot[..len].to_vec()));
-                    }
-                    _ => {
-                        let capacity = meta.bind_width.saturating_sub(1);
-                        let len = usize::try_from(indicator).unwrap_or(capacity).min(capacity);
-                        row.push(Value::Text(
-                            String::from_utf8_lossy(&slot[..len]).into_owned(),
-                        ));
-                    }
-                }
-            }
+        // Read the complete diagnostic chain now: the cleanup that follows
+        // this closure (reset_rowset) issues its own CLI calls, which would
+        // overwrite the fetch's records.
+        let warning_chain = (rc == cli::SQL_SUCCESS_WITH_INFO
+            || rowset_has_row_warnings(&storage.row_status, fetched))
+        .then(|| statement_diags(h));
+        let block = materialize_checked_rowset(warning_chain.as_ref(), || {
+            transpose_rowset(&cols, &storage, fetched)
+        })?;
+        if let Some((records, _)) = warning_chain {
+            // Non-empty here: an empty chain was already rejected above.
+            // Surface the first (whole-function ordered) record plus the
+            // chain length.
+            let first = &records[0];
+            crate::obs::emit_rowset_row_warning(&first.sqlstate, &first.message, records.len());
         }
         Ok(block)
     })();
@@ -1317,7 +1550,13 @@ impl CliDriver for Db2CliDriver {
         let mut inner = self.lock();
         inner.next_conn += 1;
         let h = inner.next_conn;
-        inner.conns.insert(h, RawHandle(dbc));
+        inner.conns.insert(
+            h,
+            ConnEntry {
+                handle: RawHandle(dbc),
+                lifecycle: Arc::new(Mutex::new(())),
+            },
+        );
         Ok(ConnectionHandle(h))
     }
 
@@ -2229,6 +2468,229 @@ mod tests {
         );
     }
 
+    /// Packs raw bytes into the i64-backed rowset buffer layout.
+    fn packed(bytes: &[u8]) -> Vec<i64> {
+        let mut padded = bytes.to_vec();
+        while padded.len() % 8 != 0 {
+            padded.push(0);
+        }
+        padded
+            .chunks(8)
+            .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    fn int_col() -> ColMeta {
+        ColMeta {
+            sql_type: cli::SQL_BIGINT,
+            c_type: cli::SQL_C_SBIGINT,
+            bind_width: 8,
+            bounded: true,
+        }
+    }
+
+    fn char_col(width: usize) -> ColMeta {
+        ColMeta {
+            sql_type: cli::SQL_VARCHAR,
+            c_type: cli::SQL_C_CHAR,
+            bind_width: width,
+            bounded: true,
+        }
+    }
+
+    #[test]
+    fn column_meta_falls_back_when_octet_length_is_unknown() {
+        // A confirmed octet length keeps byte-addressed columns bounded...
+        assert!(column_meta(cli::SQL_VARCHAR, 10, true).bounded);
+        assert!(column_meta(cli::SQL_VARBINARY, 10, true).bounded);
+        // ...but without it only the per-row fallback is safe for them.
+        assert!(!column_meta(cli::SQL_VARCHAR, 10, false).bounded);
+        assert!(!column_meta(cli::SQL_BINARY, 10, false).bounded);
+        // Fixed-width numerics never depend on the probe.
+        let int_meta = column_meta(cli::SQL_INTEGER, 0, false);
+        assert!(int_meta.bounded);
+        assert_eq!(int_meta.c_type, cli::SQL_C_SBIGINT);
+        assert_eq!(int_meta.bind_width, std::mem::size_of::<i64>());
+    }
+
+    #[test]
+    fn column_meta_marks_lobs_and_degenerate_widths_unbounded() {
+        assert!(!column_meta(cli::SQL_CLOB, 100, true).bounded);
+        assert!(!column_meta(cli::SQL_VARBINARY, 0, true).bounded);
+        assert!(!column_meta(cli::SQL_VARCHAR, MAX_BOUND_COL_BYTES + 1, true).bounded);
+        // Text bind width reserves the NUL terminator.
+        assert_eq!(column_meta(cli::SQL_VARCHAR, 10, true).bind_width, 11);
+    }
+
+    #[test]
+    fn rowset_row_warning_detection() {
+        let statuses = [cli::SQL_ROW_SUCCESS, cli::SQL_ROW_SUCCESS_WITH_INFO];
+        assert!(rowset_has_row_warnings(&statuses, 2));
+        assert!(!rowset_has_row_warnings(&statuses, 1));
+        assert!(!rowset_has_row_warnings(&[cli::SQL_ROW_SUCCESS; 4], 4));
+    }
+
+    fn rec(state: &str) -> DiagRecord {
+        DiagRecord {
+            sqlstate: state.into(),
+            native: 0,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn warning_chain_policy_examines_every_record_and_fails_closed() {
+        // A chain that is entirely class 01 (and free of 01004) is benign.
+        assert!(check_warning_chain(&[rec("01000"), rec("01003")], true).is_ok());
+
+        // Whole-function records precede row records, so a benign first
+        // record must not mask a later truncation or non-warning state.
+        let e = check_warning_chain(&[rec("01000"), rec("01004")], true).unwrap_err();
+        assert_eq!(e.sqlstate, "01004");
+        let e = check_warning_chain(&[rec("01000"), rec("22003")], true).unwrap_err();
+        assert_eq!(e.sqlstate, "22003");
+
+        // WITH_INFO with no retrievable records, or a chain the reader could
+        // not finish, fails closed rather than open.
+        assert!(check_warning_chain(&[], true).is_err());
+        assert!(check_warning_chain(&[rec("01000")], false).is_err());
+    }
+
+    #[test]
+    fn warning_chain_is_arbitrated_before_the_fallible_transpose() {
+        // A rejected chain must surface its own record — the transpose's
+        // generic mapping error must not preempt it, so the transpose must
+        // not even run.
+        let chain = Some((vec![rec("01004")], true));
+        let e = materialize_checked_rowset(chain.as_ref(), || -> Result<()> {
+            panic!("transpose must not run when the chain is rejected")
+        })
+        .unwrap_err();
+        assert_eq!(e.sqlstate, "01004");
+
+        // A benign chain defers to the transpose outcome.
+        let chain = Some((vec![rec("01000")], true));
+        let e = materialize_checked_rowset(chain.as_ref(), || -> Result<()> {
+            Err(Error::new(ErrorCode::Mapping, "row status 5"))
+        })
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Mapping);
+
+        // No chain: the transpose runs directly.
+        assert_eq!(materialize_checked_rowset(None, || Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn transpose_rowset_materializes_rows_and_nulls() {
+        let cols = [int_col(), char_col(6)];
+        let mut text = [0u8; 12];
+        text[..2].copy_from_slice(b"ab");
+        text[6..9].copy_from_slice(b"cde");
+        let storage = RowsetStorage {
+            buffers: vec![vec![7, 8], packed(&text)],
+            indicators: vec![vec![8, cli::SQL_NULL_DATA], vec![2, 3]],
+            rows_fetched: 2,
+            row_status: vec![cli::SQL_ROW_SUCCESS, cli::SQL_ROW_SUCCESS_WITH_INFO],
+        };
+        let block = transpose_rowset(&cols, &storage, 2).unwrap();
+        assert_eq!(block[0], vec![Value::Int(7), Value::Text("ab".into())]);
+        assert_eq!(block[1], vec![Value::Null, Value::Text("cde".into())]);
+    }
+
+    #[test]
+    fn transpose_rowset_rejects_row_level_errors() {
+        let cols = [int_col()];
+        let storage = RowsetStorage {
+            buffers: vec![vec![1, 2]],
+            indicators: vec![vec![8, 8]],
+            rows_fetched: 2,
+            row_status: vec![cli::SQL_ROW_SUCCESS, cli::SQL_ROW_ERROR],
+        };
+        let e = transpose_rowset(&cols, &storage, 2).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Mapping);
+        assert!(e.message.contains("row 1"), "message: {}", e.message);
+    }
+
+    #[test]
+    fn transpose_rowset_rejects_truncated_and_unknown_length_cells() {
+        // Text capacity is bind_width - 1: an indicator past it is truncation,
+        // and a negative indicator is an unknown length — both must error, not
+        // silently clamp.
+        let cols = [char_col(6)];
+        let mut text = [0u8; 6];
+        text[..5].copy_from_slice(b"abcde");
+        for bad in [10 as cli::SQLLEN, cli::SQL_NO_TOTAL] {
+            let storage = RowsetStorage {
+                buffers: vec![packed(&text)],
+                indicators: vec![vec![bad]],
+                rows_fetched: 1,
+                row_status: vec![cli::SQL_ROW_SUCCESS],
+            };
+            let e = transpose_rowset(&cols, &storage, 1).unwrap_err();
+            assert_eq!(e.code, ErrorCode::Mapping);
+        }
+
+        // An exactly-full buffer is legitimate for text (capacity)...
+        let full = RowsetStorage {
+            buffers: vec![packed(&text)],
+            indicators: vec![vec![5]],
+            rows_fetched: 1,
+            row_status: vec![cli::SQL_ROW_SUCCESS],
+        };
+        assert_eq!(
+            transpose_rowset(&cols, &full, 1).unwrap()[0][0],
+            Value::Text("abcde".into())
+        );
+
+        // ...and for binary (full bind width), while one byte past it errors.
+        let bin = ColMeta {
+            sql_type: cli::SQL_VARBINARY,
+            c_type: cli::SQL_C_BINARY,
+            bind_width: 4,
+            bounded: true,
+        };
+        for (indicator, expect_ok) in [(4, true), (5, false)] {
+            let storage = RowsetStorage {
+                buffers: vec![packed(b"wxyz")],
+                indicators: vec![vec![indicator]],
+                rows_fetched: 1,
+                row_status: vec![cli::SQL_ROW_SUCCESS],
+            };
+            let outcome = transpose_rowset(&[bin], &storage, 1);
+            if expect_ok {
+                assert_eq!(outcome.unwrap()[0][0], Value::Bytes(b"wxyz".to_vec()));
+            } else {
+                assert_eq!(outcome.unwrap_err().code, ErrorCode::Mapping);
+            }
+        }
+    }
+
+    #[test]
+    fn char_chunk_len_handles_all_indicator_sentinels() {
+        let mut chunk = [0u8; 8];
+        chunk[..3].copy_from_slice(b"abc");
+        // In-range indicator: exact byte count.
+        assert_eq!(char_chunk_len(&chunk, 3), 3);
+        // Truncation (indicator at/over capacity): scan to the NUL terminator.
+        assert_eq!(char_chunk_len(&chunk, 8), 3);
+        assert_eq!(char_chunk_len(&chunk, 1_000_000), 3);
+        // Negative sentinels (SQL_NTS, SQL_NO_TOTAL) must NUL-scan, not index.
+        assert_eq!(char_chunk_len(&chunk, cli::SQLLEN::from(cli::SQL_NTS)), 3);
+        assert_eq!(char_chunk_len(&chunk, cli::SQL_NO_TOTAL), 3);
+        // No terminator at all: the whole chunk is data.
+        let full = [b'x'; 4];
+        assert_eq!(char_chunk_len(&full, cli::SQL_NO_TOTAL), 4);
+    }
+
+    #[test]
+    fn binary_chunk_len_handles_negative_and_oversized_indicators() {
+        assert_eq!(binary_chunk_len(8, 5), 5);
+        assert_eq!(binary_chunk_len(8, 8), 8);
+        assert_eq!(binary_chunk_len(8, 100), 8);
+        assert_eq!(binary_chunk_len(8, cli::SQL_NO_TOTAL), 8);
+        assert_eq!(binary_chunk_len(8, cli::SQLLEN::from(cli::SQL_NTS)), 8);
+    }
+
     #[test]
     fn pump_source_err_invokes_cancel_and_propagates() {
         let mut stage = [0u8; 8];
@@ -2403,6 +2865,7 @@ mod tests {
         let status_ptr = storage.row_status.as_mut_ptr();
         let entry = StmtEntry {
             conn: 1,
+            lifecycle: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(StmtState {
                 handle: RawHandle(ptr::null_mut()),
                 bound: Vec::new(),
@@ -2461,7 +2924,19 @@ mod tests {
         });
     }
 
-    fn test_stmt_entry(conn: u64) -> (StmtEntry, Arc<Mutex<StmtState>>) {
+    fn test_conn_entry() -> ConnEntry {
+        ConnEntry {
+            handle: RawHandle(ptr::null_mut()),
+            lifecycle: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Statement entry sharing `lifecycle`, as production entries share their
+    /// parent connection's guard.
+    fn test_stmt_entry_with(
+        conn: u64,
+        lifecycle: Arc<Mutex<()>>,
+    ) -> (StmtEntry, Arc<Mutex<StmtState>>) {
         let state = Arc::new(Mutex::new(StmtState {
             handle: RawHandle(ptr::null_mut()),
             bound: Vec::new(),
@@ -2473,10 +2948,15 @@ mod tests {
         (
             StmtEntry {
                 conn,
+                lifecycle,
                 state: state.clone(),
             },
             state,
         )
+    }
+
+    fn test_stmt_entry(conn: u64) -> (StmtEntry, Arc<Mutex<StmtState>>) {
+        test_stmt_entry_with(conn, Arc::new(Mutex::new(())))
     }
 
     #[test]
@@ -2499,11 +2979,12 @@ mod tests {
     #[test]
     fn disconnect_failure_restores_children_and_skips_parent_release() {
         let inner = Mutex::new(Inner::default());
-        let (first, first_state) = test_stmt_entry(3);
-        let (second, second_state) = test_stmt_entry(3);
+        let conn_entry = test_conn_entry();
+        let (first, first_state) = test_stmt_entry_with(3, conn_entry.lifecycle.clone());
+        let (second, second_state) = test_stmt_entry_with(3, conn_entry.lifecycle.clone());
         {
             let mut inner = inner.lock().unwrap();
-            inner.conns.insert(3, RawHandle(ptr::null_mut()));
+            inner.conns.insert(3, conn_entry);
             inner.stmts.insert(7, first);
             inner.stmts.insert(8, second);
         }
@@ -2542,7 +3023,7 @@ mod tests {
     fn drop_failure_retains_parent_dbc_and_environment() {
         let mut inner = Inner::default();
         let (entry, state) = test_stmt_entry(3);
-        inner.conns.insert(3, RawHandle(ptr::null_mut()));
+        inner.conns.insert(3, test_conn_entry());
         inner.stmts.insert(7, entry);
         let mut child_free_calls = 0;
         let mut disconnect_calls = 0;
@@ -2580,10 +3061,12 @@ mod tests {
     #[test]
     fn lifecycle_orders_finalization_before_parent_release() {
         let inner = Arc::new(Mutex::new(Inner::default()));
-        let (entry, _) = test_stmt_entry(3);
+        // Sharing the parent's guard is what serializes finalize vs disconnect.
+        let conn_entry = test_conn_entry();
+        let (entry, _) = test_stmt_entry_with(3, conn_entry.lifecycle.clone());
         {
             let mut inner = inner.lock().unwrap();
-            inner.conns.insert(3, RawHandle(ptr::null_mut()));
+            inner.conns.insert(3, conn_entry);
             inner.stmts.insert(7, entry);
         }
         let finalizer_ready = Arc::new(std::sync::Barrier::new(2));
@@ -2637,11 +3120,7 @@ mod tests {
     #[test]
     fn lifecycle_orders_prepare_registration_before_parent_release() {
         let inner = Arc::new(Mutex::new(Inner::default()));
-        inner
-            .lock()
-            .unwrap()
-            .conns
-            .insert(3, RawHandle(ptr::null_mut()));
+        inner.lock().unwrap().conns.insert(3, test_conn_entry());
         let prepare_ready = Arc::new(std::sync::Barrier::new(2));
         let disconnect_started = Arc::new(std::sync::Barrier::new(2));
         let release_prepare = Arc::new(std::sync::Barrier::new(2));
@@ -2699,13 +3178,49 @@ mod tests {
     }
 
     #[test]
+    fn prepares_on_distinct_connections_do_not_serialize() {
+        let inner = Arc::new(Mutex::new(Inner::default()));
+        {
+            let mut guard = inner.lock().unwrap();
+            guard.conns.insert(1, test_conn_entry());
+            guard.conns.insert(2, test_conn_entry());
+        }
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let blocked_inner = inner.clone();
+            let entered_for_thread = entered.clone();
+            let release_for_thread = release.clone();
+            let blocked = scope.spawn(move || {
+                prepare_stmt_with(
+                    &blocked_inner,
+                    2,
+                    |_| {
+                        entered_for_thread.wait();
+                        release_for_thread.wait();
+                        Ok(RawHandle(ptr::null_mut()))
+                    },
+                    |_| {},
+                )
+                .unwrap();
+            });
+
+            // Once this barrier passes, connection 2's guard is held mid-prepare.
+            // A single driver-wide guard would deadlock the next call: it would
+            // wait on connection 2's in-flight native call, which only finishes
+            // after this thread reaches the release barrier below.
+            entered.wait();
+            prepare_stmt_with(&inner, 1, |_| Ok(RawHandle(ptr::null_mut())), |_| {}).unwrap();
+            release.wait();
+            blocked.join().unwrap();
+        });
+    }
+
+    #[test]
     fn lifecycle_orders_temporary_liveness_child_before_parent_release() {
         let inner = Arc::new(Mutex::new(Inner::default()));
-        inner
-            .lock()
-            .unwrap()
-            .conns
-            .insert(3, RawHandle(ptr::null_mut()));
+        inner.lock().unwrap().conns.insert(3, test_conn_entry());
         let liveness_ready = Arc::new(std::sync::Barrier::new(2));
         let disconnect_started = Arc::new(std::sync::Barrier::new(2));
         let release_liveness = Arc::new(std::sync::Barrier::new(2));
@@ -2765,11 +3280,7 @@ mod tests {
     #[test]
     fn failed_liveness_child_free_retains_its_parent_until_disconnect_retries() {
         let inner = Mutex::new(Inner::default());
-        inner
-            .lock()
-            .unwrap()
-            .conns
-            .insert(3, RawHandle(ptr::null_mut()));
+        inner.lock().unwrap().conns.insert(3, test_conn_entry());
 
         let error = is_alive_with(
             &inner,

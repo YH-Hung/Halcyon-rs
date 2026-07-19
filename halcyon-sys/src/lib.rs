@@ -118,6 +118,12 @@ pub const SQL_ATTR_ROW_ARRAY_SIZE: SQLINTEGER = 27;
 pub const SQL_BIND_BY_COLUMN: SQLULEN = 0;
 pub const SQL_PARAM_BIND_BY_COLUMN: SQLULEN = 0;
 
+// --- Row status array values (sqlext.h) ---
+
+pub const SQL_ROW_SUCCESS: SQLUSMALLINT = 0;
+pub const SQL_ROW_ERROR: SQLUSMALLINT = 5;
+pub const SQL_ROW_SUCCESS_WITH_INFO: SQLUSMALLINT = 6;
+
 // --- SQLColAttribute descriptor fields ---
 
 pub const SQL_DESC_OCTET_LENGTH: SQLUSMALLINT = 1013;

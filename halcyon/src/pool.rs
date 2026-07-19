@@ -69,8 +69,12 @@ pub struct PoolConfig {
     /// Every pooled connection (including transparent reconnects) gets its own
     /// cache of this size, cleared when the physical connection is dropped.
     pub statement_cache_size: usize,
-    /// Session isolation applied to every pooled connection at open time.
-    /// `None` preserves the server default.
+    /// Session isolation applied to every pooled connection at open time —
+    /// the sole source of truth for pooled sessions: the pool replaces
+    /// `ConnectionParams::isolation` with this value, so a level set only on
+    /// the params is ignored. `None` preserves the server default (even when
+    /// the params carry a level). `ConnectionParams::isolation` applies to
+    /// standalone [`Connection::open`](crate::Connection) only.
     pub isolation: Option<Isolation>,
 }
 
@@ -516,6 +520,8 @@ impl ConnectionPool {
 
         let inner = Arc::new(PoolInner {
             driver,
+            // PoolConfig::isolation is the pooled source of truth: the params'
+            // own level is deliberately discarded (see the field's docs).
             params: ConnectionParams {
                 isolation: config.isolation,
                 ..params

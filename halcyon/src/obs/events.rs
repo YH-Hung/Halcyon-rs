@@ -97,3 +97,18 @@ pub(crate) fn emit_isolation_restore_fail(error: &Error) {
         code = error.code.as_str(),
     );
 }
+
+/// Rust-only event (not in the C++ catalog): a rowset fetch completed with a
+/// benign class-01 warning chain whose diagnostics would otherwise be
+/// discarded. Carries the first (whole-function ordered) record and the chain
+/// length. Only the `db2` driver seam fetches rowsets, hence the feature gate.
+#[cfg(feature = "db2")]
+pub(crate) fn emit_rowset_row_warning(sqlstate: &str, message: &str, records: usize) {
+    tracing::event!(
+        name: "rowset.row_warning",
+        tracing::Level::WARN,
+        sqlstate,
+        message,
+        records,
+    );
+}

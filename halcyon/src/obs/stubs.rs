@@ -42,4 +42,7 @@ pub(crate) fn emit_savepoint_poisoned(_name: &str) {}
 
 pub(crate) fn emit_isolation_restore_fail(_error: &Error) {}
 
+#[cfg(feature = "db2")]
+pub(crate) fn emit_rowset_row_warning(_sqlstate: &str, _message: &str, _records: usize) {}
+
 pub(crate) fn emit_stmt_cache(_result: &'static str, _size: usize) {}

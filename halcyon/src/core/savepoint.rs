@@ -43,6 +43,10 @@ impl SavepointState {
         self.live_names.borrow_mut().insert(normalize_name(name))
     }
 
+    fn occupied(&self, name: &str) -> bool {
+        self.live_names.borrow().contains(&normalize_name(name))
+    }
+
     fn free(&self, name: &str) {
         self.live_names.borrow_mut().remove(&normalize_name(name));
     }
@@ -162,7 +166,16 @@ impl fmt::Debug for Savepoint<'_> {
 }
 
 pub(crate) fn auto_savepoint<'a>(owner: &'a dyn SavepointOwner) -> Result<Savepoint<'a>> {
-    make_savepoint(owner, owner.savepoint_state().next_name())
+    let state = owner.savepoint_state();
+    // Skip generated names occupied by live explicit savepoints (e.g. a user's
+    // own `halcyon_sp_1`). The live set is finite and each iteration advances
+    // the counter, so a free numeric suffix is always reached.
+    loop {
+        let name = state.next_name();
+        if !state.occupied(&name) {
+            return make_savepoint(owner, name);
+        }
+    }
 }
 
 pub(crate) fn named_savepoint<'a>(
@@ -402,6 +415,22 @@ mod tests {
         assert_eq!(savepoint.release().unwrap_err().code, ErrorCode::Connection);
         assert!(savepoint.poisoned());
         assert!(tx.poisoned());
+    }
+
+    #[test]
+    fn automatic_names_skip_live_explicit_savepoints() {
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = connect(&mock);
+        let tx = conn.begin().unwrap();
+
+        // A live explicit savepoint occupies the first automatic name
+        // (case-folded); generation must skip it, not fail.
+        let explicit = tx.savepoint_named("HALCYON_SP_1").unwrap();
+        let auto = tx.savepoint().unwrap();
+        assert_eq!(auto.name(), "halcyon_sp_2");
+
+        auto.release().unwrap();
+        explicit.release().unwrap();
     }
 
     #[test]

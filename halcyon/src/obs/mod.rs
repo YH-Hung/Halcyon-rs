@@ -13,6 +13,8 @@ mod labels;
 #[cfg(not(feature = "observability"))]
 mod stubs;
 
+#[cfg(all(feature = "observability", feature = "db2"))]
+pub(crate) use events::emit_rowset_row_warning;
 #[cfg(feature = "observability")]
 pub(crate) use events::{
     emit_connect_fail, emit_connect_ok, emit_isolation_restore_fail, emit_pool_exhausted,
@@ -24,6 +26,8 @@ pub(crate) use instrument::{
     emit_retry, emit_stmt_cache, flush_pool_metrics, instrument_execute, instrument_query,
     instrument_transaction, PendingMetrics,
 };
+#[cfg(all(not(feature = "observability"), feature = "db2"))]
+pub(crate) use stubs::emit_rowset_row_warning;
 #[cfg(not(feature = "observability"))]
 pub(crate) use stubs::{
     emit_connect_fail, emit_connect_ok, emit_isolation_restore_fail, emit_pool_exhausted,

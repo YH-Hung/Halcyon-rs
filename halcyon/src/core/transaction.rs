@@ -59,10 +59,12 @@ impl<'c> Transaction<'c> {
         self.active.get()
     }
 
-    /// True if a commit/rollback (or the implicit rollback on drop) failed,
-    /// leaving the connection dead or autocommit in an unknown state. The pool
-    /// (Phase 4) discards such a connection rather than reusing it; mirrors the
-    /// C++ `Transaction::poisoned`.
+    /// True if a commit/rollback (or the implicit rollback on drop) failed;
+    /// mirrors the C++ `Transaction::poisoned`. The pool discards such a
+    /// connection rather than reusing it. A standalone connection is condemned
+    /// only when the autocommit/isolation restore itself failed — a failed
+    /// terminal op with a clean restore (e.g. a deadlock victim) leaves the
+    /// connection usable for re-driving the unit of work.
     pub fn poisoned(&self) -> bool {
         self.poisoned.get()
     }
@@ -145,15 +147,19 @@ impl<'c> Transaction<'c> {
         if !self.active.get() {
             return Ok(());
         }
-        let (result, poisoned) = terminate(
+        let (result, state) = terminate(
             self.conn.driver_ref(),
             self.conn.handle(),
             matches!(outcome, Outcome::Commit),
             self.restore_isolation,
         );
         self.active.set(false);
-        if poisoned {
-            self.poison(); // dead connection or autocommit lost
+        if state.poisoned {
+            self.poison();
+        }
+        if state.session_lost {
+            // Autocommit/isolation state is unknown; a failed terminal op with
+            // a clean restore does NOT condemn the connection (see TerminalState).
             self.conn.mark_unusable();
         }
         result
@@ -187,19 +193,31 @@ impl SavepointOwner for Transaction<'_> {
     }
 }
 
+/// How a terminal transaction op left the session, alongside its result.
+pub(crate) struct TerminalState {
+    /// Any failure occurred: the transaction is untrustworthy, so it is
+    /// poisoned and a pooled lease is discarded rather than reused — the C++
+    /// `Transaction::poisoned` contract.
+    pub(crate) poisoned: bool,
+    /// The autocommit/isolation restore itself failed, leaving the session
+    /// transition in an unknown state. Only this condemns a standalone
+    /// connection: a failed commit/rollback alone (e.g. a deadlock victim)
+    /// leaves a cleanly restored session the caller can re-drive.
+    pub(crate) session_lost: bool,
+}
+
 /// Runs the terminal transaction op (commit if `commit`, else rollback) then
 /// restores autocommit — the exact order the C++ `Transaction::commit`/`rollback`
 /// use. Returns the op's error if it failed, otherwise the autocommit-restore
-/// result, plus whether the connection is now poisoned (dead, or autocommit left
-/// in an unknown state). Shared by [`Transaction`] and the facade's owned
-/// `ScopedTransaction`, which both wrap it with their own `active`/`poisoned`
-/// bookkeeping.
+/// result, plus the [`TerminalState`] the session was left in. Shared by
+/// [`Transaction`] and the facade's owned `ScopedTransaction`, which both wrap
+/// it with their own `active`/`poisoned` bookkeeping.
 pub(crate) fn terminate(
     driver: &dyn CliDriver,
     handle: ConnectionHandle,
     commit: bool,
     restore_isolation: Option<Isolation>,
-) -> (Result<()>, bool) {
+) -> (Result<()>, TerminalState) {
     let ended = if commit {
         driver.commit(handle)
     } else {
@@ -213,8 +231,11 @@ pub(crate) fn terminate(
         }),
         None => Ok(()),
     };
-    let poisoned = ended.is_err() || restored.is_err() || isolation_restored.is_err();
-    (ended.and(restored).and(isolation_restored), poisoned)
+    let state = TerminalState {
+        poisoned: ended.is_err() || restored.is_err() || isolation_restored.is_err(),
+        session_lost: restored.is_err() || isolation_restored.is_err(),
+    };
+    (ended.and(restored).and(isolation_restored), state)
 }
 
 /// Outcome of setting a temporary isolation level before disabling autocommit.
@@ -539,6 +560,40 @@ mod tests {
         assert_eq!(e.code, ErrorCode::Connection);
         assert!(tx.poisoned());
         assert!(!tx.active());
+    }
+
+    #[test]
+    fn recoverable_commit_failure_keeps_standalone_connection_usable() {
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = connect(&mock);
+        let mut tx = conn.begin().unwrap();
+        // Only the terminal commit fails (a deadlock victim); the autocommit
+        // restore that follows succeeds, so the session state is intact.
+        mock.push_txn_error(Error::new(ErrorCode::Deadlock, "deadlock victim"));
+        let e = tx.commit().unwrap_err();
+        assert_eq!(e.code, ErrorCode::Deadlock);
+        assert!(tx.poisoned());
+        drop(tx);
+        // The caller may re-drive the unit of work on the same connection.
+        assert_eq!(conn.execute("UPDATE t SET x = 1", ()).unwrap(), 0);
+    }
+
+    #[test]
+    fn lost_autocommit_restore_marks_standalone_connection_unusable() {
+        let mock = Arc::new(MockCliDriver::new());
+        let conn = connect(&mock);
+        let mut tx = conn.begin().unwrap();
+        // The terminal commit fails AND the autocommit restore fails: the
+        // session transition is unknown, so the connection must not be reused.
+        mock.push_txn_error(Error::new(ErrorCode::Deadlock, "deadlock victim"));
+        mock.push_txn_error(Error::new(ErrorCode::Connection, "restore failed"));
+        let e = tx.commit().unwrap_err();
+        assert_eq!(e.code, ErrorCode::Deadlock);
+        assert!(tx.poisoned());
+        assert_eq!(
+            conn.execute("UPDATE t SET x = 1", ()).unwrap_err().code,
+            ErrorCode::InvalidState
+        );
     }
 
     #[test]

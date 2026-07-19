@@ -38,8 +38,20 @@ impl<'a> Row<'a> {
         self.cells.len()
     }
 
+    /// Borrows the buffered value at the 0-based `index` without copying, or
+    /// `None` when the index is out of range. Use this for large cells (LOBs)
+    /// where the owned conversion of [`column`](Row::column) would clone the
+    /// buffered bytes.
+    pub fn value(&self, index: usize) -> Option<&'a Value> {
+        self.cells.get(index)
+    }
+
     /// Reads the 0-based `index` column as `T`. Mapping errors are local to the
     /// caller: the driver already returned the entire block successfully.
+    ///
+    /// Returning owned data copies a variable-length cell once (the same cost
+    /// as the C++ `TypeBinder::from_value`); [`value`](Row::value) borrows the
+    /// buffered cell instead.
     pub fn column<T: FromColumn>(&self, index: usize) -> Result<T> {
         let value = self.cells.get(index).cloned().ok_or_else(|| {
             mapping(format!(
@@ -233,5 +245,19 @@ where
             Ok(None) => None,
             Err(e) => Some(Err(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_value_borrows_the_buffered_cell_without_copying() {
+        let cells = vec![Value::Int(7), Value::Bytes(vec![1, 2, 3])];
+        let row = Row::new(&cells);
+        // The same allocation, not a clone.
+        assert!(std::ptr::eq(row.value(1).unwrap(), &cells[1]));
+        assert_eq!(row.value(2), None);
     }
 }

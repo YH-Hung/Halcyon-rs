@@ -50,7 +50,9 @@ impl Database {
     /// point, used by tests (against a mock `CliDriver`) and by callers supplying
     /// their own driver. The `db2`-gated `Database::connect` is the
     /// no-CLI-types form. Warms the pool to `config.min`; a warmup failure
-    /// returns the error.
+    /// returns the error. Session isolation comes from `config.isolation`
+    /// alone: `params.isolation` is discarded on this pooled path, even when
+    /// `config.isolation` is `None`.
     pub fn open(
         driver: Arc<dyn CliDriver>,
         params: ConnectionParams,
@@ -734,14 +736,16 @@ impl ScopedTransaction {
         if !self.active.get() {
             return Ok(());
         }
-        let (result, poisoned) = terminate(
+        let (result, state) = terminate(
             self.lease.driver_ref(),
             self.lease.handle(),
             commit,
             self.restore_isolation,
         );
         self.active.set(false);
-        if poisoned {
+        // Any terminal failure poisons the unit of work; Drop then discards the
+        // lease, which covers the session_lost case for pooled connections.
+        if state.poisoned {
             self.poison();
         }
         result
