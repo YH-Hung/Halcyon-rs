@@ -259,15 +259,23 @@ impl BoundParam {
     }
 }
 
+/// Array parameter buffers remain valid until their CLI bindings are cleared,
+/// including on partial bind/execute/reset failures.
+struct BatchParams {
+    buffers: Vec<Vec<i64>>,
+    indicators: Vec<Vec<cli::SQLLEN>>,
+}
+
 struct StmtState {
     handle: RawHandle,
     /// Kept alive (and address-stable) between bind_params and execute — the
-    /// CLI holds pointers into these until the statement is executed or rebound.
+    /// CLI holds pointers into these until the parameters are reset or rebound.
     bound: Vec<BoundParam>,
     /// The CLI retains each streamed parameter's StrLen_or_IndPtr after
     /// execute, so this storage must be owned by the cached statement rather
     /// than by one execute_streaming stack frame.
     stream_indicators: Vec<cli::SQLLEN>,
+    batch_params: Option<BatchParams>,
     /// Described once per successfully executed cursor, then cleared on close
     /// or re-execute so cached statements never retain stale result metadata.
     cols: Option<Vec<ColMeta>>,
@@ -565,6 +573,7 @@ where
                 handle: stmt,
                 bound: Vec::new(),
                 stream_indicators: Vec::new(),
+                batch_params: None,
                 cols: None,
                 block_fallback: false,
                 pending_rowset: None,
@@ -749,23 +758,52 @@ impl Drop for Db2CliDriver {
     }
 }
 
-/// Restores single-row paramset state so a cached statement is clean for later
-/// scalar bind/execute reuse. Returns the CLI status so the success path can
-/// fail if the reset did not stick.
-fn reset_paramset(h: cli::SQLHANDLE) -> cli::SQLRETURN {
-    unsafe { cli::SQLSetStmtAttr(h, cli::SQL_ATTR_PARAMSET_SIZE, attr_value(1), 0) }
+/// Clear native bindings before releasing any allocation they can reference.
+/// A reset failure conservatively retains every owner for retry or finalization.
+fn reset_parameters_with(
+    st: &mut StmtState,
+    reset: impl FnOnce(cli::SQLHANDLE) -> Result<()>,
+) -> Result<()> {
+    reset(st.handle.0)?;
+    st.bound.clear();
+    st.stream_indicators.clear();
+    st.batch_params = None;
+    Ok(())
 }
 
-/// Data bytes present in a character SQLGetData chunk. On truncation the CLI
-/// fills and NUL-terminates the buffer, and a negative indicator (SQL_NTS, or
-/// SQL_NO_TOTAL when the remaining length is unknown) carries no byte count —
-/// so every out-of-range indicator falls back to the NUL scan; an indicator is
-/// never used to index the chunk.
+fn reset_parameters(st: &mut StmtState) -> Result<()> {
+    reset_parameters_with(st, |h| {
+        let rc = unsafe { cli::SQLFreeStmt(h, cli::SQL_RESET_PARAMS) };
+        if !cli_ok(rc) {
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                "SQLFreeStmt(SQL_RESET_PARAMS) failed",
+            ));
+        }
+        let rc = unsafe { cli::SQLSetStmtAttr(h, cli::SQL_ATTR_PARAMSET_SIZE, attr_value(1), 0) };
+        if !cli_ok(rc) {
+            return Err(make_error(
+                cli::SQL_HANDLE_STMT,
+                h,
+                ErrorCode::Unknown,
+                "SQLSetStmtAttr reset parameter array size failed",
+            ));
+        }
+        Ok(())
+    })
+}
+
+/// SQLGetData character chunks reserve one byte for the terminator. A known
+/// length counts embedded NULs as data; truncated/unknown-total chunks fill
+/// the usable capacity. Only SQL_NTS explicitly requests a terminator scan.
 fn char_chunk_len(chunk: &[u8], ind: cli::SQLLEN) -> usize {
-    if ind < 0 || ind >= chunk.len() as cli::SQLLEN {
+    if ind == cli::SQL_NTS {
         chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len())
     } else {
-        ind as usize
+        let capacity = chunk.len().saturating_sub(1);
+        usize::try_from(ind).unwrap_or(capacity).min(capacity)
     }
 }
 
@@ -1647,6 +1685,7 @@ impl CliDriver for Db2CliDriver {
         ensure_rowset_reset(&mut st)?;
         // Build every BoundParam first so the Vec reaches its final size, then
         // bind — the addresses handed to the CLI must not move afterwards.
+        reset_parameters(&mut st)?;
         st.bound = params.iter().map(BoundParam::from_value).collect();
         let h = st.handle.0;
         // CLI input parameters are read-only; a shared empty buffer stands in
@@ -1784,6 +1823,7 @@ impl CliDriver for Db2CliDriver {
         let mut total: i64 = 0;
         let mut start = 0usize;
         while start < n_rows {
+            reset_parameters(&mut st)?;
             // Grow the chunk until adding the next row would exceed the budget.
             // col_max tracks each var-width column's longest element in the chunk.
             let mut col_max = vec![0usize; n_cols];
@@ -1864,6 +1904,12 @@ impl CliDriver for Db2CliDriver {
                 ind.push(col_ind);
             }
 
+            // Move ownership into the statement before any native binding. On
+            // every error exit these allocations survive until reset or free.
+            let batch = st.batch_params.insert(BatchParams {
+                buffers: buf,
+                indicators: ind,
+            });
             let mut rc_set = unsafe {
                 cli::SQLSetStmtAttr(
                     h,
@@ -1889,7 +1935,7 @@ impl CliDriver for Db2CliDriver {
                     ErrorCode::Unknown,
                     "SQLSetStmtAttr (array binding) failed",
                 );
-                reset_paramset(h);
+                let _ = reset_parameters(&mut st);
                 return Err(e);
             }
 
@@ -1903,9 +1949,9 @@ impl CliDriver for Db2CliDriver {
                         sql_type[c],
                         width[c] as cli::SQLULEN,
                         0,
-                        buf[c].as_mut_ptr().cast(),
+                        batch.buffers[c].as_mut_ptr().cast(),
                         width[c],
-                        ind[c].as_mut_ptr(),
+                        batch.indicators[c].as_mut_ptr(),
                     )
                 };
                 if !cli_ok(rc) {
@@ -1915,7 +1961,7 @@ impl CliDriver for Db2CliDriver {
                         ErrorCode::Unknown,
                         "SQLBindParameter (array) failed",
                     );
-                    reset_paramset(h);
+                    let _ = reset_parameters(&mut st);
                     return Err(e);
                 }
             }
@@ -1933,7 +1979,7 @@ impl CliDriver for Db2CliDriver {
                     ErrorCode::Unknown,
                     "SQLExecute (array binding) failed",
                 );
-                reset_paramset(h);
+                let _ = reset_parameters(&mut st);
                 return Err(e);
             }
             let mut affected: cli::SQLLEN = 0;
@@ -1941,16 +1987,9 @@ impl CliDriver for Db2CliDriver {
             total += i64::from(affected.max(0));
             start = end;
         }
-        // On success the reset must stick, or a later reuse of this cached
-        // statement would execute with the wrong paramset size.
-        if !cli_ok(reset_paramset(h)) {
-            return Err(make_error(
-                cli::SQL_HANDLE_STMT,
-                h,
-                ErrorCode::Unknown,
-                "SQLSetStmtAttr reset after array binding failed",
-            ));
-        }
+        // A successful batch releases its arrays only after native descriptors
+        // and the parameter-array size have both been reset successfully.
+        reset_parameters(&mut st)?;
         Ok(total)
     }
 
@@ -2206,6 +2245,7 @@ impl CliDriver for Db2CliDriver {
         ensure_rowset_reset(&mut st)?;
         st.cols = None;
         st.block_fallback = false;
+        reset_parameters(&mut st)?;
         st.bound = params.iter().map(BoundParam::from_value).collect();
         st.stream_indicators.clear();
         st.stream_indicators.resize(params.len(), 0);
@@ -2667,19 +2707,28 @@ mod tests {
 
     #[test]
     fn char_chunk_len_handles_all_indicator_sentinels() {
-        let mut chunk = [0u8; 8];
-        chunk[..3].copy_from_slice(b"abc");
-        // In-range indicator: exact byte count.
-        assert_eq!(char_chunk_len(&chunk, 3), 3);
-        // Truncation (indicator at/over capacity): scan to the NUL terminator.
-        assert_eq!(char_chunk_len(&chunk, 8), 3);
-        assert_eq!(char_chunk_len(&chunk, 1_000_000), 3);
-        // Negative sentinels (SQL_NTS, SQL_NO_TOTAL) must NUL-scan, not index.
-        assert_eq!(char_chunk_len(&chunk, cli::SQLLEN::from(cli::SQL_NTS)), 3);
-        assert_eq!(char_chunk_len(&chunk, cli::SQL_NO_TOTAL), 3);
-        // No terminator at all: the whole chunk is data.
-        let full = [b'x'; 4];
-        assert_eq!(char_chunk_len(&full, cli::SQL_NO_TOTAL), 4);
+        let chunk = b"ab\0cdef\0";
+        // Known byte counts include embedded NULs and exclude the terminator.
+        assert_eq!(char_chunk_len(chunk, 3), 3);
+        assert_eq!(char_chunk_len(chunk, 8), 7);
+        assert_eq!(char_chunk_len(chunk, 1_000_000), 7);
+        // SQL_NO_TOTAL denotes a full truncated chunk; SQL_NTS alone scans.
+        assert_eq!(char_chunk_len(chunk, cli::SQL_NO_TOTAL), 7);
+        assert_eq!(char_chunk_len(chunk, cli::SQL_NTS), 2);
+    }
+
+    #[test]
+    fn truncated_character_chunks_preserve_embedded_nuls() {
+        let mut original = vec![b'A'; 5000];
+        original[100] = 0;
+        let mut first = [0u8; 4096];
+        first[..4095].copy_from_slice(&original[..4095]);
+        let mut last = [0u8; 4096];
+        last[..905].copy_from_slice(&original[4095..]);
+        let mut result = Vec::new();
+        result.extend_from_slice(&first[..char_chunk_len(&first, 5000)]);
+        result.extend_from_slice(&last[..char_chunk_len(&last, 905)]);
+        assert_eq!(result, original);
     }
 
     #[test]
@@ -2761,6 +2810,55 @@ mod tests {
     }
 
     #[test]
+    fn parameter_reset_failure_keeps_all_native_pointer_storage_alive() {
+        let (_, state) = test_stmt_entry(3);
+        let mut state = state.lock().unwrap();
+        state.bound = vec![BoundParam::from_value(&Value::Text("old value".into()))];
+        state.stream_indicators = vec![cli::SQL_DATA_AT_EXEC];
+        state.batch_params = Some(BatchParams {
+            buffers: vec![vec![42]],
+            indicators: vec![vec![8]],
+        });
+        let scalar = state.bound[0].buf.as_ptr();
+        let scalar_indicator = &state.bound[0].len_ind as *const cli::SQLLEN;
+        let stream = state.stream_indicators.as_ptr();
+        let batch = state.batch_params.as_ref().unwrap();
+        let array = batch.buffers[0].as_ptr();
+        let array_indicator = batch.indicators[0].as_ptr();
+
+        let error = reset_parameters_with(&mut state, |_| {
+            Err(Error::new(ErrorCode::Unknown, "native reset failed"))
+        })
+        .unwrap_err();
+        assert_eq!(error.message, "native reset failed");
+        assert_eq!(state.bound[0].buf.as_ptr(), scalar);
+        assert_eq!(
+            &state.bound[0].len_ind as *const cli::SQLLEN,
+            scalar_indicator
+        );
+        assert_eq!(state.stream_indicators.as_ptr(), stream);
+        let batch = state.batch_params.as_ref().unwrap();
+        assert_eq!(batch.buffers[0].as_ptr(), array);
+        assert_eq!(batch.indicators[0].as_ptr(), array_indicator);
+        // The native pointers remain readable through a failed cleanup and are
+        // still valid when the next reset starts, not merely address-equal.
+        reset_parameters_with(&mut state, |_| {
+            unsafe {
+                assert_eq!(std::slice::from_raw_parts(scalar, 9), b"old value");
+                assert_eq!(*scalar_indicator, 9);
+                assert_eq!(*stream, cli::SQL_DATA_AT_EXEC);
+                assert_eq!(*array, 42);
+                assert_eq!(*array_indicator, 8);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(state.bound.is_empty());
+        assert!(state.stream_indicators.is_empty());
+        assert!(state.batch_params.is_none());
+    }
+
+    #[test]
     fn streamed_indicator_storage_is_owned_by_statement_state() {
         let (_, state) = test_stmt_entry(3);
         let pointer = {
@@ -2835,6 +2933,7 @@ mod tests {
             handle: RawHandle(ptr::null_mut()),
             bound: Vec::new(),
             stream_indicators: Vec::new(),
+            batch_params: None,
             cols: None,
             block_fallback: false,
             pending_rowset: None,
@@ -2870,6 +2969,7 @@ mod tests {
                 handle: RawHandle(ptr::null_mut()),
                 bound: Vec::new(),
                 stream_indicators: Vec::new(),
+                batch_params: None,
                 cols: None,
                 block_fallback: false,
                 pending_rowset: Some(storage),
@@ -2941,6 +3041,7 @@ mod tests {
             handle: RawHandle(ptr::null_mut()),
             bound: Vec::new(),
             stream_indicators: Vec::new(),
+            batch_params: None,
             cols: None,
             block_fallback: false,
             pending_rowset: None,

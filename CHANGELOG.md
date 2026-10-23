@@ -105,6 +105,17 @@ published and no `v0.1.0` tag or GitHub release exists yet. The `halcyon-sys`,
 
 ### Fixed
 
+- Reset native parameter bindings before replacing their backing storage,
+  including batch and LOB paths, to make statement reuse with fewer values safe.
+- Recognize SQL comments during retry classification so embedded writes cannot
+  be replayed because of quotes inside comments.
+- Reject overlapping standalone transactions and data operations on completed
+  standalone or pooled transaction guards with `InvalidState`.
+- Preserve embedded NUL bytes in known-length, chunked CLOB/text reads.
+- Keep Tokio on the Rust 1.75-compatible 1.52 series for fresh consumers.
+- Add release CI checks for documentation, package contents, all features,
+  optional-feature MSRV, and downstream compilation, plus a compiled quick start.
+
 - Corrected non-Windows IBM CLI `SQLLEN`/`SQLULEN` widths to 32 bits, preserving
   the `-1` NULL indicator sentinel observed in live round-trips.
 - Statement failures poison cached entries so they cannot be reused in an

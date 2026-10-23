@@ -19,13 +19,14 @@ use crate::core::{
     auto_savepoint, named_savepoint, nested_savepoint, Savepoint, SavepointOwner, SavepointState,
 };
 use crate::driver::{CliDriver, ConnectionHandle};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::lob::BindParam;
 use crate::value::Value;
 use crate::Isolation;
 
 /// A scoped unit of work over one [`Connection`]. Autocommit is off for its
 /// lifetime; see the module docs for the commit/rollback and drop semantics.
+/// Data operations after commit or rollback return `ErrorCode::InvalidState`.
 pub struct Transaction<'c> {
     conn: &'c Connection,
     active: Cell<bool>,
@@ -44,6 +45,7 @@ impl<'c> Transaction<'c> {
     /// Constructed only by [`Connection::begin`], which has already flipped
     /// autocommit off on `conn`.
     fn new(conn: &'c Connection, restore_isolation: Option<Isolation>) -> Self {
+        conn.transaction_active.set(true);
         Transaction {
             conn,
             active: Cell::new(true),
@@ -69,14 +71,23 @@ impl<'c> Transaction<'c> {
         self.poisoned.get()
     }
 
+    fn ensure_active(&self) -> Result<()> {
+        if !self.active.get() {
+            return Err(Error::new(ErrorCode::InvalidState, "transaction has ended"));
+        }
+        Ok(())
+    }
+
     /// Executes a non-query statement within the unit of work. See
     /// [`Connection::execute`].
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<i64> {
+        self.ensure_active()?;
         self.conn.execute(sql, params)
     }
 
     /// Executes positional values and LOB streams once within this transaction.
     pub fn execute_with_lobs(&self, sql: &str, params: Vec<BindParam<'_>>) -> Result<i64> {
+        self.ensure_active()?;
         self.conn.execute_with_lobs(sql, params)
     }
 
@@ -84,6 +95,7 @@ impl<'c> Transaction<'c> {
     /// borrows the transaction, so it must be finished (dropped) before
     /// commit/rollback. See [`Connection::query`].
     pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<ResultSet<'_>> {
+        self.ensure_active()?;
         self.conn.query(sql, params)
     }
 
@@ -93,16 +105,19 @@ impl<'c> Transaction<'c> {
         sql: &str,
         params: impl IntoParams,
     ) -> Result<StreamingResultSet<'_>> {
+        self.ensure_active()?;
         self.conn.query_streaming(sql, params)
     }
 
     /// Runs a query and maps every row into `T`. See [`Connection::query_as`].
     pub fn query_as<T: FromRow>(&self, sql: &str, params: impl IntoParams) -> Result<Vec<T>> {
+        self.ensure_active()?;
         self.conn.query_as(sql, params)
     }
 
     /// Batch insert within the unit of work. See [`Connection::execute_batch`].
     pub fn execute_batch(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
+        self.ensure_active()?;
         self.conn.execute_batch(sql, rows)
     }
 
@@ -154,6 +169,7 @@ impl<'c> Transaction<'c> {
             self.restore_isolation,
         );
         self.active.set(false);
+        self.conn.transaction_active.set(false);
         if state.poisoned {
             self.poison();
         }
@@ -284,11 +300,23 @@ impl fmt::Debug for Transaction<'_> {
 }
 
 impl Connection {
+    fn ensure_can_begin(&self) -> Result<()> {
+        self.ensure_usable()?;
+        if self.transaction_active.get() {
+            return Err(Error::new(
+                ErrorCode::InvalidState,
+                "connection already has an active transaction; use a savepoint for nested work",
+            ));
+        }
+        Ok(())
+    }
+
     /// Begins a transaction: disables autocommit and returns a [`Transaction`]
     /// bound to this connection. If enabling manual commit fails, no transaction
-    /// is created and the error is returned. Ported from C++ `Connection::begin`.
+    /// is created and the error is returned. An overlapping transaction is
+    /// rejected with `InvalidState`; use a savepoint for nested work.
     pub fn begin(&self) -> Result<Transaction<'_>> {
-        self.ensure_usable()?;
+        self.ensure_can_begin()?;
         self.driver_ref().set_auto_commit(self.handle(), false)?;
         Ok(Transaction::new(self, None))
     }
@@ -296,7 +324,7 @@ impl Connection {
     /// Begins a transaction at `level`, restoring this connection's configured
     /// default (or Cursor Stability when none was configured) when it ends.
     pub fn begin_with_isolation(&self, level: Isolation) -> Result<Transaction<'_>> {
-        self.ensure_usable()?;
+        self.ensure_can_begin()?;
         let restore_target = self.isolation_restore_target();
         match start_with_isolation(self.driver_ref(), self.handle(), level, restore_target) {
             IsolationBegin::Started => Ok(Transaction::new(self, Some(restore_target))),
@@ -326,6 +354,79 @@ mod tests {
 
     fn connect(mock: &Arc<MockCliDriver>) -> Connection {
         Connection::open(mock.clone(), &params()).unwrap()
+    }
+
+    #[test]
+    fn overlapping_transactions_are_rejected_before_session_changes() {
+        for isolation in [None, Some(Isolation::ReadStability)] {
+            let mock = Arc::new(MockCliDriver::new());
+            let conn = connect(&mock);
+            let mut tx = match isolation {
+                None => conn.begin().unwrap(),
+                Some(level) => conn.begin_with_isolation(level).unwrap(),
+            };
+            let events = mock.transaction_events();
+            assert_eq!(conn.begin().unwrap_err().code, ErrorCode::InvalidState);
+            assert_eq!(
+                conn.begin_with_isolation(Isolation::RepeatableRead)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(mock.transaction_events(), events);
+            assert!(tx.active());
+            tx.commit().unwrap();
+            let mut next = conn.begin().unwrap();
+            next.rollback().unwrap();
+            drop(conn.begin().unwrap());
+            conn.begin_with_isolation(Isolation::ReadStability)
+                .unwrap()
+                .rollback()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn ended_transaction_rejects_every_data_operation() {
+        for commit in [false, true] {
+            let mock = Arc::new(MockCliDriver::new());
+            let conn = connect(&mock);
+            let mut tx = conn.begin().unwrap();
+            if commit {
+                tx.commit().unwrap();
+            } else {
+                tx.rollback().unwrap();
+            }
+            assert_eq!(
+                tx.execute("INSERT INTO t VALUES (1)", ()).unwrap_err().code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(
+                tx.execute_with_lobs("INSERT INTO t VALUES (1)", vec![])
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(
+                tx.execute_batch("INSERT INTO t VALUES (?)", &[vec![Value::Int(1)]])
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(
+                tx.query("SELECT 1", ()).unwrap_err().code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(
+                tx.query_streaming("SELECT 1", ()).unwrap_err().code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(
+                tx.query_as::<(i64,)>("SELECT 1", ()).unwrap_err().code,
+                ErrorCode::InvalidState
+            );
+            assert!(mock.prepared_sql().is_empty());
+        }
     }
 
     #[test]

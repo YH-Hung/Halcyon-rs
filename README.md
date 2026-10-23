@@ -41,6 +41,50 @@ facade ─► pool ─► core ─► driver (CliDriver trait) ─► halcyon-sy
 - Rust 1.75+
 - IBM Db2 CLI driver (**clidriver**) — user-supplied, never redistributed. Point `DB2_CLIDRIVER_ROOT` at it, or vendor it at `third_party/clidriver/`. A sibling checkout of the C++ Halcyon repo works out of the box via [.cargo/config.toml](.cargo/config.toml).
 
+## Quick start
+
+Add the published client to your application (version 0.1.0 is awaiting its
+first publication):
+
+```toml
+[dependencies]
+halcyon = "0.1.0"
+```
+
+Install IBM's clidriver for your platform and set `DB2_CLIDRIVER_ROOT` to its
+absolute installation directory before building. The default features enable
+Db2 and `#[derive(FromRow)]`. Add `features = ["tokio"]` for `AsyncDatabase`.
+
+| Target | Db2 feature | Pure-Rust layers |
+|---|---|---|
+| Linux x86_64 | Built and tested in CI, including live Db2 | Supported |
+| macOS x86_64 | Built and tested in CI | Supported |
+| macOS ARM64 | No native IBM driver coverage | Tested locally |
+| Windows / AIX | Deferred | No CI support guarantee |
+
+Configure the runtime loader with `LD_LIBRARY_PATH="$DB2_CLIDRIVER_ROOT/lib"`
+on Linux or `DYLD_LIBRARY_PATH="$DB2_CLIDRIVER_ROOT/lib"` on macOS. The
+repository's rpath setup for its own tests does not configure your application.
+
+```rust
+use halcyon::{Database, Error, ErrorCode, Result};
+
+fn main() -> Result<()> {
+    let dsn = std::env::var("HALCYON_DSN")
+        .map_err(|_| Error::new(ErrorCode::InvalidArgument, "set HALCYON_DSN"))?;
+    let db = Database::connect(&dsn)?;
+    let rows: Vec<(i64,)> = db.query_as("VALUES CAST(? AS BIGINT)", (42_i64,))?;
+    println!("{rows:?}");
+    Ok(())
+}
+```
+
+Set `HALCYON_DSN` to your CLI connection string, for example
+`DATABASE=SAMPLE;HOSTNAME=localhost;PORT=50000;PROTOCOL=TCPIP;UID=...;PWD=...;`.
+For a complete typed query and transaction example using a temporary table, see
+[quick_start.rs](halcyon/examples/quick_start.rs). CI compiles the example;
+run it against your database with `cargo run -p halcyon --example quick_start`.
+
 ## Build & test
 
 ```bash

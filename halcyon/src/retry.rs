@@ -8,8 +8,8 @@
 //! fake clock.
 //!
 //! `is_read_only` classifies a statement as safe to auto-retry (a read-only
-//! `SELECT` / `WITH…SELECT` / `VALUES`), the exact port of the C++
-//! `detail::is_read_only` scanner — the facade uses it to pick a default retry
+//! `SELECT` / `WITH…SELECT` / `VALUES`), based on the C++ `detail::is_read_only`
+//! scanner with SQL-comment handling — the facade uses it to pick a default retry
 //! policy per call (writes run once; reads may replay after a transient error).
 
 use std::time::Duration;
@@ -82,7 +82,7 @@ impl Default for ExecPolicy {
 }
 
 /// True for statements safe to auto-retry: a read-only `SELECT` / `WITH…SELECT` /
-/// `VALUES`. Exact port of the C++ `detail::is_read_only`.
+/// `VALUES`. Based on the C++ `detail::is_read_only`.
 ///
 /// The leading keyword must be a whole token (so `WITHOUT` / `SELECTED` /
 /// `VALUESX` are rejected), and a `WITH` must resolve to a `SELECT` — a `WITH`
@@ -90,8 +90,9 @@ impl Default for ExecPolicy {
 /// (`INSERT`/`UPDATE`/`DELETE`/`MERGE`) as a whole token at *any* parenthesis
 /// depth disqualifies the statement, so a Db2 data-change table reference
 /// (`SELECT … FROM FINAL TABLE(INSERT …)`) is correctly classified as a write
-/// even though it leads with `SELECT`. Quoted strings and delimited identifiers
-/// are skipped so their contents can't perturb the scan.
+/// even though it leads with `SELECT`. Quoted strings, delimited identifiers,
+/// and SQL comments are skipped so their contents can't perturb the scan.
+/// Comment handling hardens the original C++ scanner against hidden writes.
 ///
 /// Operates on ASCII bytes: any non-ASCII byte in a literal or identifier is a
 /// non-keyword, non-delimiter byte, exactly as the C++ scanner treats it.
@@ -129,6 +130,34 @@ pub(crate) fn is_read_only(sql: &str) -> bool {
     let mut with_main_select = false;
     while i < n {
         let ch = b[i];
+        // Comments may contain unmatched quotes or keywords. Skip them before
+        // interpreting either, so a comment cannot conceal an embedded write.
+        if b[i..].starts_with(b"--") {
+            i += 2;
+            while i < n && b[i] != b'\n' && b[i] != b'\r' {
+                i += 1;
+            }
+            continue;
+        }
+        if b[i..].starts_with(b"/*") {
+            i += 2;
+            let mut nesting = 1usize;
+            while i < n && nesting > 0 {
+                if b[i..].starts_with(b"/*") {
+                    nesting += 1;
+                    i += 2;
+                } else if b[i..].starts_with(b"*/") {
+                    nesting -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if nesting != 0 {
+                return false;
+            }
+            continue;
+        }
         if ch == b'\'' || ch == b'"' {
             let quote = ch;
             i += 1;
@@ -276,6 +305,21 @@ mod tests {
         // A WITH whose main statement is not a SELECT is not read-only even with
         // no data-change verb (e.g. a bare CTE feeding nothing SELECT-shaped).
         assert!(!is_read_only("WITH x AS (SELECT 1) DELETE FROM x"));
+    }
+
+    #[test]
+    fn sql_comments_cannot_hide_embedded_writes() {
+        for sql in [
+            "SELECT /* ' */ * FROM FINAL TABLE (INSERT INTO t VALUES (1))",
+            "SELECT -- \"\n * FROM FINAL TABLE (INSERT INTO t VALUES (1))",
+            "SELECT /* outer /* nested */ ' */ * FROM FINAL TABLE (INSERT INTO t VALUES (1))",
+        ] {
+            assert!(!is_read_only(sql), "mutation classified as read: {sql}");
+        }
+        assert!(is_read_only("SELECT /* ' INSERT */ 1"));
+        assert!(is_read_only("SELECT -- ' INSERT\n 1"));
+        assert!(is_read_only("SELECT '/* not a comment */'"));
+        assert!(!is_read_only("SELECT /* unterminated"));
     }
 
     #[test]

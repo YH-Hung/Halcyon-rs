@@ -51,6 +51,8 @@ pub struct Connection {
     configured_isolation: Option<Isolation>,
     /// A standalone connection whose session transition became untrustworthy.
     unusable: Cell<bool>,
+    /// Only one connection-borrowing transaction may own this session.
+    pub(super) transaction_active: Cell<bool>,
     // `Cell<()>` is `Send + !Sync`, which propagates to `Connection` without a
     // runtime cost or any borrowed data. It carries no value.
     _not_sync: PhantomData<Cell<()>>,
@@ -84,6 +86,7 @@ impl Connection {
             cache: RefCell::new(StatementCache::new(cache_capacity)),
             configured_isolation: params.isolation,
             unusable: Cell::new(false),
+            transaction_active: Cell::new(false),
             _not_sync: PhantomData,
         })
     }
