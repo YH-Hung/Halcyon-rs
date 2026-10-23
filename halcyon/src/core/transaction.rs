@@ -168,6 +168,9 @@ impl<'c> Transaction<'c> {
             matches!(outcome, Outcome::Commit),
             self.restore_isolation,
         );
+        if let Err(error) = &result {
+            self.conn.note_failure(error);
+        }
         self.active.set(false);
         self.conn.transaction_active.set(false);
         if state.poisoned {
@@ -317,7 +320,10 @@ impl Connection {
     /// rejected with `InvalidState`; use a savepoint for nested work.
     pub fn begin(&self) -> Result<Transaction<'_>> {
         self.ensure_can_begin()?;
-        self.driver_ref().set_auto_commit(self.handle(), false)?;
+        if let Err(error) = self.driver_ref().set_auto_commit(self.handle(), false) {
+            self.note_failure(&error);
+            return Err(error);
+        }
         Ok(Transaction::new(self, None))
     }
 
@@ -328,7 +334,10 @@ impl Connection {
         let restore_target = self.isolation_restore_target();
         match start_with_isolation(self.driver_ref(), self.handle(), level, restore_target) {
             IsolationBegin::Started => Ok(Transaction::new(self, Some(restore_target))),
-            IsolationBegin::OverrideFailed(e) => Err(e),
+            IsolationBegin::OverrideFailed(e) => {
+                self.note_failure(&e);
+                Err(e)
+            }
             IsolationBegin::AutoCommitFailed(e) => {
                 self.mark_unusable();
                 Err(e)
@@ -575,16 +584,33 @@ mod tests {
     }
 
     #[test]
-    fn failed_isolation_override_leaves_standalone_connection_usable() {
+    fn isolation_override_on_a_lost_connection_retires_it() {
         let mock = Arc::new(MockCliDriver::new());
-        mock.push_isolation_error(Error::new(ErrorCode::Connection, "override failed"));
+        let mut lost = Error::new(ErrorCode::Unknown, "statement completion unknown");
+        lost.sqlstate = "40003".into();
+        mock.push_isolation_error(lost);
         let conn = connect(&mock);
 
         let error = conn
             .begin_with_isolation(crate::Isolation::UncommittedRead)
             .unwrap_err();
 
-        assert_eq!(error.code, ErrorCode::Connection);
+        assert_eq!(error.sqlstate, "40003");
+        assert!(conn.is_unusable());
+    }
+
+    #[test]
+    fn failed_isolation_override_leaves_standalone_connection_usable() {
+        let mock = Arc::new(MockCliDriver::new());
+        // A rejected override, not a lost connection (which retires it).
+        mock.push_isolation_error(Error::new(ErrorCode::Unknown, "override failed"));
+        let conn = connect(&mock);
+
+        let error = conn
+            .begin_with_isolation(crate::Isolation::UncommittedRead)
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Unknown);
         assert_eq!(mock.auto_commit_calls(), Vec::<bool>::new());
         assert_eq!(conn.execute("UPDATE t SET x = 1", ()).unwrap(), 0);
     }

@@ -30,6 +30,10 @@ use crate::lob::BindParam;
 use crate::value::Value;
 use crate::Isolation;
 
+/// SQLSTATE 40003: the connection was lost, so the statement's completion is
+/// unknown. IBM documents it as a communication-link failure.
+const COMPLETION_UNKNOWN: &str = "40003";
+
 /// A single logical Db2 connection over the CLI seam.
 ///
 /// Owns the physical connection handle and disconnects on drop. Move-only.
@@ -105,7 +109,7 @@ impl Connection {
         if self.unusable.get() {
             return Err(Error::new(
                 ErrorCode::InvalidState,
-                "connection unusable after failed isolation/autocommit transition",
+                "connection unusable after a failed session transition or a lost connection",
             ));
         }
         Ok(())
@@ -120,9 +124,21 @@ impl Connection {
         self.unusable.set(true);
     }
 
-    /// Whether a failed session transition left this connection unsafe to pool.
+    /// Whether a failed session transition or a lost connection left this
+    /// connection unsafe to pool.
     pub(crate) fn is_unusable(&self) -> bool {
         self.unusable.get()
+    }
+
+    /// Retires this connection after a driver failure that reports it lost —
+    /// a connection-class error, or SQLSTATE 40003 (statement completion
+    /// unknown, as after the CLI `ReceiveTimeout`) — so the pool discards it
+    /// even if the caller handles the error. The error's classification, and
+    /// with it whether the statement may be retried, is unchanged.
+    pub(crate) fn note_failure(&self, error: &Error) {
+        if error.code == ErrorCode::Connection || error.sqlstate == COMPLETION_UNKNOWN {
+            self.mark_unusable();
+        }
     }
 
     /// Prepares `sql` (or leases it from the statement cache), returning a
@@ -132,7 +148,11 @@ impl Connection {
         let lease = self
             .cache
             .borrow_mut()
-            .acquire(self.driver.as_ref(), self.handle, sql)?;
+            .acquire(self.driver.as_ref(), self.handle, sql)
+            .map_err(|e| {
+                self.note_failure(&e);
+                e
+            })?;
         Ok(Statement {
             conn: self,
             handle: lease.handle(),
@@ -146,8 +166,8 @@ impl Connection {
         self.ensure_usable()?;
         let stmt = self.prepare_and_bind(sql, params.into_params())?;
         let result = self.driver.execute(stmt.handle());
-        if result.is_err() {
-            stmt.poison();
+        if let Err(e) = &result {
+            stmt.fail(e);
         }
         result
     }
@@ -161,8 +181,8 @@ impl Connection {
         let result = self
             .driver
             .execute_streaming(stmt.handle(), &values, sources);
-        if result.is_err() {
-            stmt.poison();
+        if let Err(e) = &result {
+            stmt.fail(e);
         }
         result
     }
@@ -179,7 +199,7 @@ impl Connection {
         {
             Ok(columns) => columns,
             Err(e) => {
-                stmt.poison();
+                stmt.fail(&e);
                 return Err(e);
             }
         };
@@ -202,7 +222,7 @@ impl Connection {
         {
             Ok(columns) => columns,
             Err(error) => {
-                stmt.poison();
+                stmt.fail(&error);
                 return Err(error);
             }
         };
@@ -228,8 +248,8 @@ impl Connection {
         validate_batch_rows(rows)?;
         let stmt = self.prepare(sql)?;
         let result = self.driver.execute_batch(stmt.handle(), rows);
-        if result.is_err() {
-            stmt.poison();
+        if let Err(e) = &result {
+            stmt.fail(e);
         }
         result
     }
@@ -259,8 +279,13 @@ impl Connection {
         let lease = self
             .cache
             .borrow_mut()
-            .acquire(self.driver.as_ref(), self.handle, &sql)?;
+            .acquire(self.driver.as_ref(), self.handle, &sql)
+            .map_err(|e| {
+                self.note_failure(&e);
+                e
+            })?;
         if let Err(e) = self.driver.bind_params(lease.handle(), &values) {
+            self.note_failure(&e);
             lease.poison();
             self.release_stmt(lease);
             return Err(e);
@@ -288,6 +313,7 @@ impl Connection {
         {
             Ok(columns) => Ok((lease, columns)),
             Err(e) => {
+                self.note_failure(&e);
                 lease.poison();
                 self.release_stmt(lease);
                 Err(e)
@@ -309,7 +335,10 @@ impl Connection {
     /// leases are finalized, cached ones reset and returned to the LRU (or
     /// dropped if poisoned). The release half of every prepare path above.
     pub(crate) fn release_stmt(&self, lease: StmtLease) {
-        self.cache.borrow_mut().release(self.driver.as_ref(), lease);
+        let cleanup = self.cache.borrow_mut().release(self.driver.as_ref(), lease);
+        if let Some(error) = cleanup {
+            self.note_failure(&error);
+        }
     }
 }
 
@@ -369,12 +398,24 @@ impl<'c> Statement<'c> {
         self.conn.driver.as_ref()
     }
 
+    /// The owning connection, for cursors that record driver failures on it.
+    pub(crate) fn connection(&self) -> &'c Connection {
+        self.conn
+    }
+
     /// Marks the leased statement possibly corrupt (driver-side failure while
     /// in use), so release drops the cache entry instead of reusing it.
     pub(crate) fn poison(&self) {
         if let Some(lease) = &self.lease {
             lease.poison();
         }
+    }
+
+    /// Poisons the statement after `error`, retiring the connection too if the
+    /// error reports it lost.
+    pub(crate) fn fail(&self, error: &Error) {
+        self.conn.note_failure(error);
+        self.poison();
     }
 
     /// Rebinds positional params and re-executes, returning rows affected. A
@@ -389,8 +430,8 @@ impl<'c> Statement<'c> {
             .driver
             .bind_params(self.handle, &values)
             .and_then(|_| self.conn.driver.execute(self.handle));
-        if result.is_err() {
-            self.poison();
+        if let Err(e) = &result {
+            self.fail(e);
         }
         result
     }
@@ -408,7 +449,7 @@ impl<'c> Statement<'c> {
         {
             Ok(columns) => columns,
             Err(e) => {
-                self.poison();
+                self.fail(&e);
                 return Err(e);
             }
         };
@@ -471,6 +512,71 @@ mod tests {
     /// inspect the mock after driving the connection.
     fn connect(mock: &Arc<MockCliDriver>) -> Connection {
         Connection::open(mock.clone(), &params()).unwrap()
+    }
+
+    fn completion_unknown() -> Error {
+        let mut e = Error::new(ErrorCode::Unknown, "statement completion unknown");
+        e.sqlstate = "40003".into();
+        e.native_error = -99999;
+        e
+    }
+
+    #[test]
+    fn completion_unknown_retires_the_connection_without_reclassifying() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_execute_error(completion_unknown());
+        let conn = connect(&mock);
+
+        let err = conn.execute("UPDATE t SET x = 1", ()).unwrap_err();
+        assert_eq!(
+            (err.code, err.sqlstate.as_str(), err.retriable),
+            (ErrorCode::Unknown, "40003", false)
+        );
+        assert!(conn.is_unusable());
+        let next = conn.execute("UPDATE t SET x = 1", ()).unwrap_err();
+        assert_eq!(next.code, ErrorCode::InvalidState);
+    }
+
+    #[test]
+    fn fetch_failure_retires_the_connection_while_the_cursor_is_alive() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(users_grid());
+        mock.fail_fetch_block_on_call(1, completion_unknown());
+        let conn = connect(&mock);
+
+        let mut rs = conn.query("SELECT id, name FROM u", ()).unwrap();
+        assert!(rs.next().is_err());
+
+        let next = conn.execute("UPDATE t SET x = 1", ()).unwrap_err();
+        assert_eq!(next.code, ErrorCode::InvalidState); // never reached the driver
+        drop(rs);
+    }
+
+    #[test]
+    fn streaming_fetch_failure_retires_the_connection_while_the_cursor_is_alive() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(users_grid());
+        mock.fail_fetch_next_on_call(1, completion_unknown());
+        let conn = connect(&mock);
+
+        let mut cursor = conn.query_streaming("SELECT id, name FROM u", ()).unwrap();
+        assert!(cursor.next().is_err());
+
+        let next = conn.execute("UPDATE t SET x = 1", ()).unwrap_err();
+        assert_eq!(next.code, ErrorCode::InvalidState); // never reached the driver
+        drop(cursor);
+    }
+
+    #[test]
+    fn other_statement_failures_keep_the_connection() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut duplicate = Error::new(ErrorCode::Constraint, "duplicate key");
+        duplicate.sqlstate = "23505".into();
+        mock.push_execute_error(duplicate);
+        let conn = connect(&mock);
+
+        assert!(conn.execute("INSERT INTO t VALUES (1)", ()).is_err());
+        assert!(!conn.is_unusable());
     }
 
     #[test]
@@ -1012,7 +1118,8 @@ mod tests {
         let mock = Arc::new(MockCliDriver::new());
         let conn = connect_cached(&mock, 8);
         conn.execute("UPDATE t SET x = ?", (1,)).unwrap(); // miss: prepare #1
-        mock.push_execute_error(Error::new(ErrorCode::Connection, "broken"));
+                                                           // Not connection-class: that would retire the connection itself.
+        mock.push_execute_error(Error::new(ErrorCode::Unknown, "broken"));
         conn.execute("UPDATE t SET x = ?", (2,)).unwrap_err(); // hit, exec fails
         assert_eq!(mock.finalize_calls(), 1); // poisoned entry dropped
         conn.execute("UPDATE t SET x = ?", (3,)).unwrap(); // miss again
@@ -1024,7 +1131,8 @@ mod tests {
         let mock = Arc::new(MockCliDriver::new());
         mock.push_result_set(users_grid());
         mock.push_result_set(users_grid());
-        mock.fail_fetch_block_on_call(1, Error::new(ErrorCode::Connection, "boom"));
+        // Not connection-class: that would retire the connection itself.
+        mock.fail_fetch_block_on_call(1, Error::new(ErrorCode::Unknown, "boom"));
         let conn = connect_cached(&mock, 8);
         {
             let mut rs = conn.query("SELECT id, name FROM u", ()).unwrap();

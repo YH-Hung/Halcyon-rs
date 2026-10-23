@@ -61,4 +61,11 @@ fn main() {
     let _ = (record.id, record.name);
 }
 RUST
+# Cargo before 1.84 ignores rust-version when resolving, so on an older
+# toolchain the consumer pins tokio as the README tells Rust 1.75 users to.
+rustc_minor="$(rustc --version | cut -d' ' -f2 | cut -d. -f2)"
+if [ "$rustc_minor" -lt 85 ]; then
+  cargo generate-lockfile --manifest-path "$consumer_dir/Cargo.toml"
+  cargo update --manifest-path "$consumer_dir/Cargo.toml" -p tokio --precise 1.53.3
+fi
 cargo check --manifest-path "$consumer_dir/Cargo.toml"

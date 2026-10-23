@@ -2,8 +2,8 @@
 
 use std::fmt;
 
-use crate::core::connection::Statement;
-use crate::driver::{CliDriver, GetDataChunk, StatementHandle};
+use crate::core::connection::{Connection, Statement};
+use crate::driver::{GetDataChunk, StatementHandle};
 use crate::error::{Error, ErrorCode, Result};
 use crate::lob::{StreamingAccess, StreamingRow};
 use crate::value::Value;
@@ -35,17 +35,17 @@ impl StreamingState {
         self.error.clone()
     }
 
-    pub(crate) fn next(&mut self, driver: &dyn CliDriver) -> Result<bool> {
+    pub(crate) fn next(&mut self, conn: &Connection) -> Result<bool> {
         if self.done {
             return Ok(false);
         }
-        match driver.fetch_next(self.stmt) {
+        match conn.driver_ref().fetch_next(self.stmt) {
             Ok(has_row) => {
                 self.done = !has_row;
                 self.last_column = None;
                 Ok(has_row)
             }
-            Err(error) => self.driver_error(error),
+            Err(error) => self.driver_error(conn, error),
         }
     }
 
@@ -69,11 +69,11 @@ impl StreamingState {
         Ok(())
     }
 
-    pub(crate) fn get(&mut self, driver: &dyn CliDriver, column: usize) -> Result<Value> {
+    pub(crate) fn get(&mut self, conn: &Connection, column: usize) -> Result<Value> {
         self.access_column(column)?;
-        match driver.get_value(self.stmt, column) {
+        match conn.driver_ref().get_value(self.stmt, column) {
             Ok(value) => Ok(value),
-            Err(error) => self.driver_error(error),
+            Err(error) => self.driver_error(conn, error),
         }
     }
 
@@ -83,21 +83,24 @@ impl StreamingState {
 
     pub(crate) fn read_lob(
         &mut self,
-        driver: &dyn CliDriver,
+        conn: &Connection,
         column: usize,
         buffer: &mut [u8],
     ) -> Result<GetDataChunk> {
-        match driver.get_data_chunk(self.stmt, column, buffer) {
+        match conn.driver_ref().get_data_chunk(self.stmt, column, buffer) {
             Ok(chunk) if chunk.bytes <= buffer.len() => Ok(chunk),
-            Ok(_) => self.driver_error(Error::new(
-                ErrorCode::Mapping,
-                "driver returned an oversized LOB chunk",
-            )),
-            Err(error) => self.driver_error(error),
+            Ok(_) => self.driver_error(
+                conn,
+                Error::new(ErrorCode::Mapping, "driver returned an oversized LOB chunk"),
+            ),
+            Err(error) => self.driver_error(conn, error),
         }
     }
 
-    fn driver_error<T>(&mut self, error: Error) -> Result<T> {
+    /// Records a driver failure on the cursor, and on its connection if the
+    /// failure reports the connection lost.
+    fn driver_error<T>(&mut self, conn: &Connection, error: Error) -> Result<T> {
+        conn.note_failure(&error);
         self.done = true;
         if self.error.is_none() {
             self.error = Some(error.clone());
@@ -128,8 +131,7 @@ impl<'c> StreamingResultSet<'c> {
 
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<StreamingRow<'_>>> {
-        let driver = self.statement.driver_ref();
-        if self.state.next(driver)? {
+        if self.state.next(self.statement.connection())? {
             Ok(Some(StreamingRow::new(self)))
         } else {
             Ok(None)
@@ -143,8 +145,7 @@ impl StreamingAccess for StreamingResultSet<'_> {
     }
 
     fn streaming_get(&mut self, column: usize) -> Result<Value> {
-        let driver = self.statement.driver_ref();
-        self.state.get(driver, column)
+        self.state.get(self.statement.connection(), column)
     }
 
     fn streaming_start_lob(&mut self, column: usize) -> Result<()> {
@@ -152,8 +153,8 @@ impl StreamingAccess for StreamingResultSet<'_> {
     }
 
     fn streaming_read_lob(&mut self, column: usize, buffer: &mut [u8]) -> Result<GetDataChunk> {
-        let driver = self.statement.driver_ref();
-        self.state.read_lob(driver, column, buffer)
+        self.state
+            .read_lob(self.statement.connection(), column, buffer)
     }
 }
 
