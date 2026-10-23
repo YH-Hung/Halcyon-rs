@@ -149,6 +149,7 @@ pub const SQL_ROLLBACK: SQLSMALLINT = 1;
 
 pub const SQL_CLOSE: SQLUSMALLINT = 0;
 pub const SQL_UNBIND: SQLUSMALLINT = 2;
+pub const SQL_RESET_PARAMS: SQLUSMALLINT = 3;
 
 extern "C" {
     pub fn SQLAllocHandle(

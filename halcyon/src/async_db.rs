@@ -214,7 +214,7 @@ impl AsyncDatabase {
 impl AsyncDatabase {
     /// Opens an `AsyncDatabase` over a fresh real
     /// [`Db2CliDriver`](crate::driver::Db2CliDriver) built from `dsn`, with a
-    /// default [`PoolConfig`] — the async analog of [`Database::connect`].
+    /// default [`PoolConfig`](crate::PoolConfig) — the async analog of [`Database::connect`].
     /// Pool warmup (network connect) runs on a blocking thread so the caller
     /// task is not stalled.
     pub async fn connect(dsn: &str) -> Result<Self> {
@@ -224,7 +224,7 @@ impl AsyncDatabase {
         run_blocking_raw(move || Database::connect(&dsn).map(AsyncDatabase::new)).await
     }
 
-    /// Like [`connect`](Self::connect) but with an explicit [`PoolConfig`].
+    /// Like [`connect`](Self::connect) but with an explicit [`PoolConfig`](crate::PoolConfig).
     pub async fn connect_with(dsn: &str, config: crate::pool::PoolConfig) -> Result<Self> {
         let dsn = dsn.to_string();
         run_blocking_raw(move || Database::connect_with(&dsn, config).map(AsyncDatabase::new)).await

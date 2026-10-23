@@ -9,19 +9,20 @@ version, so they must exist on the registry first.
 All of the following must pass on the release commit:
 
 ```bash
+bash ci/check-release.sh
 cargo fmt --all --check
 cargo clippy --all-targets --features tokio,observability,stress -- -D warnings
 cargo clippy -p halcyon --no-default-features --features derive,tokio,observability --all-targets -- -D warnings
 
 # Pure-Rust suite (must pass with no clidriver installed)
 cargo test -p halcyon --no-default-features
-cargo test -p halcyon --no-default-features --features derive,tokio,observability,stress
+cargo test -p halcyon --no-default-features --features derive,tokio,observability,stress -- --test-threads=1
 
 # Full suite (needs clidriver; x86_64 only)
 cargo test
 
 # Concurrency gate
-RUSTFLAGS="--cfg loom" cargo test -p halcyon --no-default-features --release --lib pool::loom
+RUSTFLAGS="--cfg loom" cargo test -p halcyon --no-default-features --release --lib pool::loom_tests
 # TSan stress (nightly, x86_64): see .github/workflows/ci.yml `stress-tsan`
 
 # Live Db2 round-trip (Linux x86_64 on the Db2 network; see README)
@@ -32,8 +33,12 @@ DOCS_RS=1 cargo doc -p halcyon-sys --no-deps
 cargo doc -p halcyon --no-default-features --features derive,tokio,observability --no-deps
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same gates; a green run on `main`
-covers everything except the manual loom/live steps if those jobs are skipped.
+CI (`.github/workflows/ci.yml`) runs the feature, MSRV, native, concurrency,
+live, documentation, package-content, and downstream-consumer gates. Confirm
+that loom and live Db2 actually ran on the release commit. Driverless checks
+using `DOCS_RS=1` are compile/docs evidence, not native runtime verification.
+The main crate must still pass registry package verification after its two
+dependencies are published.
 
 ## 2. Version bump
 

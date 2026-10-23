@@ -600,7 +600,8 @@ impl fmt::Debug for StreamingQueryResult {
 /// [`Database::begin`]. Autocommit is off for its lifetime; commit/rollback end
 /// it and restore autocommit. An uncommitted transaction rolls back on drop, and
 /// a poisoned terminal op discards the lease. The Rust analog of the C++
-/// `ScopedTransaction`.
+/// `ScopedTransaction`. Data operations after commit or rollback return
+/// `ErrorCode::InvalidState`.
 pub struct ScopedTransaction {
     lease: PooledConnection,
     active: Cell<bool>,
@@ -633,14 +634,23 @@ impl ScopedTransaction {
         self.poisoned.get()
     }
 
+    fn ensure_active(&self) -> Result<()> {
+        if !self.active.get() {
+            return Err(Error::new(ErrorCode::InvalidState, "transaction has ended"));
+        }
+        Ok(())
+    }
+
     /// Executes a non-query statement within the unit of work.
     pub fn execute(&self, sql: &str, params: impl IntoParams) -> Result<i64> {
+        self.ensure_active()?;
         let params = params.into_params();
         crate::obs::instrument_execute(sql, move || self.note(self.lease.execute(sql, params)))
     }
 
     /// Executes positional values and LOB streams once in this transaction.
     pub fn execute_with_lobs(&self, sql: &str, params: Vec<BindParam<'_>>) -> Result<i64> {
+        self.ensure_active()?;
         crate::obs::instrument_execute(sql, || self.note(self.lease.execute_with_lobs(sql, params)))
     }
 
@@ -650,6 +660,7 @@ impl ScopedTransaction {
     /// discards the leased connection on transaction drop, exactly as the pooled
     /// [`QueryResult`] does outside a transaction.
     pub fn query(&self, sql: &str, params: impl IntoParams) -> Result<TxCursor<'_>> {
+        self.ensure_active()?;
         let params = params.into_params();
         crate::obs::instrument_query(sql, move || {
             let rows = self.note(self.lease.query(sql, params))?;
@@ -667,6 +678,7 @@ impl ScopedTransaction {
         sql: &str,
         params: impl IntoParams,
     ) -> Result<TxStreamingCursor<'_>> {
+        self.ensure_active()?;
         let params = params.into_params();
         crate::obs::instrument_query(sql, move || {
             let rows = self.note(self.lease.query_streaming(sql, params))?;
@@ -679,12 +691,14 @@ impl ScopedTransaction {
 
     /// Runs a query and maps every row into `T`.
     pub fn query_as<T: FromRow>(&self, sql: &str, params: impl IntoParams) -> Result<Vec<T>> {
+        self.ensure_active()?;
         let params = params.into_params();
         crate::obs::instrument_query(sql, move || self.note(self.lease.query_as(sql, params)))
     }
 
     /// Batch insert within the unit of work.
     pub fn execute_batch(&self, sql: &str, rows: &[Vec<Value>]) -> Result<i64> {
+        self.ensure_active()?;
         crate::obs::instrument_execute(sql, || self.note(self.lease.execute_batch(sql, rows)))
     }
 
@@ -1307,6 +1321,59 @@ mod tests {
         // The dead lease was discarded and the retry connected anew.
         assert_eq!(mock.connect_calls(), 2); // warmup + reconnect
         assert_eq!(mock.disconnect_calls(), 1); // the broken one
+    }
+
+    #[test]
+    fn commented_mutation_is_never_retried() {
+        let mock = Arc::new(MockCliDriver::new());
+        let db = open(&mock);
+        mock.push_execute_error(retriable(ErrorCode::Connection, "response lost"));
+        let sql = "SELECT /* ' */ * FROM FINAL TABLE (INSERT INTO t VALUES (1))";
+        assert!(db.execute(sql, ()).is_err());
+        assert_eq!(mock.prepared_sql(), vec![sql]);
+    }
+
+    #[test]
+    fn ended_scoped_transaction_rejects_every_data_operation() {
+        for commit in [false, true] {
+            let mock = Arc::new(MockCliDriver::new());
+            let db = open(&mock);
+            let mut tx = db.begin().unwrap();
+            if commit {
+                tx.commit().unwrap();
+            } else {
+                tx.rollback().unwrap();
+            }
+            assert_eq!(
+                tx.execute("INSERT INTO t VALUES (1)", ()).unwrap_err().code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(
+                tx.execute_with_lobs("INSERT INTO t VALUES (1)", vec![])
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(
+                tx.execute_batch("INSERT INTO t VALUES (?)", &[vec![Value::Int(1)]])
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(
+                tx.query("SELECT 1", ()).unwrap_err().code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(
+                tx.query_streaming("SELECT 1", ()).unwrap_err().code,
+                ErrorCode::InvalidState
+            );
+            assert_eq!(
+                tx.query_as::<(i64,)>("SELECT 1", ()).unwrap_err().code,
+                ErrorCode::InvalidState
+            );
+            assert!(mock.prepared_sql().is_empty());
+        }
     }
 
     #[test]

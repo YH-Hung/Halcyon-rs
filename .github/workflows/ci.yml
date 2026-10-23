@@ -60,6 +60,20 @@ jobs:
           cargo test -p halcyon --no-default-features --features observability,tokio,derive -- --test-threads=1
           cargo test -p halcyon-derive
 
+  release-artifacts:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        toolchain: [stable, "1.75.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Docs, packages, and downstream consumer
+        run: bash ci/check-release.sh
+
   # ---------------------------------------------------------------------------
   # Compile-fail (trybuild) tests for #[derive(FromRow)]. Pinned toolchain: the
   # .stderr snapshots are rustc-version-specific, so this is the one job that
@@ -91,7 +105,8 @@ jobs:
       - name: Build + test on MSRV (pure-Rust)
         run: |
           cargo build -p halcyon --no-default-features --features derive
-          cargo test -p halcyon --no-default-features --features derive
+          cargo test -p halcyon --no-default-features --features derive,tokio,observability,stress -- --test-threads=1
+          DOCS_RS=1 cargo check --workspace --all-features --all-targets
 
   # ---------------------------------------------------------------------------
   # Concurrency stress scenarios on stable (fast feedback). Pure-Rust: the fake
@@ -164,11 +179,13 @@ jobs:
       - name: Set up Db2 CLI driver
         uses: ./.github/actions/setup-db2-clidriver
       - name: Clippy (all features)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
       # PR-gated: default features omit `tokio`, so compile the db2+tokio combo
       # here (connect/connect_with + live_tests). live-db2 only runs on main.
       - name: Clippy (db2 + tokio)
         run: cargo clippy --features tokio --all-targets -- -D warnings
+      - name: Compile consumer quick start
+        run: cargo check -p halcyon --example quick_start
       - name: Build
         run: cargo build
       - name: Test (unit + integration-skipped)

@@ -19,7 +19,8 @@ inputs:
       this pin makes the build reproducible and tamper-evident: when IBM rotates
       the file the checksum check fails loudly — review the new driver, then
       update this value (a fresh checksum also rotates the cache key).
-    default: 2c10efc71a638cd6b07a5b977b6dbe8aa0408e1dca825bea0d2b63318c9bba2f
+    # IBM 12.1.4 Linux x86_64 archive, inspected 2026-10-23.
+    default: 77b754d19be2cd5c55f6feb8bd951c2b17aa6646289944855612c5a2ac555f55
   macos_url:
     description: macOS (x86_64) clidriver tarball URL.
     default: https://public.dhe.ibm.com/ibmdl/export/pub/software/data/db2/drivers/odbc_cli/macos64_odbc_cli.tar.gz
@@ -91,8 +92,10 @@ runs:
           sleep $((attempt * 5))
         done
         if [ "$RUNNER_OS" = "macOS" ]; then
+          shasum -a 256 /tmp/clidriver.tar.gz
           echo "${{ steps.src.outputs.sha256 }}  /tmp/clidriver.tar.gz" | shasum -a 256 -c -
         else
+          sha256sum /tmp/clidriver.tar.gz
           echo "${{ steps.src.outputs.sha256 }}  /tmp/clidriver.tar.gz" | sha256sum -c -
         fi
         tar -xzf /tmp/clidriver.tar.gz -C third_party

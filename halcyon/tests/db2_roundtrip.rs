@@ -836,3 +836,97 @@ fn aborted_streaming_execute_allows_reuse_of_same_statement_handle() {
     finalize.expect("finalize SQLCancel proof statement");
     drop_table.expect("drop SQLCancel proof table");
 }
+
+/// Bindings survive execution in CLI; all reuse paths must explicitly clear
+/// omitted positions before the old Rust backing allocations can be released.
+#[test]
+fn live_rebinding_rejects_missing_parameters() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("HALCYON_TEST_DSN not set; skipping missing-parameter reuse regression");
+        return;
+    };
+    let (driver, conn) = open(&dsn);
+    let _ = conn.execute("DROP TABLE halcyon_rebind_rs", ());
+    conn.execute("CREATE TABLE halcyon_rebind_rs(a INT, b INT)", ())
+        .expect("create rebind table");
+    let sql = "INSERT INTO halcyon_rebind_rs VALUES (?, ?)";
+    for initial in ["scalar", "batch", "streaming"] {
+        for next_streaming in [false, true] {
+            let stmt = driver.prepare(conn.handle(), sql).expect("prepare insert");
+            let values = [Value::Int(1), Value::Int(2)];
+            match initial {
+                "batch" => {
+                    driver
+                        .execute_batch(stmt, &[values.to_vec()])
+                        .expect("initial batch");
+                }
+                "streaming" => {
+                    driver
+                        .execute_streaming(stmt, &values, vec![])
+                        .expect("initial streaming execute");
+                }
+                _ => {
+                    driver.bind_params(stmt, &values).expect("initial bind");
+                    driver.execute(stmt).expect("initial scalar execute");
+                }
+            }
+            let missing = [Value::Int(3)];
+            let result = if next_streaming {
+                driver.execute_streaming(stmt, &missing, vec![])
+            } else {
+                driver
+                    .bind_params(stmt, &missing)
+                    .and_then(|_| driver.execute(stmt))
+            };
+            assert!(result.is_err(), "{initial} reuse accepted a missing value");
+            driver.finalize(stmt).expect("finalize rejected statement");
+        }
+    }
+    let rows: Vec<(i64,)> = conn
+        .query_as("SELECT COUNT(*) FROM halcyon_rebind_rs", ())
+        .expect("count accepted inserts");
+    assert_eq!(rows, vec![(6,)]);
+    conn.execute("DROP TABLE halcyon_rebind_rs", ())
+        .expect("drop rebind table");
+}
+
+#[test]
+fn live_clob_embedded_nuls_survive_chunk_boundaries() {
+    let Some(dsn) = test_dsn() else {
+        eprintln!("HALCYON_TEST_DSN not set; skipping embedded-NUL CLOB regression");
+        return;
+    };
+    let (_, conn) = open(&dsn);
+    let _ = conn.execute("DROP TABLE halcyon_clob_nul_rs", ());
+    conn.execute("CREATE TABLE halcyon_clob_nul_rs(body CLOB(64K))", ())
+        .expect("create CLOB table");
+    // First NUL is internal to a truncated chunk; the second is the final
+    // data byte of that chunk. Later chunks contain UTF-8 and a trailing NUL.
+    let text = format!(
+        "{}\0{}\0{}\0",
+        "a".repeat(100),
+        "b".repeat(3993),
+        "é漢".repeat(1000)
+    );
+    let mut input = Cursor::new(text.as_bytes());
+    conn.execute_with_lobs(
+        "INSERT INTO halcyon_clob_nul_rs VALUES (?)",
+        vec![BindParam::Lob(
+            lob_reader(&mut input, Some(text.len() as u64)).as_clob(),
+        )],
+    )
+    .expect("insert CLOB with embedded NULs");
+    let values: Vec<(String,)> = conn
+        .query_as("SELECT body FROM halcyon_clob_nul_rs", ())
+        .expect("materialize ordinary CLOB query");
+    assert_eq!(values, vec![(text.clone(),)]);
+    {
+        let mut rows = conn
+            .query_streaming("SELECT body FROM halcyon_clob_nul_rs", ())
+            .expect("stream CLOB row");
+        let mut row = rows.next().expect("fetch CLOB").expect("CLOB row");
+        assert_eq!(row.get::<String>(0).expect("scalar CLOB"), text);
+    }
+    conn.execute("DROP TABLE halcyon_clob_nul_rs", ())
+        .expect("drop CLOB table");
+}
