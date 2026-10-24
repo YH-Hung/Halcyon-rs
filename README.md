@@ -145,7 +145,7 @@ TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --no-default-feature
 
 ### Continuous integration
 
-[.github/workflows/ci.yml](.github/workflows/ci.yml) runs `fmt`, `clippy`, the pure-Rust feature matrix, the Rust 1.75 MSRV lane, Db2-linked Linux/macOS builds, deterministic stress, ThreadSanitizer stress, loom models, and derive UI tests. Its `live-db2` job is configured to stand up Dockerized Db2 and run the DSN-gated sync and async round-trips on pushes to `main` and manual dispatch. Publication still requires the release-commit matrix in [docs/RELEASING.md](docs/RELEASING.md), rather than assuming that configured jobs or skipped tests ran live assertions.
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs `fmt`, `clippy`, the pure-Rust feature matrix, the Rust 1.75 MSRV lane, Db2-linked Linux/macOS builds, deterministic stress, ThreadSanitizer stress, loom models, and derive UI tests. Its `live-db2` job is configured to stand up Dockerized Db2 and run the DSN-gated sync and async round-trips on every pull request to `main`, pushes to `main` and release tags, and manual dispatch. Publication still requires the release-commit matrix in [docs/RELEASING.md](docs/RELEASING.md), rather than assuming that configured jobs or skipped tests ran live assertions.
 
 ## Feature flags
 
