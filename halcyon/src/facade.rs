@@ -193,7 +193,10 @@ impl Database {
                 savepoints: SavepointState::new(),
                 conn_broken: Cell::new(false),
             }),
-            IsolationBegin::OverrideFailed(e) => Err(e),
+            IsolationBegin::OverrideFailed(e) => {
+                lease.note_failure(&e);
+                Err(e)
+            }
             IsolationBegin::AutoCommitFailed(e) => {
                 lease.mark_broken();
                 Err(e)
@@ -456,6 +459,7 @@ impl QueryResult {
                 }
                 Err(e) => {
                     self.done = true;
+                    self.lease.note_failure(&e);
                     if self.error.is_none() {
                         self.error = Some(e.clone());
                     }
@@ -541,8 +545,7 @@ impl StreamingQueryResult {
 
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<StreamingRow<'_>>> {
-        let driver = self.lease.driver_ref();
-        if self.state.next(driver)? {
+        if self.state.next(&self.lease)? {
             Ok(Some(StreamingRow::new(self)))
         } else {
             Ok(None)
@@ -556,8 +559,7 @@ impl StreamingAccess for StreamingQueryResult {
     }
 
     fn streaming_get(&mut self, column: usize) -> Result<Value> {
-        let driver = self.lease.driver_ref();
-        self.state.get(driver, column)
+        self.state.get(&self.lease, column)
     }
 
     fn streaming_start_lob(&mut self, column: usize) -> Result<()> {
@@ -565,8 +567,7 @@ impl StreamingAccess for StreamingQueryResult {
     }
 
     fn streaming_read_lob(&mut self, column: usize, buffer: &mut [u8]) -> Result<GetDataChunk> {
-        let driver = self.lease.driver_ref();
-        self.state.read_lob(driver, column, buffer)
+        self.state.read_lob(&self.lease, column, buffer)
     }
 }
 
@@ -1306,6 +1307,84 @@ mod tests {
         assert_eq!(db.pool().idle_count(), 0);
         assert_eq!(db.pool().active_count(), 0);
         assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    fn completion_unknown(code: ErrorCode, native_error: i32) -> Error {
+        let mut e = Error::new(code, "statement completion unknown");
+        e.sqlstate = "40003".into();
+        e.native_error = native_error;
+        e.retriable = code == ErrorCode::Transient;
+        e
+    }
+
+    #[test]
+    fn isolation_override_on_a_lost_connection_discards_it() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_isolation_error(completion_unknown(ErrorCode::Unknown, -99999));
+        let db = open(&mock);
+
+        let error = db
+            .begin_with_isolation(Isolation::UncommittedRead)
+            .unwrap_err();
+
+        assert_eq!(error.sqlstate, "40003");
+        assert_eq!(db.pool().total_count(), 0);
+    }
+
+    #[test]
+    fn completion_unknown_while_closing_a_cursor_discards_the_connection() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(7)]]));
+        mock.push_close_cursor_error(completion_unknown(ErrorCode::Unknown, -99999));
+        let db = Database::open(mock.clone(), params(), cached_config()).unwrap();
+
+        // Releasing the cached statement resets its cursor, which fails.
+        let rows: Vec<(i64,)> = db.query_as("SELECT id FROM t", ()).unwrap();
+
+        assert_eq!(rows, vec![(7,)]);
+        assert_eq!(db.pool().total_count(), 0);
+    }
+
+    #[test]
+    fn completion_unknown_write_runs_once_and_discards_the_connection() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_execute_error(completion_unknown(ErrorCode::Unknown, -99999));
+        let db = open(&mock);
+
+        let err = db.execute("UPDATE t SET x = 1", ()).unwrap_err();
+
+        assert_eq!((err.code, err.retriable), (ErrorCode::Unknown, false));
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[test]
+    fn completion_unknown_during_fetch_discards_the_connection() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(1)]]));
+        mock.fail_fetch_block_on_call(1, completion_unknown(ErrorCode::Unknown, -99999));
+        let db = open(&mock);
+
+        let result: Result<Vec<(i64,)>> = db.query_as("SELECT id FROM t", ());
+
+        assert_eq!(result.unwrap_err().sqlstate, "40003");
+        assert_eq!(db.pool().total_count(), 0);
+    }
+
+    #[test]
+    fn transient_completion_unknown_read_retries_on_a_fresh_connection() {
+        let mock = Arc::new(MockCliDriver::new());
+        // Native -30081 classifies as a retriable Transient; the retry must not
+        // reuse the lost connection.
+        mock.push_execute_error(completion_unknown(ErrorCode::Transient, -30081));
+        mock.push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(42)]]));
+        let db = open(&mock);
+
+        let rows: Vec<(i64,)> = db.query_as("SELECT id FROM t", ()).unwrap();
+
+        assert_eq!(rows, vec![(42,)]);
+        assert_eq!(mock.connect_calls(), 2); // warmup + replacement
+        assert_eq!(mock.disconnect_calls(), 1); // the lost one
     }
 
     #[test]

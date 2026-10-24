@@ -11,7 +11,7 @@
 //!
 //! The facade provides `execute`, materialized `query_as`, `execute_batch`,
 //! owned-LOB `execute_with_lobs`, and closure-scoped `query_streaming`,
-//! `transaction`, and `transaction_with_isolation`. Streaming cursors and
+//! `transaction`, `transaction_with_isolation`, and `with_connection`. Streaming cursors and
 //! transactions remain wholly inside their synchronous closure on one blocking
 //! thread; no pool lease, lending row, or transaction guard crosses an await
 //! point. There are deliberately no async `begin` methods. With the
@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::core::{FromRow, IntoParams};
+use crate::core::{Connection, FromRow, IntoParams};
 use crate::error::{Error, ErrorCode, Result};
 use crate::facade::{Database, ScopedTransaction, StreamingQueryResult};
 use crate::lob::OwnedBindParam;
@@ -208,6 +208,37 @@ impl AsyncDatabase {
         let db = self.inner.clone();
         run_blocking(&self.admit, move || db.transaction_with_isolation(iso, f)).await
     }
+
+    /// Leases a pooled connection on one blocking thread and runs `f` with it —
+    /// the C++ `async_with_connection`. Use it to run several statements on one
+    /// connection, or to decide what to run only once a connection is in hand.
+    /// `f` runs once, without auto-retry. The lease is returned when `f`
+    /// returns, or discarded after a connection-class failure as on the other
+    /// single-attempt paths; it never crosses `.await`.
+    ///
+    /// Dropping the future while it waits for admission cancels it before `f`
+    /// runs. Once the blocking work has started, dropping the future does not
+    /// stop it, as with every method here: `f` still runs when the connection
+    /// arrives, so check any cancellation state of your own first.
+    pub async fn with_connection<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let db = self.inner.clone();
+        run_blocking(&self.admit, move || {
+            let mut lease = db.pool().acquire()?;
+            let result = f(&lease);
+            if result
+                .as_ref()
+                .is_err_and(|error| error.code == ErrorCode::Connection)
+            {
+                lease.mark_broken();
+            }
+            result
+        })
+        .await
+    }
 }
 
 #[cfg(feature = "db2")]
@@ -363,6 +394,7 @@ mod tests {
     use crate::retry::BackoffPolicy;
     use crate::testing::{MockCliDriver, ScriptedRows};
     use crate::value::Value;
+    use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -519,6 +551,119 @@ mod tests {
         assert_eq!(result.unwrap_err().code, ErrorCode::Connection);
         assert_eq!(db.pool().total_count(), 0);
         assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_connection_runs_statements_on_one_lease_and_returns_it() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_exec_row_count(1)
+            .push_result_set(ScriptedRows::new(["id"], vec![vec![Value::Int(7)]]));
+        let db = open(&mock);
+
+        // The mock serves a queued result set to the first execute, so query first.
+        let (updated, ids) = db
+            .with_connection(|conn| {
+                let ids: Vec<(i64,)> = conn.query_as("SELECT id FROM t", ())?;
+                let updated = conn.execute("UPDATE t SET a = 1 WHERE id = 7", ())?;
+                Ok((updated, ids))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!((updated, ids), (1, vec![(7,)]));
+        assert_eq!(mock.connect_calls(), 1);
+        assert_eq!(db.pool().idle_count(), 1);
+        assert_eq!(db.pool().active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_connection_connection_error_discards_lease() {
+        let mock = Arc::new(MockCliDriver::new());
+        mock.push_execute_error(Error::new(ErrorCode::Connection, "link down"));
+        let db = open(&mock);
+
+        let result = db
+            .with_connection(|conn| conn.execute("UPDATE t SET a = 1", ()))
+            .await;
+
+        assert_eq!(result.unwrap_err().code, ErrorCode::Connection);
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_connection_discards_a_lost_connection_the_closure_handled() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut lost = Error::new(ErrorCode::Connection, "communication link failure");
+        lost.sqlstate = "08S01".into();
+        mock.push_execute_error(lost);
+        let db = open(&mock);
+
+        db.with_connection(|conn| {
+            let _ = conn.execute("UPDATE t SET a = 1", ()); // handled, not propagated
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(db.pool().total_count(), 0);
+        assert_eq!(mock.disconnect_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_connection_discards_a_connection_lost_while_beginning() {
+        let mock = Arc::new(MockCliDriver::new());
+        let mut lost = Error::new(ErrorCode::Unknown, "statement completion unknown");
+        lost.sqlstate = "40003".into();
+        mock.push_txn_error(lost);
+        let db = open(&mock);
+
+        let result = db.with_connection(|conn| conn.begin().map(|_tx| ())).await;
+
+        assert_eq!(result.unwrap_err().sqlstate, "40003");
+        assert_eq!(db.pool().total_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_connection_dropped_while_waiting_for_admission_never_runs() {
+        let mock = Arc::new(MockCliDriver::new());
+        let config = PoolConfig { max: 1, ..config() };
+        let db = AsyncDatabase::new(Database::open(mock.clone(), params(), config).unwrap());
+        let (started, has_started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::spawn({
+            let db = db.clone();
+            async move {
+                db.with_connection(move |_conn| {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(())
+                })
+                .await
+            }
+        });
+        has_started.await.unwrap(); // the holder owns the only admission permit
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        {
+            let mut waiting = std::pin::pin!(db.with_connection({
+                let ran = ran.clone();
+                move |_conn| {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(waiting.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        } // dropped while waiting for admission
+        release.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        assert_eq!(db.pool().idle_count(), 1);
     }
 
     #[tokio::test]
@@ -903,6 +1048,22 @@ mod live_tests {
                 (3, "cy".to_string()),
             ]
         );
+
+        // Several statements on one leased connection.
+        let (inserted, total) = db
+            .with_connection(|conn| {
+                let inserted = conn.execute(
+                    "INSERT INTO halcyon_async (id, name) VALUES (?, ?)",
+                    (4, "dan"),
+                )?;
+                let (total,): (i64,) = conn
+                    .query_as("SELECT COUNT(*) FROM halcyon_async", ())?
+                    .remove(0);
+                Ok((inserted, total))
+            })
+            .await
+            .expect("with_connection");
+        assert_eq!((inserted, total), (1, 4));
 
         db.execute("DROP TABLE halcyon_async", ())
             .await

@@ -10,6 +10,43 @@ are implementation details.
 
 ## [Unreleased]
 
+### Added
+
+- `AsyncDatabase::with_connection`, the C++ `async_with_connection`: runs a
+  closure with one pooled connection on a blocking thread, discarding the lease
+  after a connection-class failure. Dropping its future while it waits for
+  admission cancels it before the closure runs.
+
+### Changed
+
+- The `tokio` feature accepts tokio `1.52` and later instead of `~1.52`, so
+  applications that need tokio 1.53 or newer can use it. This supersedes the
+  0.1.0 pin. Builds with Cargo before 1.84, including Rust 1.75, pin a
+  compatible tokio in their lockfile; the release check does so for its
+  consumer on toolchains older than Rust 1.85.
+
+### Fixed
+
+- A connection is retired as soon as a driver call on it reports the
+  connection lost: a connection-class error, or SQLSTATE `40003` (statement
+  completion unknown, as after `ReceiveTimeout`). This covers statements,
+  transaction start, cursor fetches, and cursor cleanup, even when the caller
+  handles the error, so the pool replaces the connection instead of reusing it.
+  The error's code and `retriable` flag are unchanged. A retired standalone
+  `Connection` returns `InvalidState` from later calls.
+
+### Documentation
+
+- Timeouts: `ReceiveTimeout` bounds waits on an unresponsive server; with IBM's
+  macOS ARM64 clidriver v12.1.4, adding `ConnectTimeout` disabled it, and
+  neither bounded reconnecting.
+- `PoolConfig::validate_on_acquire` is opt-in (off by default, as in C++).
+- `DEP_DB2_LIB_DIR` reaches only direct dependents of `halcyon-sys`;
+  applications set the runtime library path themselves.
+- The live suite runs from a macOS host through Docker Desktop's port proxy,
+  verified on Apple silicon with IBM's `macarm64` clidriver; the README no
+  longer says it cannot.
+
 ## [0.1.0] - Pending publication
 
 This is the complete planned initial release surface. The crates have not been

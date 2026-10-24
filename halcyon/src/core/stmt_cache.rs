@@ -20,7 +20,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use crate::driver::{CliDriver, ConnectionHandle, StatementHandle};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// One cached prepared statement.
 struct Entry {
@@ -161,10 +161,13 @@ impl StatementCache {
     /// closed and re-enter the LRU as most-recently-used — unless the reset
     /// fails, in which case the entry is dropped too (never re-serve a
     /// half-reset handle).
-    pub(crate) fn release(&mut self, driver: &dyn CliDriver, lease: StmtLease) {
+    /// Returns the `close_cursor` failure, if resetting a cached statement
+    /// failed, so the connection can judge whether it is still usable. The
+    /// cleanup itself stays best-effort either way.
+    pub(crate) fn release(&mut self, driver: &dyn CliDriver, lease: StmtLease) -> Option<Error> {
         let Some(id) = lease.entry_id else {
             let _ = driver.finalize(lease.handle);
-            return;
+            return None;
         };
         let Some(key) = self
             .entries
@@ -176,25 +179,26 @@ impl StatementCache {
             // but never leak a handle if the invariant is ever broken.
             debug_assert!(false, "released a lease for an unknown cache entry");
             let _ = driver.finalize(lease.handle);
-            return;
+            return None;
         };
         if lease.poisoned.get() {
             let e = self.entries.remove(&key).expect("key just found");
             let _ = driver.finalize(e.handle);
-            return;
+            return None;
         }
         // Best-effort cursor reset. If `close_cursor` fails the handle may be
-        // only half-reset; swallow the error but drop the entry so a bad
-        // handle is never served to a later acquire (C++ spec §7).
-        if driver.close_cursor(lease.handle).is_err() {
+        // only half-reset; drop the entry so a bad handle is never served to a
+        // later acquire (C++ spec §7), and hand the error back to the caller.
+        if let Err(error) = driver.close_cursor(lease.handle) {
             let e = self.entries.remove(&key).expect("key just found");
             let _ = driver.finalize(e.handle);
-            return;
+            return Some(error);
         }
         let e = self.entries.get_mut(&key).expect("key just found");
         e.busy = false;
         self.tick += 1;
         e.last_used = self.tick;
+        None
     }
 
     /// Finalizes every cached handle. `Connection::drop` calls this **before**

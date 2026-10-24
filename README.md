@@ -28,8 +28,8 @@ facade ─► pool ─► core ─► driver (CliDriver trait) ─► halcyon-sy
 - **Transactions** — RAII and closure transactions on `Connection` and `Database`. `ConnectionParams::isolation` sets the session default for standalone connections; pooled sessions take theirs from `PoolConfig::isolation` alone (`Database::open` discards `ConnectionParams::isolation`, even when the pool level is `None`). `begin_with_isolation` and `transaction_with_isolation` apply a per-transaction override and restore the configured level, or Cursor Stability when no level was configured.
 - **Savepoints** — `savepoint`, `savepoint_named`, and `nested` return/use RAII `Savepoint` guards. Dropping a live guard rolls back and releases it; active names are guarded case-insensitively to match Db2 identifier folding.
 - **Large objects** — single-attempt `execute_with_lobs` accepts `BindParam` values plus `lob_file`, `lob_reader`, or `lob_callback` BLOB/CLOB sources. `query_streaming` returns a lending `StreamingRow`; `LobReader` supports chunk reads, `copy_to`, `copy_to_file`, `to_vec`, and `to_string` without letting a row or pool lease escape its cursor.
-- **Pool, cache, and retry** — bounded pooling, validation/reconnect, idle/lifetime maintenance, a per-connection statement LRU, and classified read retry. Writes, batches, and streaming/LOB operations are single-attempt.
-- **Async facade** — with feature `tokio`, `AsyncDatabase` provides `execute`, `query_as`, `execute_batch`, `execute_with_lobs`, `transaction`, `transaction_with_isolation`, and closure-scoped `query_streaming`. Work runs through `spawn_blocking`; there are deliberately no async `begin` methods, and dropping a future does not cancel in-flight blocking work.
+- **Pool, cache, and retry** — bounded pooling, opt-in validation on acquire with reconnect (`PoolConfig::validate_on_acquire`, off by default as in C++), idle/lifetime maintenance, a per-connection statement LRU, and classified read retry. Writes, batches, and streaming/LOB operations are single-attempt.
+- **Async facade** — with feature `tokio`, `AsyncDatabase` provides `execute`, `query_as`, `execute_batch`, `execute_with_lobs`, `transaction`, `transaction_with_isolation`, closure-scoped `query_streaming`, and `with_connection` (the C++ `async_with_connection`) for several statements on one leased connection. Work runs through `spawn_blocking`; there are deliberately no async `begin` methods, and dropping a future does not cancel in-flight blocking work.
 - **Observability** — with feature `observability`, `tracing` spans and `metrics` instruments cover query/execute/transaction, pool, retry, reconnect, and cache paths. The structured event names exactly match the C++ catalog: `connect.ok`, `connect.fail`, `reconnect.attempt`, `reconnect.ok`, `reconnect.fail`, `pool.exhausted`, `pool.reap`, `retry.attempt`, `stmt_cache.evict`, `txn.poisoned`, `savepoint.poisoned`, and `isolation.restore_fail`; `rowset.row_warning` (a benign class-01 fetch warning's diagnostic) is Rust-only.
 
 ### Long-column block-fetch divergence
@@ -59,7 +59,7 @@ Db2 and `#[derive(FromRow)]`. Add `features = ["tokio"]` for `AsyncDatabase`.
 |---|---|---|
 | Linux x86_64 | Built and tested in CI, including live Db2 | Supported |
 | macOS x86_64 | Built and tested in CI | Supported |
-| macOS ARM64 | No native IBM driver coverage | Tested locally |
+| macOS ARM64 | Live-tested locally against Db2 in Docker Desktop; not in CI | Tested locally |
 | Windows / AIX | Deferred | No CI support guarantee |
 
 Configure the runtime loader with `LD_LIBRARY_PATH="$DB2_CLIDRIVER_ROOT/lib"`
@@ -85,6 +85,28 @@ For a complete typed query and transaction example using a temporary table, see
 [quick_start.rs](halcyon/examples/quick_start.rs). CI compiles the example;
 run it against your database with `cargo run -p halcyon --example quick_start`.
 
+## Timeouts and lost connections
+
+Halcyon sets no deadline of its own on statements, validation, or connecting;
+`PoolConfig::acquire_timeout` bounds only the wait for pool capacity. To bound
+waits on an unresponsive server, add IBM's `ReceiveTimeout=<seconds>` keyword
+to the DSN. A statement that times out fails with SQLSTATE `40003` (statement
+completion unknown). Halcyon then retires that connection, as it does after any
+connection-class failure, even one your code handles, so the pool replaces it.
+The error's classification is unchanged: the statement may have completed, so
+the failure never makes a write retriable.
+
+Observed with IBM's macOS ARM64 clidriver v12.1.4 against a paused Db2
+container, not confirmed on other drivers:
+
+- `ReceiveTimeout=5` bounded every statement path, including the
+  `validate_on_acquire` probe, at about 15 seconds.
+- Adding `ConnectTimeout=5` to the same DSN disabled that bound: every statement
+  waited until the server answered again.
+- `ReceiveTimeout` does not bound reconnecting. A reconnect after a failed
+  validation, or for a read retried after a lost connection, waits until the
+  server answers, unless the pool is full and `acquire_timeout` ends the wait.
+
 ## Build & test
 
 ```bash
@@ -97,7 +119,7 @@ cargo build -p halcyon --no-default-features
 cargo test  -p halcyon --no-default-features
 ```
 
-The clidriver `lib/` directory is embedded as an rpath in test/example binaries, so on **Linux** they run without `LD_LIBRARY_PATH`. On **macOS** the rpath is not consulted — IBM ships `libdb2.dylib` with a bare install name, and rpaths only apply to `@rpath/` names — so set `DYLD_LIBRARY_PATH` to the clidriver `lib/` directory when running binaries. Downstream consumers can read `DEP_DB2_LIB_DIR` in their own build script or set the library path at runtime.
+The clidriver `lib/` directory is embedded as an rpath in test/example binaries, so on **Linux** they run without `LD_LIBRARY_PATH`. On **macOS** the rpath is not consulted — IBM ships `libdb2.dylib` with a bare install name, and rpaths only apply to `@rpath/` names — so set `DYLD_LIBRARY_PATH` to the clidriver `lib/` directory when running binaries. That rpath reaches only this repository's binaries: `DEP_DB2_LIB_DIR` is visible only to direct dependents of `halcyon-sys`, so applications set the library path themselves, as in [Quick start](#quick-start).
 
 ### Live integration test
 
@@ -111,7 +133,7 @@ export HALCYON_TEST_DSN='DATABASE=SAMPLE;HOSTNAME=localhost;PORT=50000;PROTOCOL=
 cargo test --test db2_roundtrip -- --nocapture
 ```
 
-> On macOS + Docker Desktop the host cannot complete the Db2 DRDA handshake through the port proxy (IBM's own `db2cli` fails identically), so run the round-trip on Linux — or in a Linux container on the Db2 network — where it connects natively. CI's `live-db2` job does exactly this.
+> On macOS, run the suite from the host through Docker Desktop's port proxy, with `DYLD_LIBRARY_PATH` set as above. This was verified on Apple silicon with IBM's `macarm64` clidriver (v12.1.4) against this compose file's Db2 11.5.9.0 and against Db2 12.1.5.0. The Db2 image is linux/amd64, so Apple silicon emulates it. CI's `live-db2` job runs the same suite on Linux.
 
 ### Derive UI tests
 
@@ -150,6 +172,7 @@ TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --no-default-feature
 
 - The public **`halcyon` API is SemVer-stable**; `halcyon-sys` and `halcyon-derive` are implementation details with no stability guarantee of their own (all three crates version in lockstep). Pre-1.0, breaking changes bump the minor version.
 - **MSRV is Rust 1.75**, checked in CI. Raising it is a minor version bump, never a patch.
+- With feature `tokio`, any tokio 1.x from 1.52 works. Tokio 1.54 needs Rust 1.85, and Cargo before 1.84 ignores `rust-version` when resolving, so a Rust 1.75 build pins a compatible tokio in its lockfile: `cargo update -p tokio --precise 1.53.3`. Cargo 1.84 and later can pick one itself with `resolver.incompatible-rust-versions = "fallback"`, the default under resolver 3.
 
 ## Deferred features
 

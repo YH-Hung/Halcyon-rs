@@ -47,9 +47,11 @@ halcyon-derive = { path = "../halcyon-derive", version = "0.1.0", optional = tru
 # (for spawn_blocking); `rt-multi-thread` + `macros` are here so the gated
 # `#[tokio::test]` async unit tests build without a separate dev-dependency
 # (which would otherwise compile tokio on the pure-Rust/MSRV test lanes).
-# Tokio 1.54 raises MSRV to 1.85. Keep fresh downstream resolutions on the
-# 1.52 series, which supports our Rust 1.75 promise (including async).
-tokio = { version = "~1.52", optional = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
+# Tokio 1.54 raises its MSRV to 1.85, and Cargo before 1.84 ignores
+# rust-version when resolving: a Rust 1.75 build pins tokio below 1.54 in its
+# lockfile (see README). A caret requirement leaves newer tokio available to
+# applications that need it.
+tokio = { version = "1.52", optional = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
 # Observability facades (feature `observability`). MSRV-friendly: tracing 0.1
 # (MSRV 1.65) and metrics 0.24 (MSRV 1.71.1) both build on Halcyon's 1.75.
 tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }

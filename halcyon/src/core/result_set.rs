@@ -181,6 +181,7 @@ impl<'c> ResultSet<'c> {
                 }
                 Err(e) => {
                     self.done = true;
+                    self.stmt.connection().note_failure(&e);
                     self.poison(e.clone());
                     return Err(e);
                 }
