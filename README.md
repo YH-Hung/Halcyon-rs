@@ -25,7 +25,7 @@ facade ─► pool ─► core ─► driver (CliDriver trait) ─► halcyon-sy
 ## Current surface
 
 - **Db2 data path** — positional and named parameters; exact `Value` mapping; column-wise, memory-bounded `execute_batch`; and rowset-backed `CliDriver::fetch_block` for ordinary `ResultSet`/`QueryResult` cursors.
-- **Transactions** — RAII and closure transactions on `Connection` and `Database`. `ConnectionParams::isolation` sets the session default for standalone connections; pooled sessions take theirs from `PoolConfig::isolation` alone (`Database::open` discards `ConnectionParams::isolation`, even when the pool level is `None`). `begin_with_isolation` and `transaction_with_isolation` apply a per-transaction override and restore the configured level, or Cursor Stability when no level was configured.
+- **Transactions** — RAII and closure transactions on `Connection` and `Database`. `ConnectionParams::isolation` sets the session default for standalone connections; pooled sessions take theirs from `PoolConfig::isolation`, and `Database::open` takes only a connection string. `begin_with_isolation` and `transaction_with_isolation` apply a per-transaction override and restore the configured level, or Cursor Stability when no level was configured.
 - **Savepoints** — `savepoint`, `savepoint_named`, and `nested` return/use RAII `Savepoint` guards. Dropping a live guard rolls back and releases it; active names are guarded case-insensitively to match Db2 identifier folding.
 - **Large objects** — single-attempt `execute_with_lobs` accepts `BindParam` values plus `lob_file`, `lob_reader`, or `lob_callback` BLOB/CLOB sources. `query_streaming` returns a lending `StreamingRow`; `LobReader` supports chunk reads, `copy_to`, `copy_to_file`, `to_vec`, and `to_string` without letting a row or pool lease escape its cursor.
 - **Pool, cache, and retry** — bounded pooling, opt-in validation on acquire with reconnect (`PoolConfig::validate_on_acquire`, off by default as in C++), idle/lifetime maintenance, a per-connection statement LRU, and classified read retry. Writes, batches, and streaming/LOB operations are single-attempt.
@@ -145,7 +145,7 @@ TRYBUILD=overwrite HALCYON_UI_TESTS=1 cargo test -p halcyon --no-default-feature
 
 ### Continuous integration
 
-[.github/workflows/ci.yml](.github/workflows/ci.yml) runs `fmt`, `clippy`, the pure-Rust feature matrix, the Rust 1.75 MSRV lane, Db2-linked Linux/macOS builds, deterministic stress, ThreadSanitizer stress, loom models, and derive UI tests. Its `live-db2` job is configured to stand up Dockerized Db2 and run the DSN-gated sync and async round-trips on pushes to `main` and manual dispatch. Publication still requires the release-commit matrix in [docs/RELEASING.md](docs/RELEASING.md), rather than assuming that configured jobs or skipped tests ran live assertions.
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs `fmt`, `clippy`, the pure-Rust feature matrix, the Rust 1.75 MSRV lane, Db2-linked Linux/macOS builds, deterministic stress, ThreadSanitizer stress, loom models, and derive UI tests. Its `live-db2` job is configured to stand up Dockerized Db2 and run the DSN-gated sync and async round-trips on every pull request to `main`, pushes to `main` and release tags, and manual dispatch. Publication still requires the release-commit matrix in [docs/RELEASING.md](docs/RELEASING.md), rather than assuming that configured jobs or skipped tests ran live assertions.
 
 ## Feature flags
 

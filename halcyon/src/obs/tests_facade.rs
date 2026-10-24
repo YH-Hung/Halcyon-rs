@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::driver::ConnectionParams;
 use crate::error::{Error, ErrorCode, Result};
 use crate::facade::Database;
 use crate::obs::{count, find_child, find_span, obs_lock, with_obs, with_tracing_events};
@@ -11,13 +10,6 @@ use crate::pool::PoolConfig;
 use crate::retry::BackoffPolicy;
 use crate::testing::MockCliDriver;
 use crate::value::Value;
-
-fn params() -> ConnectionParams {
-    ConnectionParams {
-        connection_string: "DSN=mock".into(),
-        isolation: None,
-    }
-}
 
 fn config() -> PoolConfig {
     PoolConfig {
@@ -44,7 +36,7 @@ fn execute_emits_queries_total_and_duration() {
     let _g = obs_lock();
     let mock = Arc::new(MockCliDriver::new());
     mock.push_exec_row_count(1);
-    let db = Database::open(mock, params(), config()).unwrap();
+    let db = Database::open(mock, "DSN=mock", config()).unwrap();
 
     with_obs(|rec, spans| {
         assert_eq!(db.execute("INSERT INTO t VALUES (?)", (1,)).unwrap(), 1);
@@ -84,7 +76,7 @@ fn error_path_emits_errors_total_and_error_status() {
     let _g = obs_lock();
     let mock = Arc::new(MockCliDriver::new());
     mock.push_execute_error(Error::new(ErrorCode::Syntax, "bad sql"));
-    let db = Database::open(mock, params(), config()).unwrap();
+    let db = Database::open(mock, "DSN=mock", config()).unwrap();
 
     with_obs(|rec, spans| {
         assert!(db.execute("INSERT INTO t VALUES (?)", (1,)).is_err());
@@ -116,7 +108,7 @@ fn retries_emit_retried_then_exhausted() {
         e.retriable = true;
         mock.push_execute_error(e);
     }
-    let db = Database::open(mock, params(), config()).unwrap();
+    let db = Database::open(mock, "DSN=mock", config()).unwrap();
 
     with_obs(|rec, _spans| {
         let r: Result<Vec<(i64,)>> = db.query_as("SELECT n FROM t", ());
@@ -150,7 +142,7 @@ fn retries_emit_exact_attempt_events() {
         error.retriable = true;
         mock.push_execute_error(error);
     }
-    let db = Database::open(mock, params(), config()).unwrap();
+    let db = Database::open(mock, "DSN=mock", config()).unwrap();
 
     with_tracing_events(|_, events| {
         let result: Result<Vec<(i64,)>> = db.query_as("SELECT n FROM t", ());
@@ -187,7 +179,7 @@ fn mid_retry_non_retriable_does_not_emit_exhausted() {
     deadlock.retriable = true;
     mock.push_execute_error(deadlock);
     mock.push_execute_error(Error::new(ErrorCode::Syntax, "syntax"));
-    let db = Database::open(mock, params(), config()).unwrap();
+    let db = Database::open(mock, "DSN=mock", config()).unwrap();
 
     with_obs(|rec, _spans| {
         let r: Result<Vec<(i64,)>> = db.query_as("SELECT n FROM t", ());
@@ -213,7 +205,7 @@ fn execute_batch_emits_execute_metrics() {
     let _g = obs_lock();
     let mock = Arc::new(MockCliDriver::new());
     mock.push_exec_row_count(2);
-    let db = Database::open(mock, params(), config()).unwrap();
+    let db = Database::open(mock, "DSN=mock", config()).unwrap();
     let rows = vec![vec![Value::Int(1)], vec![Value::Int(2)]];
 
     with_obs(|rec, spans| {
@@ -240,7 +232,7 @@ fn scoped_transaction_execute_emits_execute_span_under_transaction() {
     let _g = obs_lock();
     let mock = Arc::new(MockCliDriver::new());
     mock.push_exec_row_count(1);
-    let db = Database::open(mock, params(), config()).unwrap();
+    let db = Database::open(mock, "DSN=mock", config()).unwrap();
 
     with_obs(|_rec, spans| {
         db.transaction(|tx| {

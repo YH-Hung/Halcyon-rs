@@ -69,10 +69,9 @@ impl StatementHandle {
 #[derive(Debug, Clone)]
 pub struct ConnectionParams {
     pub connection_string: String,
-    /// Session isolation level; `None` preserves the server default. Honored
-    /// by standalone `Connection::open` only: the pooled path (`Database`,
-    /// `ConnectionPool`) overrides this field with `PoolConfig::isolation`,
-    /// discarding any level set here — even when the pool's level is `None`.
+    /// Session isolation level for a standalone `Connection::open`; `None`
+    /// preserves the server default. Pooled connections take theirs from
+    /// `PoolConfig::isolation`.
     pub isolation: Option<Isolation>,
 }
 

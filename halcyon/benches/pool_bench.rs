@@ -6,9 +6,8 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use halcyon::driver::ConnectionParams;
-use halcyon::retry::BackoffPolicy;
 use halcyon::stress::ConcurrentFakeDriver;
+use halcyon::BackoffPolicy;
 use halcyon::{Database, PoolConfig};
 
 fn db(statement_cache_size: usize) -> Database {
@@ -29,15 +28,7 @@ fn db(statement_cache_size: usize) -> Database {
         statement_cache_size,
         isolation: None,
     };
-    Database::open(
-        Arc::new(ConcurrentFakeDriver::new()),
-        ConnectionParams {
-            connection_string: "dsn".into(),
-            isolation: None,
-        },
-        cfg,
-    )
-    .unwrap()
+    Database::open(Arc::new(ConcurrentFakeDriver::new()), "dsn", cfg).unwrap()
 }
 
 fn bench_acquire_release(c: &mut Criterion) {

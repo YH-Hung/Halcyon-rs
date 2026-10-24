@@ -9,7 +9,7 @@
 //! [`ResultSet`]/[`Row`], `?`/`:name` params, row → tuple mapping), the
 //! connection [`pool`] (bounded sizing, blocking acquire, reaping, transparent
 //! reconnect, per-connection prepared-statement LRU via
-//! [`PoolConfig::statement_cache_size`]) with safe auto-[`retry`], and the
+//! [`PoolConfig::statement_cache_size`]) with safe auto-retry, and the
 //! pooled [`Database`] facade (owned [`QueryResult`] cursors and
 //! [`ScopedTransaction`]s) are implemented, mock-tested, and
 //! concurrency-verified (`loom` + ThreadSanitizer stress). The `tokio` async
@@ -65,7 +65,7 @@ mod async_db;
 // Observability helpers (tracing + metrics when feature on; no-op stubs off).
 mod obs;
 pub mod pool;
-pub mod retry;
+mod retry;
 mod value;
 
 // Synchronization shim (std, or loom under `--cfg loom`). See sync.rs.
@@ -89,17 +89,14 @@ pub use core::{
     Savepoint, Statement, StreamingResultSet, Transaction,
 };
 pub use error::{Error, ErrorCode, Result};
-pub use facade::{
-    Database, QueryResult, ScopedTransaction, StreamingQueryResult, TxCursor, TxQueryMap,
-    TxStreamingCursor,
-};
+pub use facade::{Database, QueryResult, ScopedTransaction, StreamingQueryResult};
 pub use isolation::Isolation;
 pub use lob::{
     lob_callback, lob_file, lob_reader, owned_lob_callback, owned_lob_file, BindParam, LobReader,
     LobSource, OwnedBindParam, OwnedLobSource, StreamingRow,
 };
 pub use pool::{ConnectionPool, PoolConfig, PooledConnection};
-pub use retry::{BackoffPolicy, ExecPolicy};
+pub use retry::BackoffPolicy;
 pub use value::Value;
 
 /// Derives [`FromRow`] for a struct, mapping a result-set row into its fields by

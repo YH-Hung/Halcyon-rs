@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use halcyon::driver::ConnectionParams;
 use halcyon::stress::{
     config_for, make_pool_contention, make_reconnect_faults, make_txn_churn, run_workload,
     ConcurrentFakeDriver, RunConfig, Scenario, Stop,
@@ -15,15 +14,7 @@ use halcyon::stress::{
 use halcyon::{Database, Isolation};
 
 fn open(fake: Arc<ConcurrentFakeDriver>, scenario: Scenario, pool_max: usize) -> Database {
-    Database::open(
-        fake,
-        ConnectionParams {
-            connection_string: "dsn".into(),
-            isolation: None,
-        },
-        config_for(scenario, pool_max),
-    )
-    .expect("pool warmup")
+    Database::open(fake, "dsn", config_for(scenario, pool_max)).expect("pool warmup")
 }
 
 #[test]

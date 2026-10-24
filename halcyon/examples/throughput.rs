@@ -5,7 +5,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use halcyon::driver::ConnectionParams;
 use halcyon::stress::{
     config_for, make_pool_contention, run_workload, ConcurrentFakeDriver, RunConfig, Scenario, Stop,
 };
@@ -20,15 +19,7 @@ fn main() {
     );
     for pool_max in [1usize, 2, 4, 8, 16] {
         let fake = Arc::new(ConcurrentFakeDriver::new());
-        let db = Database::open(
-            fake,
-            ConnectionParams {
-                connection_string: "dsn".into(),
-                isolation: None,
-            },
-            config_for(Scenario::Pool, pool_max),
-        )
-        .unwrap();
+        let db = Database::open(fake, "dsn", config_for(Scenario::Pool, pool_max)).unwrap();
 
         let body = make_pool_contention(&db);
         let cfg = RunConfig {

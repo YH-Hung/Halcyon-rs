@@ -388,7 +388,6 @@ fn join<T>(res: std::result::Result<Result<T>, tokio::task::JoinError>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::ConnectionParams;
     use crate::error::{Error, ErrorCode};
     use crate::pool::PoolConfig;
     use crate::retry::BackoffPolicy;
@@ -398,13 +397,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
-
-    fn params() -> ConnectionParams {
-        ConnectionParams {
-            connection_string: "DSN=mock".into(),
-            isolation: None,
-        }
-    }
 
     /// Deterministic single-thread-friendly config: min=1, generous acquire, no
     /// reaper thread, zero backoff, 3 attempts (so reads auto-retry instantly).
@@ -429,7 +421,7 @@ mod tests {
     }
 
     fn open(mock: &Arc<MockCliDriver>) -> AsyncDatabase {
-        AsyncDatabase::new(Database::open(mock.clone(), params(), config()).unwrap())
+        AsyncDatabase::new(Database::open(mock.clone(), "DSN=mock", config()).unwrap())
     }
 
     #[test]
@@ -628,7 +620,7 @@ mod tests {
     async fn with_connection_dropped_while_waiting_for_admission_never_runs() {
         let mock = Arc::new(MockCliDriver::new());
         let config = PoolConfig { max: 1, ..config() };
-        let db = AsyncDatabase::new(Database::open(mock.clone(), params(), config).unwrap());
+        let db = AsyncDatabase::new(Database::open(mock.clone(), "DSN=mock", config).unwrap());
         let (started, has_started) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let holder = tokio::spawn({
@@ -884,7 +876,7 @@ mod tests {
     async fn into_async_wraps_the_database() {
         let mock = Arc::new(MockCliDriver::new());
         mock.push_exec_row_count(1);
-        let db = Database::open(mock.clone(), params(), config())
+        let db = Database::open(mock.clone(), "DSN=mock", config())
             .unwrap()
             .into_async();
         assert_eq!(db.execute("UPDATE t SET a = 1", ()).await.unwrap(), 1);
@@ -941,7 +933,7 @@ mod tests {
         let _g = obs_lock();
         let mock = Arc::new(MockCliDriver::new());
         mock.push_exec_row_count(1);
-        let db = AsyncDatabase::new(Database::open(mock, params(), config()).unwrap());
+        let db = AsyncDatabase::new(Database::open(mock, "DSN=mock", config()).unwrap());
 
         let spans = Arc::new(Mutex::new(Vec::new()));
         let sub = RecordingSubscriber::new(Arc::clone(&spans));

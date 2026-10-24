@@ -47,18 +47,18 @@ impl BackoffPolicy {
     }
 }
 
-/// Per-call retry policy. Idempotency is opt-in via `max_attempts > 1`; the
-/// caller (or pool/facade) decides which statements are safe to replay. Ported
-/// from the C++ `ExecPolicy`.
+/// Per-call retry policy the facade derives for each statement. Idempotency is
+/// opt-in via `max_attempts > 1`. Ported from the C++ `ExecPolicy`; internal
+/// until a public method accepts one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecPolicy {
-    pub max_attempts: u32,
-    pub backoff: BackoffPolicy,
+pub(crate) struct ExecPolicy {
+    pub(crate) max_attempts: u32,
+    pub(crate) backoff: BackoffPolicy,
 }
 
 impl ExecPolicy {
     /// Run exactly once — no retry. The default for writes.
-    pub fn once() -> Self {
+    pub(crate) fn once() -> Self {
         ExecPolicy {
             max_attempts: 1,
             backoff: BackoffPolicy::default(),
@@ -67,17 +67,11 @@ impl ExecPolicy {
 
     /// Up to `attempts` tries (clamped to at least 1) for an idempotent
     /// statement — the facade's default for reads.
-    pub fn idempotent(attempts: u32) -> Self {
+    pub(crate) fn idempotent(attempts: u32) -> Self {
         ExecPolicy {
             max_attempts: attempts.max(1),
             backoff: BackoffPolicy::default(),
         }
-    }
-}
-
-impl Default for ExecPolicy {
-    fn default() -> Self {
-        ExecPolicy::once()
     }
 }
 
@@ -252,7 +246,6 @@ mod tests {
     #[test]
     fn exec_policy_constructors() {
         assert_eq!(ExecPolicy::once().max_attempts, 1);
-        assert_eq!(ExecPolicy::default(), ExecPolicy::once());
         assert_eq!(ExecPolicy::idempotent(3).max_attempts, 3);
         // Clamped to at least one attempt.
         assert_eq!(ExecPolicy::idempotent(0).max_attempts, 1);

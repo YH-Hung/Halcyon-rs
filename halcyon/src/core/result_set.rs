@@ -11,8 +11,9 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::core::column::FromColumn;
-use crate::core::connection::Statement;
+use crate::core::connection::{Connection, Statement};
 use crate::core::mapping;
+use crate::driver::StatementHandle;
 use crate::error::{Error, Result};
 use crate::value::Value;
 
@@ -20,17 +21,37 @@ use crate::value::Value;
 /// block for byte-budget or transport reasons; only an empty block is EOF.
 pub(crate) const FETCH_BLOCK_ROWS: usize = 4096;
 
-/// Non-owning view of one materialized cursor row. Read a column with
-/// [`Row::column`], or map the whole row to a tuple with [`Row::get`]. Valid
-/// only while it is the live row of its [`ResultSet`].
+/// Non-owning view of one materialized row — normally the live row of a
+/// [`ResultSet`], valid only until the cursor advances. Read a column with
+/// [`Row::column`], or map the whole row to a tuple with [`Row::get`].
 pub struct Row<'a> {
     cells: &'a [Value],
 }
 
 impl<'a> Row<'a> {
-    /// Builds a view over already-materialized row values. Used by the core and
-    /// pooled cursor implementations after successful `fetch_block` calls.
-    pub(crate) fn new(cells: &'a [Value]) -> Self {
+    /// Builds a view over row values in column order — what a cursor yields,
+    /// and a way to unit-test a [`FromRow`] mapping with no driver:
+    ///
+    /// ```
+    /// use halcyon::{FromRow, Row, Value};
+    ///
+    /// struct User {
+    ///     id: i64,
+    ///     name: String,
+    /// }
+    ///
+    /// impl FromRow for User {
+    ///     fn from_row(row: &Row<'_>) -> halcyon::Result<Self> {
+    ///         Ok(User { id: row.column(0)?, name: row.column(1)? })
+    ///     }
+    /// }
+    ///
+    /// let cells = [Value::Int(7), Value::Text("ann".into())];
+    /// let user = User::from_row(&Row::new(&cells))?;
+    /// assert_eq!((user.id, user.name.as_str()), (7, "ann"));
+    /// # Ok::<(), halcyon::Error>(())
+    /// ```
+    pub fn new(cells: &'a [Value]) -> Self {
         Row { cells }
     }
 
@@ -112,11 +133,12 @@ impl_from_row_tuple!(10; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9);
 impl_from_row_tuple!(11; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10);
 impl_from_row_tuple!(12; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11);
 
-/// Forward-only cursor over an executed statement. Owns the statement, closing
-/// its cursor and finalizing it on drop. Move-only.
+/// Block-buffered scan state shared by the borrowed [`ResultSet`] and the
+/// pooled [`QueryResult`](crate::QueryResult), which differ only in how they
+/// own the statement and its connection.
 #[derive(Debug)]
-pub struct ResultSet<'c> {
-    stmt: Statement<'c>,
+pub(crate) struct BlockState {
+    stmt: StatementHandle,
     columns: usize,
     block: Vec<Vec<Value>>,
     position: usize,
@@ -124,11 +146,9 @@ pub struct ResultSet<'c> {
     done: bool,
 }
 
-impl<'c> ResultSet<'c> {
-    /// Wraps a statement whose `execute` has already run and whose column count
-    /// is known. Called by `Connection`/`Statement` after executing a query.
-    pub(crate) fn from_executed(stmt: Statement<'c>, columns: usize) -> Self {
-        ResultSet {
+impl BlockState {
+    pub(crate) fn new(stmt: StatementHandle, columns: usize) -> Self {
+        BlockState {
             stmt,
             columns,
             block: Vec::new(),
@@ -138,22 +158,71 @@ impl<'c> ResultSet<'c> {
         }
     }
 
-    pub fn column_count(&self) -> usize {
+    pub(crate) fn column_count(&self) -> usize {
         self.columns
+    }
+
+    pub(crate) fn error(&self) -> Option<Error> {
+        self.error.clone()
+    }
+
+    /// Advances to the next row, fetching a new block from `conn` when the
+    /// buffered one is spent. A fetch failure is retained, retires `conn` if
+    /// it reports the connection lost, and ends the scan.
+    pub(crate) fn next(&mut self, conn: &Connection) -> Result<Option<Row<'_>>> {
+        if self.done {
+            return Ok(None);
+        }
+        if self.position == self.block.len() {
+            match conn.driver_ref().fetch_block(self.stmt, FETCH_BLOCK_ROWS) {
+                Ok(block) if block.is_empty() => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                Ok(block) => {
+                    self.block = block;
+                    self.position = 0;
+                }
+                Err(e) => {
+                    self.done = true;
+                    conn.note_failure(&e);
+                    self.error = Some(e.clone());
+                    return Err(e);
+                }
+            }
+        }
+
+        let row = Row::new(&self.block[self.position]);
+        self.position += 1;
+        Ok(Some(row))
+    }
+}
+
+/// Forward-only cursor over an executed statement. Owns the statement, closing
+/// its cursor and finalizing it on drop. Move-only.
+#[derive(Debug)]
+pub struct ResultSet<'c> {
+    stmt: Statement<'c>,
+    state: BlockState,
+}
+
+impl<'c> ResultSet<'c> {
+    /// Wraps a statement whose `execute` has already run and whose column count
+    /// is known. Called by `Connection`/`Statement` after executing a query.
+    pub(crate) fn from_executed(stmt: Statement<'c>, columns: usize) -> Self {
+        let state = BlockState::new(stmt.handle(), columns);
+        ResultSet { stmt, state }
+    }
+
+    pub fn column_count(&self) -> usize {
+        self.state.column_count()
     }
 
     /// The driver-side failure that spoiled the scan, if any: empty after a
     /// clean end, set after a mid-stream block-fetch failure. Client-side
     /// mapping errors are not recorded here.
     pub fn error(&self) -> Option<Error> {
-        self.error.clone()
-    }
-
-    /// Records a driver-side failure, keeping the first one seen.
-    fn poison(&mut self, e: Error) {
-        if self.error.is_none() {
-            self.error = Some(e);
-        }
+        self.state.error()
     }
 
     /// Advances to the next row. `Ok(Some(row))` while rows remain, `Ok(None)`
@@ -165,32 +234,7 @@ impl<'c> ResultSet<'c> {
     /// [`query_map`](ResultSet::query_map) for owned-item iteration.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Row<'_>>> {
-        if self.done {
-            return Ok(None);
-        }
-        if self.position == self.block.len() {
-            let handle = self.stmt.handle();
-            match self.stmt.driver_ref().fetch_block(handle, FETCH_BLOCK_ROWS) {
-                Ok(block) if block.is_empty() => {
-                    self.done = true;
-                    return Ok(None);
-                }
-                Ok(block) => {
-                    self.block = block;
-                    self.position = 0;
-                }
-                Err(e) => {
-                    self.done = true;
-                    self.stmt.connection().note_failure(&e);
-                    self.poison(e.clone());
-                    return Err(e);
-                }
-            }
-        }
-
-        let row = Row::new(&self.block[self.position]);
-        self.position += 1;
-        Ok(Some(row))
+        self.state.next(self.stmt.connection())
     }
 
     /// Adapts the cursor into an `Iterator` of owned `Result<T>`, mapping each
@@ -221,7 +265,7 @@ impl Drop for ResultSet<'_> {
     fn drop(&mut self) {
         // A driver-side block-fetch failure may leave the handle mid-cursor:
         // poison the statement so a cached entry is finalized, not reused.
-        if self.error.is_some() {
+        if self.state.error.is_some() {
             self.stmt.poison();
         }
     }

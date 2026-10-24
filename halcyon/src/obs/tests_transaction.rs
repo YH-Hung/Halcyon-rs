@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::driver::ConnectionParams;
 use crate::error::{Error, ErrorCode};
 use crate::facade::Database;
 use crate::obs::{obs_lock, with_tracing_events};
@@ -11,13 +10,6 @@ use crate::pool::PoolConfig;
 use crate::retry::BackoffPolicy;
 use crate::testing::MockCliDriver;
 use crate::Isolation;
-
-fn params() -> ConnectionParams {
-    ConnectionParams {
-        connection_string: "DSN=mock".into(),
-        isolation: None,
-    }
-}
 
 fn config() -> PoolConfig {
     PoolConfig {
@@ -43,7 +35,7 @@ fn config() -> PoolConfig {
 fn failed_terminal_operation_emits_txn_poisoned_once() {
     let _g = obs_lock();
     let mock = Arc::new(MockCliDriver::new());
-    let db = Database::open(mock.clone(), params(), config()).unwrap();
+    let db = Database::open(mock.clone(), "DSN=mock", config()).unwrap();
 
     with_tracing_events(|_, events| {
         let mut tx = db.begin().unwrap();
@@ -65,7 +57,7 @@ fn failed_terminal_operation_emits_txn_poisoned_once() {
 fn failed_named_savepoint_emits_savepoint_and_txn_poison_events_once() {
     let _g = obs_lock();
     let mock = Arc::new(MockCliDriver::new());
-    let db = Database::open(mock.clone(), params(), config()).unwrap();
+    let db = Database::open(mock.clone(), "DSN=mock", config()).unwrap();
 
     with_tracing_events(|_, events| {
         let tx = db.begin().unwrap();
@@ -101,7 +93,7 @@ fn failed_named_savepoint_emits_savepoint_and_txn_poison_events_once() {
 fn isolation_restore_failure_emits_exact_error_code() {
     let _g = obs_lock();
     let mock = Arc::new(MockCliDriver::new());
-    let db = Database::open(mock.clone(), params(), config()).unwrap();
+    let db = Database::open(mock.clone(), "DSN=mock", config()).unwrap();
     mock.fail_isolation_on_call(
         2,
         Error::new(ErrorCode::Connection, "isolation restore failed"),

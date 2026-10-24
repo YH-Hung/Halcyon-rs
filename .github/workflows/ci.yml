@@ -181,7 +181,7 @@ jobs:
       - name: Clippy (all features)
         run: cargo clippy --all-features --all-targets -- -D warnings
       # PR-gated: default features omit `tokio`, so compile the db2+tokio combo
-      # here (connect/connect_with + live_tests). live-db2 only runs on main.
+      # here (connect/connect_with + live_tests).
       - name: Clippy (db2 + tokio)
         run: cargo clippy --features tokio --all-targets -- -D warnings
       - name: Compile consumer quick start
@@ -251,12 +251,12 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Live Db2 round-trip: stand up the Dockerized Db2 and run the integration
-  # test against it. Skipped on PRs (the ~5-min image pull + boot would slow
-  # every PR); runs on pushes to main and manual dispatch. On Linux runners the
+  # test against it on every PR to main, pushes to main and tags, and manual
+  # dispatch (the image pull + boot adds ~5 min). On Linux runners the
   # published port is reachable at localhost with native container networking.
   # ---------------------------------------------------------------------------
   live-db2:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     runs-on: ubuntu-24.04
     env:
       DB2_CLIDRIVER_ROOT: third_party/clidriver

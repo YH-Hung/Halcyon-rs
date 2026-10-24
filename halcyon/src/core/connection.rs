@@ -393,11 +393,6 @@ impl<'c> Statement<'c> {
         self.handle
     }
 
-    /// The shared driver, as a trait object — for the cursor to fetch/read rows.
-    pub(crate) fn driver_ref(&self) -> &dyn CliDriver {
-        self.conn.driver.as_ref()
-    }
-
     /// The owning connection, for cursors that record driver failures on it.
     pub(crate) fn connection(&self) -> &'c Connection {
         self.conn
