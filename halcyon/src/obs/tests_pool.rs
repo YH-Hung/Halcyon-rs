@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::driver::ConnectionParams;
 use crate::facade::Database;
 use crate::obs::{
     count, find_child, find_span, max_value, obs_lock, with_metrics, with_obs, with_tracing_events,
@@ -15,13 +14,6 @@ use crate::testing::MockCliDriver;
 use metrics::{
     Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
 };
-
-fn params() -> ConnectionParams {
-    ConnectionParams {
-        connection_string: "DSN=mock".into(),
-        isolation: None,
-    }
-}
 
 fn config() -> PoolConfig {
     PoolConfig {
@@ -50,7 +42,7 @@ fn pool_gauge_and_acquire_wait_emitted() {
     mock.push_exec_row_count(0);
 
     with_obs(|rec, spans| {
-        let db = Database::open(mock.clone(), params(), config()).unwrap();
+        let db = Database::open(mock.clone(), "DSN=mock", config()).unwrap();
         assert_eq!(
             max_value(
                 &rec.snapshot(),
@@ -78,7 +70,7 @@ fn reconnect_emits_reconnects_total() {
     cfg.validate_on_acquire = true;
 
     with_metrics(|rec| {
-        let db = Database::open(mock, params(), cfg).unwrap();
+        let db = Database::open(mock, "DSN=mock", cfg).unwrap();
         assert!(db.execute("UPDATE t SET a=?", (1,)).is_ok());
         assert!(count(&rec.snapshot(), "halcyon_reconnects_total", &[]) >= 1);
     });
@@ -96,7 +88,7 @@ fn connect_attempts_emit_exact_success_and_failure_events() {
     cfg.min = 1;
 
     with_tracing_events(|_, events| {
-        ConnectionPool::create(mock, params(), cfg).unwrap();
+        ConnectionPool::create(mock, "DSN=mock", cfg).unwrap();
         let guard = events.lock().unwrap();
         let fail = guard
             .iter()
@@ -130,7 +122,7 @@ fn reconnect_success_emits_attempt_and_ok_events() {
     let mut cfg = config();
     cfg.min = 1;
     cfg.validate_on_acquire = true;
-    let pool = ConnectionPool::create(mock.clone(), params(), cfg).unwrap();
+    let pool = ConnectionPool::create(mock.clone(), "DSN=mock", cfg).unwrap();
     mock.push_alive_result(false);
 
     with_tracing_events(|_, events| {
@@ -158,7 +150,7 @@ fn reconnect_failure_emits_error_code() {
     let mut cfg = config();
     cfg.min = 1;
     cfg.validate_on_acquire = true;
-    let pool = ConnectionPool::create(mock.clone(), params(), cfg).unwrap();
+    let pool = ConnectionPool::create(mock.clone(), "DSN=mock", cfg).unwrap();
     mock.push_alive_result(false);
     mock.push_connect_error(crate::error::Error::new(
         crate::error::ErrorCode::Connection,
@@ -189,7 +181,7 @@ fn acquire_timeout_emits_pool_exhausted_timeout() {
     cfg.min = 1;
     cfg.max = 1;
     cfg.acquire_timeout = Duration::from_millis(30);
-    let pool = ConnectionPool::create(mock, params(), cfg).unwrap();
+    let pool = ConnectionPool::create(mock, "DSN=mock", cfg).unwrap();
     let _hold = pool.acquire().unwrap();
 
     with_tracing_events(|_, events| {
@@ -215,7 +207,7 @@ fn maintain_emits_pool_reap_count() {
     let mut cfg = config();
     cfg.min = 1;
     cfg.idle_timeout = Duration::ZERO;
-    let pool = ConnectionPool::create(mock, params(), cfg).unwrap();
+    let pool = ConnectionPool::create(mock, "DSN=mock", cfg).unwrap();
     let a = pool.acquire().unwrap();
     let b = pool.acquire().unwrap();
     let c = pool.acquire().unwrap();
@@ -280,7 +272,7 @@ fn sink_may_reenter_pool_without_deadlock() {
     // Build the pool first (warmup gauges use a no-op recorder), then install the
     // re-entrant recorder and acquire — flush runs after the pool mutex is dropped,
     // so idle_count/active_count from the gauge hook must not deadlock.
-    let pool = Arc::new(ConnectionPool::create(mock, params(), config()).unwrap());
+    let pool = Arc::new(ConnectionPool::create(mock, "DSN=mock", config()).unwrap());
     let rec = ReenterRecorder {
         pool: Arc::clone(&pool),
         inner: RecordingRecorder::new(),
@@ -301,7 +293,7 @@ fn maintain_flushes_pool_gauges() {
     cfg.idle_timeout = Duration::ZERO;
 
     with_metrics(|rec| {
-        let pool = ConnectionPool::create(mock, params(), cfg).unwrap();
+        let pool = ConnectionPool::create(mock, "DSN=mock", cfg).unwrap();
         let a = pool.acquire().unwrap();
         let b = pool.acquire().unwrap();
         let c = pool.acquire().unwrap();
@@ -336,7 +328,7 @@ fn acquire_timeout_marks_span_errored() {
     cfg.acquire_timeout = Duration::from_millis(30);
 
     with_obs(|_rec, spans| {
-        let pool = ConnectionPool::create(mock, params(), cfg).unwrap();
+        let pool = ConnectionPool::create(mock, "DSN=mock", cfg).unwrap();
         let _hold = pool.acquire().unwrap();
         let err = pool.acquire().unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Pool);

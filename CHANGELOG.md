@@ -16,6 +16,8 @@ are implementation details.
   closure with one pooled connection on a blocking thread, discarding the lease
   after a connection-class failure. Dropping its future while it waits for
   admission cancels it before the closure runs.
+- `Row::new`, which builds a row view over plain `Value`s, so a custom
+  `FromRow` mapping can be unit-tested without a driver.
 
 ### Changed
 
@@ -24,6 +26,21 @@ are implementation details.
   0.1.0 pin. Builds with Cargo before 1.84, including Rust 1.75, pin a
   compatible tokio in their lockfile; the release check does so for its
   consumer on toolchains older than Rust 1.85.
+- `Database::open` and `ConnectionPool::create` take a connection string
+  instead of `ConnectionParams`, so a pooled caller can no longer set an
+  isolation level the pool would discard. Pooled session isolation comes from
+  `PoolConfig::isolation`, as before.
+- `ScopedTransaction::query` and `query_streaming` return the core
+  `ResultSet<'_>` and `StreamingResultSet<'_>` (and `query_map` the core
+  `QueryMap`). The cursor still borrows the transaction, and a scan that
+  reports the connection lost still discards the lease.
+
+### Removed
+
+- `TxCursor`, `TxStreamingCursor`, and `TxQueryMap`, replaced by the core
+  cursor types above.
+- `ExecPolicy` and the public `retry` module: no public method accepted a
+  per-call policy. `BackoffPolicy` stays exported as `halcyon::BackoffPolicy`.
 
 ### Fixed
 

@@ -69,12 +69,8 @@ pub struct PoolConfig {
     /// Every pooled connection (including transparent reconnects) gets its own
     /// cache of this size, cleared when the physical connection is dropped.
     pub statement_cache_size: usize,
-    /// Session isolation applied to every pooled connection at open time —
-    /// the sole source of truth for pooled sessions: the pool replaces
-    /// `ConnectionParams::isolation` with this value, so a level set only on
-    /// the params is ignored. `None` preserves the server default (even when
-    /// the params carry a level). `ConnectionParams::isolation` applies to
-    /// standalone [`Connection::open`](crate::Connection) only.
+    /// Session isolation applied to every pooled connection at open time
+    /// (including transparent reconnects). `None` preserves the server default.
     pub isolation: Option<Isolation>,
 }
 
@@ -490,12 +486,13 @@ pub struct ConnectionPool {
 }
 
 impl ConnectionPool {
-    /// Builds a pool over `driver`, warms it up to `config.min` connections, and
-    /// (unless disabled) starts the background maintenance thread. A warmup
-    /// connect failure aborts creation and returns the error.
+    /// Builds a pool over `driver` whose connections open with
+    /// `connection_string` and `config.isolation`, warms it up to `config.min`
+    /// connections, and (unless disabled) starts the background maintenance
+    /// thread. A warmup connect failure aborts creation and returns the error.
     pub fn create(
         driver: Arc<dyn CliDriver>,
-        params: ConnectionParams,
+        connection_string: &str,
         config: PoolConfig,
     ) -> Result<ConnectionPool> {
         // Reject an unsatisfiable config before opening anything: `max` is the hard
@@ -520,11 +517,9 @@ impl ConnectionPool {
 
         let inner = Arc::new(PoolInner {
             driver,
-            // PoolConfig::isolation is the pooled source of truth: the params'
-            // own level is deliberately discarded (see the field's docs).
             params: ConnectionParams {
+                connection_string: connection_string.to_string(),
                 isolation: config.isolation,
-                ..params
             },
             config: config.clone(),
             state: Mutex::new(PoolState {
@@ -731,13 +726,6 @@ mod tests {
     #[cfg(feature = "observability")]
     use std::sync::Barrier;
 
-    fn params() -> ConnectionParams {
-        ConnectionParams {
-            connection_string: "DSN=mock".into(),
-            isolation: None,
-        }
-    }
-
     /// A config with no background thread and zero backoff — the deterministic
     /// base every test tweaks. `min`/`max` are set per test.
     fn cfg(min: usize, max: usize) -> PoolConfig {
@@ -761,7 +749,7 @@ mod tests {
     }
 
     fn pool(mock: &Arc<MockCliDriver>, config: PoolConfig) -> ConnectionPool {
-        ConnectionPool::create(mock.clone(), params(), config).unwrap()
+        ConnectionPool::create(mock.clone(), "DSN=mock", config).unwrap()
     }
 
     fn retriable_conn(msg: &str) -> Error {
@@ -901,7 +889,7 @@ mod tests {
         let mut config = cfg(1, 1);
         config.isolation = Some(Isolation::ReadStability);
 
-        let _pool = ConnectionPool::create(mock.clone(), params(), config).unwrap();
+        let _pool = ConnectionPool::create(mock.clone(), "DSN=mock", config).unwrap();
 
         assert_eq!(
             mock.connect_params()[0].isolation,
@@ -938,7 +926,7 @@ mod tests {
     fn create_propagates_warmup_connect_error() {
         let mock = Arc::new(MockCliDriver::new());
         mock.push_connect_error(Error::new(ErrorCode::Connection, "refused"));
-        let err = ConnectionPool::create(mock.clone(), params(), cfg(1, 4)).unwrap_err();
+        let err = ConnectionPool::create(mock.clone(), "DSN=mock", cfg(1, 4)).unwrap_err();
         assert_eq!(err.code, ErrorCode::Connection);
     }
 
@@ -949,7 +937,7 @@ mod tests {
         let mut config = cfg(1, 1);
         config.isolation = Some(Isolation::UncommittedRead);
 
-        let error = ConnectionPool::create(mock.clone(), params(), config).unwrap_err();
+        let error = ConnectionPool::create(mock.clone(), "DSN=mock", config).unwrap_err();
 
         assert_eq!(error.code, ErrorCode::Connection);
         assert_eq!(mock.connect_calls(), 1);
@@ -962,7 +950,7 @@ mod tests {
         let mock = Arc::new(MockCliDriver::new());
         // min=5 > max=2 would warm 5 connections and blow past the advertised
         // hard ceiling before the pool ever started.
-        let err = ConnectionPool::create(mock.clone(), params(), cfg(5, 2)).unwrap_err();
+        let err = ConnectionPool::create(mock.clone(), "DSN=mock", cfg(5, 2)).unwrap_err();
         assert_eq!(err.code, ErrorCode::Pool);
         // An invalid config opens no connections.
         assert_eq!(mock.connect_calls(), 0);
@@ -972,7 +960,7 @@ mod tests {
     fn create_rejects_zero_max() {
         let mock = Arc::new(MockCliDriver::new());
         // max=0 is a pool that can never hand out a connection.
-        let err = ConnectionPool::create(mock.clone(), params(), cfg(0, 0)).unwrap_err();
+        let err = ConnectionPool::create(mock.clone(), "DSN=mock", cfg(0, 0)).unwrap_err();
         assert_eq!(err.code, ErrorCode::Pool);
         assert_eq!(mock.connect_calls(), 0);
     }
@@ -1237,7 +1225,7 @@ mod tests {
         let mut config = cfg(1, 1);
         config.max_lifetime = Duration::ZERO;
         let pool = Arc::new(
-            ConnectionPool::create(driver.clone(), params(), config).expect("warmup connection"),
+            ConnectionPool::create(driver.clone(), "DSN=mock", config).expect("warmup connection"),
         );
 
         let worker_pool = Arc::clone(&pool);
@@ -1450,13 +1438,6 @@ mod loom_tests {
         }
     }
 
-    fn params() -> ConnectionParams {
-        ConnectionParams {
-            connection_string: "loom".into(),
-            isolation: None,
-        }
-    }
-
     // A deterministic base config: no maintenance thread, zero backoff, one slot.
     fn cfg(max: usize) -> PoolConfig {
         PoolConfig {
@@ -1507,7 +1488,7 @@ mod loom_tests {
     fn acquire_release_handoff_has_no_lost_wakeup() {
         loom::model(|| {
             let driver = std::sync::Arc::new(LoomFake);
-            let pool = LoomArc::new(ConnectionPool::create(driver, params(), cfg(1)).unwrap());
+            let pool = LoomArc::new(ConnectionPool::create(driver, "loom", cfg(1)).unwrap());
 
             let p2 = LoomArc::clone(&pool);
             let t = loom::thread::spawn(move || {
@@ -1534,7 +1515,7 @@ mod loom_tests {
     fn acquire_timeout_or_handover_keeps_accounting_consistent() {
         loom::model(|| {
             let driver = std::sync::Arc::new(LoomFake);
-            let pool = LoomArc::new(ConnectionPool::create(driver, params(), cfg(1)).unwrap());
+            let pool = LoomArc::new(ConnectionPool::create(driver, "loom", cfg(1)).unwrap());
             let held = pool.acquire().unwrap(); // occupy the only slot
 
             let p2 = LoomArc::clone(&pool);
@@ -1562,7 +1543,7 @@ mod loom_tests {
     fn lease_drop_races_pool_drop_cleanly() {
         loom::model(|| {
             let driver = std::sync::Arc::new(LoomFake);
-            let pool = ConnectionPool::create(driver, params(), cfg(1)).unwrap();
+            let pool = ConnectionPool::create(driver, "loom", cfg(1)).unwrap();
             let lease = pool.acquire().unwrap(); // main holds a lease
 
             let t = loom::thread::spawn(move || {
