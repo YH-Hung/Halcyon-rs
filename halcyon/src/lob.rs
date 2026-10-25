@@ -15,7 +15,9 @@ pub type OwnedLobPull = dyn FnMut(&mut [u8]) -> Result<usize> + Send + 'static;
 
 /// One positional parameter for a single-use streaming execute.
 pub enum BindParam<'a> {
+    /// An ordinary value, bound as with any other query.
     Value(Value),
+    /// A BLOB or CLOB streamed in chunks during execution.
     Lob(LobSource<'a>),
 }
 
@@ -25,20 +27,33 @@ impl From<Value> for BindParam<'_> {
     }
 }
 
-/// Borrowed, single-use LOB source for synchronous execution.
+/// Borrowed, single-use LOB source for synchronous execution. Build one with
+/// [`lob_file`], [`lob_reader`], or [`lob_callback`].
 pub enum LobSource<'a> {
+    /// Streams the contents of a file, whose size gives the length.
     File {
+        /// File to read.
         path: PathBuf,
+        /// Bind as `CLOB` instead of `BLOB`.
         as_clob: bool,
     },
+    /// Streams from a reader until it returns end of file.
     Reader {
+        /// Data source.
         reader: &'a mut (dyn Read + Send),
+        /// Total length in bytes, when known.
         size_hint: Option<u64>,
+        /// Bind as `CLOB` instead of `BLOB`.
         as_clob: bool,
     },
+    /// Streams from a closure that fills a buffer and returns the number of
+    /// bytes written, with `0` meaning the data is finished.
     Callback {
+        /// Data source.
         pull: Box<LobPull<'a>>,
+        /// Total length in bytes, when known.
         size_hint: Option<u64>,
+        /// Bind as `CLOB` instead of `BLOB`.
         as_clob: bool,
     },
 }
@@ -81,20 +96,30 @@ impl<'a> LobSource<'a> {
     }
 }
 
-/// Owned, `Send + 'static`, single-use LOB source for async execution.
+/// Owned, `Send + 'static`, single-use LOB source for async execution. Build
+/// one with [`owned_lob_file`] or [`owned_lob_callback`].
 pub enum OwnedLobSource {
+    /// Streams the contents of a file, whose size gives the length.
     File {
+        /// File to read.
         path: PathBuf,
+        /// Bind as `CLOB` instead of `BLOB`.
         as_clob: bool,
     },
+    /// Streams from a closure that fills a buffer and returns the number of
+    /// bytes written, with `0` meaning the data is finished.
     Callback {
+        /// Data source.
         pull: Box<OwnedLobPull>,
+        /// Total length in bytes, when known.
         size_hint: Option<u64>,
+        /// Bind as `CLOB` instead of `BLOB`.
         as_clob: bool,
     },
 }
 
 impl OwnedLobSource {
+    /// Bind this source as character data (`CLOB`) instead of binary (`BLOB`).
     pub fn as_clob(mut self) -> Self {
         match &mut self {
             Self::File { as_clob, .. } | Self::Callback { as_clob, .. } => *as_clob = true,
@@ -121,7 +146,9 @@ impl OwnedLobSource {
 
 /// Owned counterpart of [`BindParam`], used by the async facade.
 pub enum OwnedBindParam {
+    /// An ordinary value, bound as with any other query.
     Value(Value),
+    /// A BLOB or CLOB streamed in chunks during execution.
     Lob(OwnedLobSource),
 }
 
@@ -243,6 +270,7 @@ impl StreamingRow<'_> {
         StreamingRow { cursor }
     }
 
+    /// Number of columns in the result set.
     pub fn column_count(&self) -> usize {
         self.cursor.streaming_column_count()
     }

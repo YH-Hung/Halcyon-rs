@@ -25,12 +25,14 @@ cargo test
 RUSTFLAGS="--cfg loom" cargo test -p halcyon --no-default-features --release --lib pool::loom_tests
 # TSan stress (nightly, x86_64): see .github/workflows/ci.yml `stress-tsan`
 
-# Live Db2 round-trip (Linux x86_64 on the Db2 network; see README)
+# Live Db2 round-trip (Linux x86_64 on the Db2 network; see CONTRIBUTING.md)
 HALCYON_TEST_DSN=... cargo test --test db2_roundtrip -- --nocapture
 
 # docs.rs simulation
 DOCS_RS=1 cargo doc -p halcyon-sys --no-deps
-cargo doc -p halcyon --no-default-features --features derive,tokio,observability --no-deps
+DOCS_RS=1 RUSTDOCFLAGS='-D warnings' cargo doc -p halcyon --features tokio,observability --no-deps
+# Docs must also build without db2
+RUSTDOCFLAGS='-D warnings' cargo doc -p halcyon --no-default-features --features derive,tokio,observability --no-deps
 ```
 
 CI (`.github/workflows/ci.yml`) runs the feature, MSRV, native, concurrency,
@@ -74,10 +76,10 @@ cargo publish -p halcyon
 ```
 
 `cargo publish -p halcyon` performs the full verification build against the
-now-published deps. docs.rs builds `halcyon` with `--no-default-features
---features derive,tokio,observability` (see `[package.metadata.docs.rs]`) and
-`halcyon-sys` with the `DOCS_RS` build-script escape, so neither needs
-clidriver.
+now-published deps. docs.rs builds `halcyon` with its default features plus
+`tokio` and `observability` (see `[package.metadata.docs.rs]`). Neither crate
+needs clidriver there: under `DOCS_RS`, the `halcyon-sys` build script skips
+locating and linking libdb2.
 
 ## 5. Tag + GitHub release
 

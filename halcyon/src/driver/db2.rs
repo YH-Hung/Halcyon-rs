@@ -678,6 +678,8 @@ pub struct Db2CliDriver {
 }
 
 impl Db2CliDriver {
+    /// Allocates the CLI environment. Never fails: an allocation failure is
+    /// reported by the first [`connect`](CliDriver::connect).
     pub fn new() -> Db2CliDriver {
         let mut env: cli::SQLHANDLE = ptr::null_mut();
         let rc =

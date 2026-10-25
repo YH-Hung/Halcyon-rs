@@ -57,7 +57,17 @@ use crate::Isolation;
 
 /// Async, pooled Db2 handle: a feature-gated `tokio` wrapper over [`Database`].
 /// Cloneable and thread-safe — clones share one underlying [`ConnectionPool`]
-/// and one admission [`Semaphore`].
+/// and one admission [`Semaphore`]. Create one with `AsyncDatabase::connect`
+/// (feature `db2`) or [`Database::into_async`].
+///
+/// ```no_run
+/// use halcyon::{AsyncDatabase, Result};
+///
+/// async fn count(db: &AsyncDatabase) -> Result<i64> {
+///     let rows: Vec<(i64,)> = db.query_as("SELECT COUNT(*) FROM users", ()).await?;
+///     Ok(rows[0].0)
+/// }
+/// ```
 #[derive(Clone)]
 pub struct AsyncDatabase {
     inner: Database,
