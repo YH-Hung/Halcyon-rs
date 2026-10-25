@@ -5,15 +5,22 @@
 /// `Bool` is bind-only-distinct — a boolean column reads back as `Int`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    /// SQL NULL.
     Null,
+    /// A boolean parameter. Boolean columns read back as [`Int`](Self::Int).
     Bool(bool),
+    /// Any integer type (`SMALLINT`, `INTEGER`, `BIGINT`).
     Int(i64),
+    /// Any floating-point type (`REAL`, `DOUBLE`).
     Double(f64),
+    /// Character data, as UTF-8.
     Text(String),
+    /// Binary data.
     Bytes(Vec<u8>),
 }
 
 impl Value {
+    /// Whether this is [`Null`](Self::Null).
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }

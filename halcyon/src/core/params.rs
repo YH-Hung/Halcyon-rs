@@ -26,6 +26,7 @@ pub enum Params {
 /// Implemented for `()` (no params), tuples of bindable values up to arity 12,
 /// `Vec<Value>`, and [`Named`].
 pub trait IntoParams {
+    /// Converts `self` into the bound parameter list.
     fn into_params(self) -> Params;
 }
 
@@ -75,6 +76,8 @@ impl_into_params_tuple!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L
 pub struct Named(Vec<(String, Value)>);
 
 impl Named {
+    /// An empty set of bindings. The [`named!`](crate::named) macro builds one
+    /// in a single expression.
     pub fn new() -> Self {
         Named(Vec::new())
     }

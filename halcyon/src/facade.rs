@@ -363,6 +363,7 @@ impl QueryResult {
         }
     }
 
+    /// Number of columns in the result set.
     pub fn column_count(&self) -> usize {
         self.state.column_count()
     }
@@ -432,14 +433,20 @@ impl StreamingQueryResult {
         }
     }
 
+    /// Number of columns in the result set.
     pub fn column_count(&self) -> usize {
         self.state.column_count()
     }
 
+    /// The driver-side failure that spoiled the scan, if any. Empty after a
+    /// clean end.
     pub fn error(&self) -> Option<Error> {
         self.state.error()
     }
 
+    /// Advances to the next row. `Ok(Some(row))` while rows remain, `Ok(None)`
+    /// at a clean end, `Err` on a fetch failure (also retained in
+    /// [`error`](Self::error)). Read each row's columns in ascending order.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<StreamingRow<'_>>> {
         if self.state.next(&self.lease)? {

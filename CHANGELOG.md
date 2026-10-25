@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-The versioning policy is described in the [README](README.md#versioning--msrv):
+The versioning policy is described in the [README](README.md#versioning-and-msrv):
 the public `halcyon` API is SemVer-stable; `halcyon-sys` and `halcyon-derive`
 are implementation details.
 
@@ -54,6 +54,13 @@ are implementation details.
 
 ### Documentation
 
+- docs.rs builds with the default `db2` feature, so `Database::connect`,
+  `AsyncDatabase::connect`, and `Db2CliDriver` appear in the published docs.
+- The crate-level docs are a usage guide built around `Database`, with
+  examples that compile in the doctest suite. Every public item is documented,
+  and `missing_docs` warns on new undocumented items.
+- The README is written for library users; building, testing, and CI moved to
+  `CONTRIBUTING.md`.
 - Timeouts: `ReceiveTimeout` bounds waits on an unresponsive server; with IBM's
   macOS ARM64 clidriver v12.1.4, adding `ConnectTimeout` disabled it, and
   neither bounded reconnecting.

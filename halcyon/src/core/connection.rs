@@ -95,6 +95,8 @@ impl Connection {
         })
     }
 
+    /// The driver handle of this connection, for calling [`CliDriver`]
+    /// methods directly.
     pub fn handle(&self) -> ConnectionHandle {
         self.handle
     }
@@ -389,6 +391,8 @@ pub struct Statement<'c> {
 }
 
 impl<'c> Statement<'c> {
+    /// The driver handle of this statement, for calling [`CliDriver`]
+    /// methods directly.
     pub fn handle(&self) -> StatementHandle {
         self.handle
     }

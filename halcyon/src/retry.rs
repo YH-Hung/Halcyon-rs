@@ -18,9 +18,15 @@ use std::time::Duration;
 /// `max_delay`. Ported from the C++ `BackoffPolicy` (the injected `sleep` is
 /// dropped: callers sleep `delay_for` directly).
 #[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// [`PoolConfig::backoff`](crate::PoolConfig::backoff) applies it both to
+/// reconnect attempts and to retried reads.
 pub struct BackoffPolicy {
+    /// Delay before the second attempt; each later attempt doubles it.
     pub base_delay: Duration,
+    /// Upper bound on any single delay.
     pub max_delay: Duration,
+    /// Total attempts, including the first. `0` is treated as `1`.
     pub max_attempts: u32,
 }
 

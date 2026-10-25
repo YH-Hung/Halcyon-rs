@@ -27,18 +27,28 @@ use crate::Isolation;
 /// Result of one chunked LOB read. `bytes == 0 && done` is clean EOF.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GetDataChunk {
+    /// Bytes written to the caller's buffer.
     pub bytes: usize,
+    /// No more data remains in the cell after this chunk.
     pub done: bool,
+    /// The cell is SQL NULL (then `bytes == 0` and `done`).
     pub is_null: bool,
 }
 
-/// One data-at-execution parameter stream for [`CliDriver::execute_streaming`].
+/// Pull callback behind a [`ParamStreamSource`]: fills the buffer and returns
+/// the number of bytes written, with `0` meaning the stream is finished.
 pub type ParamStreamPull<'a> = dyn FnMut(&mut [u8]) -> Result<usize> + 'a;
 
+/// One data-at-execution parameter stream for [`CliDriver::execute_streaming`].
 pub struct ParamStreamSource<'a> {
+    /// 0-based position of the `?` placeholder this stream feeds.
     pub param_index: usize,
+    /// Supplies the parameter's bytes chunk by chunk.
     pub pull: Box<ParamStreamPull<'a>>,
+    /// Total length in bytes when known up front; `None` streams with an
+    /// unknown length.
     pub size_hint: Option<u64>,
+    /// Bind as character data (`CLOB`) instead of binary (`BLOB`).
     pub is_clob: bool,
 }
 
@@ -47,8 +57,10 @@ pub struct ParamStreamSource<'a> {
 pub struct ConnectionHandle(pub u64);
 
 impl ConnectionHandle {
+    /// The handle that never refers to a live connection.
     pub const INVALID: ConnectionHandle = ConnectionHandle(0);
 
+    /// Whether this is not [`INVALID`](Self::INVALID).
     pub fn is_valid(self) -> bool {
         self != Self::INVALID
     }
@@ -59,15 +71,20 @@ impl ConnectionHandle {
 pub struct StatementHandle(pub u64);
 
 impl StatementHandle {
+    /// The handle that never refers to a live statement.
     pub const INVALID: StatementHandle = StatementHandle(0);
 
+    /// Whether this is not [`INVALID`](Self::INVALID).
     pub fn is_valid(self) -> bool {
         self != Self::INVALID
     }
 }
 
+/// What [`CliDriver::connect`] needs to open one connection.
 #[derive(Debug, Clone)]
 pub struct ConnectionParams {
+    /// CLI connection string, such as
+    /// `DATABASE=SAMPLE;HOSTNAME=localhost;PORT=50000;PROTOCOL=TCPIP;UID=...;PWD=...;`.
     pub connection_string: String,
     /// Session isolation level for a standalone `Connection::open`; `None`
     /// preserves the server default. Pooled connections take theirs from
@@ -84,8 +101,15 @@ pub struct ConnectionParams {
 /// concurrently through the same driver.
 pub trait CliDriver: Send + Sync {
     // --- Connection lifecycle ---
+
+    /// Opens a connection; returns a valid handle on success.
     fn connect(&self, params: &ConnectionParams) -> Result<ConnectionHandle>;
+
+    /// Closes the connection and releases its handle.
     fn disconnect(&self, conn: ConnectionHandle) -> Result<()>;
+
+    /// Probes whether `conn` can still run statements. The pool's validation
+    /// check; `Ok(false)` means the connection should be replaced.
     fn is_alive(&self, conn: ConnectionHandle) -> Result<bool>;
 
     // --- Prepared-statement data path ---
@@ -161,6 +185,9 @@ pub trait CliDriver: Send + Sync {
     /// Sets the connection's transaction isolation attribute.
     fn set_isolation(&self, conn: ConnectionHandle, level: Isolation) -> Result<()>;
 
+    /// Commits the connection's current unit of work.
     fn commit(&self, conn: ConnectionHandle) -> Result<()>;
+
+    /// Rolls back the connection's current unit of work.
     fn rollback(&self, conn: ConnectionHandle) -> Result<()>;
 }

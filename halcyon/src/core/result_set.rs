@@ -55,6 +55,7 @@ impl<'a> Row<'a> {
         Row { cells }
     }
 
+    /// Number of columns in the row.
     pub fn column_count(&self) -> usize {
         self.cells.len()
     }
@@ -99,8 +100,12 @@ impl fmt::Debug for Row<'_> {
 }
 
 /// Maps a whole cursor row into `Self`. Implemented for tuples of [`FromColumn`]
-/// types up to arity 12; `#[derive(FromRow)]` for structs arrives in Phase 2.
+/// types up to arity 12, and for structs by `#[derive(FromRow)]` (feature
+/// `derive`), which maps columns to fields by position.
 pub trait FromRow: Sized {
+    /// Builds `Self` from one row, failing with
+    /// [`ErrorCode::Mapping`](crate::ErrorCode::Mapping) when the column count
+    /// or a column's type does not match.
     fn from_row(row: &Row<'_>) -> Result<Self>;
 }
 
@@ -214,6 +219,7 @@ impl<'c> ResultSet<'c> {
         ResultSet { stmt, state }
     }
 
+    /// Number of columns in the result set.
     pub fn column_count(&self) -> usize {
         self.state.column_count()
     }

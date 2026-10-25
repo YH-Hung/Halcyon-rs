@@ -3,7 +3,9 @@ use crate::error::ErrorCode;
 /// Result of mapping a raw diagnostic onto Halcyon's error model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Classification {
+    /// The error's category.
     pub code: ErrorCode,
+    /// Whether a read that failed this way may be retried.
     pub retriable: bool,
 }
 

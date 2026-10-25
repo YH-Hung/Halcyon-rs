@@ -17,6 +17,9 @@ use crate::value::Value;
 /// `bool`, `String`, `Vec<u8>`, and `Option<T>` for nullability. Mirrors the
 /// C++ `TypeBinder<T>::from_value`.
 pub trait FromColumn: Sized {
+    /// Converts one column value, failing with
+    /// [`ErrorCode::Mapping`](crate::ErrorCode::Mapping) when the value's type
+    /// does not fit `Self` or a non-`Option` target receives NULL.
     fn from_column(value: Value) -> Result<Self>;
 }
 
